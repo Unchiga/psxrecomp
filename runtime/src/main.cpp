@@ -12626,42 +12626,24 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
     return true;
 }
 
-int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
-    std::fprintf(stderr, "psxrecomp: main() entered\n");
-    std::fflush(stderr);
-#if defined(RECOMP_LAUNCHER)
-    launcher_boot_timing_mark("host:main_enter");
-#endif
+/* Run the pre-boot launcher and everything that depends on its result.
+ *
+ * Three things are interleaved here because they genuinely are: the overlay
+ * cache warms on a worker thread so ABI preflight and resident DLL loads
+ * overlap with the time the player spends in the GUI; the launcher itself
+ * runs in its own GL window and persists the choices to settings.toml; and
+ * the mod activation callbacks re-run afterwards, because a soft return to
+ * the launcher must not leave a disabled package's overrides latched.
+ *
+ * The worker is joined on every exit path, including the failures -- detaching
+ * it would let a resident DLL load run against a torn-down runtime. */
+enum class LauncherOutcome { Boot, Quit, Failed };
 
-    /* Setup-host zip-root exe: after Generate & rebuild, hand off to the
-     * product binary under build-release/ (bios/, mods/, assets/, settings). */
-    /* Guard must match the declaration above, which is nested inside
-     * RECOMP_LAUNCHER: codegen_setup.c needs recomp_launcher.h, so a
-     * PSX_RECOMP_UI=OFF build (headless/generated) links no definition and
-     * previously failed to compile this call. There is no setup-host handoff
-     * without the launcher, so skipping it there is the correct behavior. */
-#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER)
-    psx_game_codegen_forward_if_built(argc, argv);
-#endif
-
-    /* Install crash handlers early so they catch issues during init too.
-     * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
-    psx_crash_trace_install_handlers();
-#if defined(RECOMP_LAUNCHER)
-    launcher_boot_timing_mark("host:crash_handlers");
-#endif
-
-    /* Startup-resolved configuration; the field comments document each source. */
-    PsxBootConfig boot;
+static LauncherOutcome run_launcher_session(int argc, char** argv,
+                                            PsxBootConfig& boot) {
     /* Deferred overlay-cache warmup; joined before the runtime starts. */
     std::thread overlay_init_thread;
     std::exception_ptr overlay_init_exc;
-
-    if (!resolve_boot_config(argc, argv, boot)) return 1;
-
 #if defined(RECOMP_LAUNCHER)
     launcher_boot_timing_mark("host:pre_overlay_worker");
 #endif
@@ -13372,7 +13354,7 @@ int main(int argc, char** argv) {
                         if (overlay_init_thread.joinable())
                             overlay_init_thread.join();
                         SDL_Quit();
-                        return 1;
+                        return LauncherOutcome::Failed;
                     } else if (match_session_bios_path.empty()) {
                         std::fprintf(stdout,
                             "psxrecomp: netplay session BIOS = OpenBIOS "
@@ -13392,7 +13374,7 @@ int main(int argc, char** argv) {
                 if (overlay_init_thread.joinable())
                     overlay_init_thread.join();
                 SDL_Quit();
-                return 0;
+                return LauncherOutcome::Quit;
             }
 #if defined(PSX_HAS_GAME_CODEGEN)
             if (lr == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
@@ -13408,7 +13390,7 @@ int main(int argc, char** argv) {
                 psx_game_codegen_relaunch_or_exit(disc_for_relaunch);
                 /* Does not return on success. */
                 SDL_Quit();
-                return 1;
+                return LauncherOutcome::Failed;
             }
 #endif
             if (lr == 0) {
@@ -13543,7 +13525,7 @@ int main(int argc, char** argv) {
             } catch (const std::exception& ex) {
                 std::fprintf(stderr, "psxrecomp: overlay cache init failed: %s\n",
                              ex.what());
-                return 1;
+                return LauncherOutcome::Failed;
             }
         }
     }
@@ -13558,12 +13540,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr,
                              "psxrecomp: cannot clear mods for netplay: %s\n",
                              mod_error.c_str());
-                return 1;
+                return LauncherOutcome::Failed;
             }
         } else if (!PSXRecompV4::mod_runtime_commit(boot.resolved_disc, &mod_error)) {
             std::fprintf(stderr, "psxrecomp: cannot launch with selected mods: %s\n",
                          mod_error.c_str());
-            return 1;
+            return LauncherOutcome::Failed;
         }
     }
     /* Activation callbacks are re-run after every launcher session. Clear
@@ -13606,6 +13588,47 @@ int main(int argc, char** argv) {
      * (at config load) only saw the game.toml default; this folds in the
      * settings.toml override and the launcher's choice. No-op when unchanged. */
     text_xlate_set_language(boot.resolved_language.c_str());
+    return LauncherOutcome::Boot;
+}
+
+int main(int argc, char** argv) {
+    /* Force line-buffered output so messages appear even if killed. */
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::fprintf(stderr, "psxrecomp: main() entered\n");
+    std::fflush(stderr);
+#if defined(RECOMP_LAUNCHER)
+    launcher_boot_timing_mark("host:main_enter");
+#endif
+
+    /* Setup-host zip-root exe: after Generate & rebuild, hand off to the
+     * product binary under build-release/ (bios/, mods/, assets/, settings). */
+    /* Guard must match the declaration above, which is nested inside
+     * RECOMP_LAUNCHER: codegen_setup.c needs recomp_launcher.h, so a
+     * PSX_RECOMP_UI=OFF build (headless/generated) links no definition and
+     * previously failed to compile this call. There is no setup-host handoff
+     * without the launcher, so skipping it there is the correct behavior. */
+#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER)
+    psx_game_codegen_forward_if_built(argc, argv);
+#endif
+
+    /* Install crash handlers early so they catch issues during init too.
+     * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
+    psx_crash_trace_install_handlers();
+#if defined(RECOMP_LAUNCHER)
+    launcher_boot_timing_mark("host:crash_handlers");
+#endif
+
+    /* Startup-resolved configuration; the field comments document each source. */
+    PsxBootConfig boot;
+
+    if (!resolve_boot_config(argc, argv, boot)) return 1;
+
+    switch (run_launcher_session(argc, argv, boot)) {
+        case LauncherOutcome::Quit:   return 0;
+        case LauncherOutcome::Failed: return 1;
+        case LauncherOutcome::Boot:   break;
+    }
 
     /* CLI overrides win over config — applied last, before backend/port init.
      * Enables a soak fleet: several instances on distinct ports + renderers,
