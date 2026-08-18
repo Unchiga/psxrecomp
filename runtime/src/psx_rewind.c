@@ -403,7 +403,7 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
     s_sel = 0;
     fprintf(stderr,
             "psxrecomp: rewind on (interval=%u fmv=%u depth=%u ~%.1fs) — "
-            "F8 / View / L3\n",
+            "F8 / GAME menu / pad hotkey\n",
             (unsigned)s_interval, (unsigned)s_fmv_interval, (unsigned)s_depth,
             (double)s_interval * (double)s_depth / 60.0);
 }
