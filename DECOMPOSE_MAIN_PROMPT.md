@@ -177,11 +177,17 @@ rematch.
    The ones with an existing sibling module are the best value: the split is
    already half-made, and the pattern is proven three times now.
 
-   **Rewind glue is the obvious next one** (`rewind_poll_nav`,
-   `rewind_host_pause_loop`, `rewind_pause_present`, ~110 lines at 6367-6493,
-   interleaved with what used to be the savestate glue). `psx_rewind.c` exists.
-   Expect the same shape as save states: the state machine moves, the SDL event
-   pumping and pause loop stay.
+   **Rewind glue was checked and does NOT move — do not retry it.** The 118
+   lines left in `main.cpp` (`rewind_poll_nav`, `rewind_poll_toggle_buttons`,
+   `rewind_pause_present`, `rewind_host_pause_loop`) are pure frontend: a
+   renderer-backend dispatch and an SDL event pump. The split is already
+   correct — `psx_rewind.c` (895 lines) owns the snapshots, selection and
+   overlay, and `psx_rewind_nav_held()` is already the right seam, with the
+   host decoding input and the module holding state. Measured: 14 shared
+   symbols, headed by `sdl_renderer` (42 uses), `g_gl_active` (29),
+   `g_players` (28), `sdl_texture` (23), `g_vk_active` (21). Moving it would
+   mean exporting the SDL handles, which is the mistake this file already
+   rejects for the phase functions.
 2. **input/pad** (~1,100). Cheap globals but scattered; move function by
    function, never by line range.
 3. **present path** (~1,550). 102 shared globals, hot path, interpolation
@@ -236,6 +242,21 @@ were throwaway, so rebuild them, but rebuild them to THIS shape.
    launcher region (below).
 5. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
    compiled clean and the behavioural pass still found a real latent bug.
+
+## ⚠ REWIND IS NOT BUILT IN THIS CHECKOUT
+
+`PSX_REWIND:BOOL=OFF` in **both** `build-dbg` and `build`. Turning it on needs
+the retcomm-rbengine snap-ring backend (`lib/retcomm-rbengine`, or
+`-DRECOMP_RBENGINE_ROOT=...`); without it CMake hard-errors rather than
+building a stub. `psx_rewind.c` still compiles, but `PSX_HAS_RBENGINE_SNAP` is
+never defined, the ring is never allocated, and `psx_rewind_enabled()` is 0
+forever.
+
+**So rewind is unreachable by every route today** — F8, the Select+R3 pad
+hotkey, and the GAME > REWIND menu row all do nothing. Verified empirically:
+the guest keeps advancing frames through all three. Do not read a dead rewind
+hotkey as a regression, and do not try to verify rewind behaviour here. A
+build with the submodule is required.
 
 ## ⚠ THE LAUNCHER IS NOT BUILDABLE IN THIS CHECKOUT
 
