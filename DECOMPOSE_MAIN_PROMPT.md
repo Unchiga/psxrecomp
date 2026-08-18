@@ -111,7 +111,10 @@ Do not re-derive these; do re-verify one before acting on it.
   timers took `&g_runtime_perf.pacer_ticks`, so callers knew the state layout;
   they now name a section and the struct is private. 14,754 -> 14,448.
 - **`psx_post_load_probe.c` (~455 lines)** — the post-restore freeze probe.
-  14,448 -> **14,034**.
+  14,448 -> 14,034.
+- **`psx_host_audio.c` (445 lines)** — the SDL device, the DRC bridge, the pump
+  and the turbo mute/sink gate. Six "shared" symbols became four API calls
+  (open / close / resync / fade-reset). 14,034 -> **13,651**.
 - **`psx_savestate_host.c` (334 lines, 2026-08-18)** — the slot menu's state
   machine plus the post-restore input guard and its trace ring. 14,996 ->
   14,708. Raw SDL polling and the host pause loop stayed in main.cpp on
@@ -174,14 +177,34 @@ rematch.
    `main.cpp`, with the caveat that each needs its own exclusive-vs-shared
    check before you commit:
    - menu glue (~268) — `psx_apply_video_menu_state`; `psx_video_menu.c` exists
-   - audio (~250) — `psx_sdl_audio.cpp` already exists. NOT yet gated; note
-     `psx_audio_out_stats` stays in main.cpp either way (it reads the DRC and
-     SDL device state and is the `audio_stats` TCP surface).
+   - audio — DONE. (`psx_audio_out_stats` moved WITH it: it reads the DRC and
+     device state, which are now the module's, and it stays the `audio_stats`
+     TCP surface from there.)
    - perf diag — DONE, see above.
    - load probe — DONE, see above (it was ~415 lines, not the ~117 the old
      cluster map claimed; re-measure before trusting any figure in that table).
    The ones with an existing sibling module are the best value: the split is
-   already half-made, and the pattern is proven three times now.
+   already half-made, and the pattern is proven five times now.
+
+   **Video-menu glue was gated and does NOT move.** `psx_apply_video_menu_state`
+   (260 lines) has 16 shared symbols headed by `g_gl_active` (29 uses),
+   `sdl_texture` (23), `g_vk_active` (21) and every video setting. That is not
+   incidental — the function's own comment says "the menu module is pure state
+   + UI; all SDL/GL plumbing lives here". It IS the plumbing half, and it is
+   already where it belongs.
+
+   **What is actually left**, largest first, none gated yet:
+   - input/pad (~520 across parse_controller_source, capture_pad_slot,
+     pad_sticks_for, open_player, capture_local_human_pad, load_input_config) —
+     scattered; move function by function, never by line range.
+   - netplay glue (~455, headed by `netplay_barrier_admit` at 217).
+     `psx_netplay.c` exists. **The user has said netplay is not needed**, so
+     treat this as low priority, and note nothing here can exercise it.
+   - free-spending cheat (~45: `PSX_STARCHIPS_ADDR`, `g_free_spending`,
+     `s_sc_*`, `psx_free_spending_tick`) — genuinely modular and would sit
+     beside `psx_card_drops.c`, but small.
+   - `sdl_vblank_present_body` (1,189) — the present path. Still the hardest and
+     still last.
 
    **Rewind glue was checked and does NOT move — do not retry it.** The 118
    lines left in `main.cpp` (`rewind_poll_nav`, `rewind_poll_toggle_buttons`,
