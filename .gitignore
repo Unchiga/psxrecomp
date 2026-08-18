@@ -1,0 +1,36 @@
+# Build outputs
+build/
+build-*/
+recompiler/build/
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.ilk
+
+# Recompiler output is a build artifact (CLAUDE.md rule 4): regenerate, don't commit
+generated/
+
+# Fetched dependencies
+runtime/third_party/
+_deps/
+
+# Local runtime state
+saves/
+*.pst
+*.thumb
+*.mcd
+menu_settings.ini
+keybinds.ini
+input.ini
+mods/state.toml
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store

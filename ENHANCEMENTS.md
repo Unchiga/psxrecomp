@@ -1,0 +1,1063 @@
+# PSXRecomp — Enhancement-Tier Work (framework-wide)
+
+Faithfulness is the foundation (CLAUDE.md Rule -1); this file tracks the
+enhancement layer built on top of it: renderers beyond the software reference,
+widescreen, load acceleration, etc. Per-game enhancement ideas live in each
+game repo's ENHANCEMENTS.md. Active framework bugs referenced here live in the
+game repos' ISSUES.md until a framework tracker exists.
+
+---
+
+## R1 — OpenGL renderer (2nd backend): PLAYABLE, flicker root-caused + fixed
+
+**Status as of 2026-07-03** (branch `feat/renderer-finish`, working tree, uncommitted):
+
+- The long-standing intermittent black-frame flicker (MegaManX6Recomp ISSUES.md
+  #7 — the reason MMX6 shipped with the software renderer) is **root-caused and
+  fixed**. Mechanism (proven via the new present ring + gl_coh_ring correlation):
+  `flush_cpu_upload()` merged all pending CPU→VRAM writes into ONE union bounding
+  box; a frame with two disjoint uploads produced a union spanning the display
+  framebuffers, which the flush painted from the **stale CPU VRAM mirror** (the
+  FBO is authoritative under GL) — stomping live frames with black. Two black
+  presents per incident (one per double-buffer parity). Software renderer is
+  immune (CPU array is authoritative there), which is why it was the safe default.
+- Fix: exact pending-rect list (16 rects; merge only when zero uncovered pixels
+  are added; wrap-aware GP0(A0) transfers split into up to 4 exact rects;
+  overflow → order-preserving flush-all). Merge rule proven by a 20k-randomized-
+  rect host unit test (0 stale / 0 missing painted pixels).
+- New always-on observability: **gl_present_ring** (every SwapWindow site records
+  path taken, src/letterbox rects, glGetError, wall-ms, backbuffer + blit-source
+  pixel samples) — the instrument that made the 1:1 black-capture correlation
+  possible. Plus a debug-server fix: send_fmt silently truncated >64KB responses
+  into unparseable JSON (broke big ring dumps); now heap-formats exactly.
+- Validation: ~18-minute MMX6 GL attract soak, ~1600 window captures across 3+
+  full attract cycles — **zero isolated black frames, zero GL errors**, no other
+  visual anomalies. Tomba1 build-gl rebuilt with the fix, boots clean (full
+  Tomba1 attract soak still owed).
+
+**Validation COMPLETE (2026-07-03, both titles):**
+- MMX6: ~18-min attract soak, ~1600 window captures, zero isolated black
+  frames (agent, ring-correlated).
+- Tomba1: 24-iteration/720-capture attract soak (2 flags, both multi-frame
+  FMV content cuts) + the definitive pass: 23,807 CONSECUTIVE presents
+  (gapless, seq-verified) over a full attract cycle via gl_present_ring —
+  ZERO isolated dark presents, zero GL errors. The capture-level flags do
+  not exist at the swap level.
+
+**Remaining to close R1:**
+1. USER final validation at the MMX6 Rainy Turtloid standing-still spot (the
+   original repro; MMX6 build-modern settings.toml is left on
+   renderer="opengl").
+2. Flip MMX6's shipping default software→opengl + close ISSUES.md #7.
+3. The same union-upload bug exists in the Vulkan backend (see R2 item 1).
+
+## R1b — Native-wide (16:9) GL: perf collapse ROOT-CAUSED + FIXED, band flicker FIXED
+
+**Status 2026-07-03** (branch `feat/renderer-finish`, commits f5362f4..8b819eb):
+
+- **The 16:9 perf collapse (Tomba2 3D attract 60→12fps, MMX6 2D attract dips)
+  was never a GPU problem.** Stack-sampled (devkitPro gdb) in the wedge: the
+  main thread lived in `ws_backdrop_site_kind` ← `exec_one` — under native-wide
+  the dirty-RAM interpreter classified EVERY executed instruction as a possible
+  backdrop rewrite site; the classifier rescans ±512 bytes on cache miss and its
+  256-slot direct-mapped cache (2 hot PCs 1 KB apart collide) thrashed on
+  overlay working sets. Squash mode gates the whole path off — that is why
+  `ws_nw on=0` restored 60fps while every GPU theory (mirror FBO ping-pong,
+  extra prims, present path) failed. The earlier "60ms scene GPU / 70us per
+  prim" numbers were CPU-starvation-inflated GPU-timestamp gaps (the GPU idles
+  between CPU-paced submissions inside the bracket) — treat GL timer numbers
+  on a CPU-bound frame as suspect.
+- **Fixes** (dbe7812 + 8b819eb): opcode pre-filter (only addu/or/addi/addiu can
+  be rewrite sites) + 8192-slot full-PC-tagged caches + `g_dirty_ram_code_gen`
+  invalidation (memory.c) + a per-entry SITE-WORD tag (revalidates the cached
+  verdict against the live instruction word — plain-CPU-store overlay reloads
+  never hit the page-marking hooks, and a stale verdict fires a GPR rewrite at
+  the wrong instruction = guest corruption).
+- **Numbers**: Tomba2 GL 16:9 attract (heavy scene, ~640-1100 prims) 72-95ms/frame
+  → **17-21ms (p50 17.1ms, ~52-58fps)**; MMX6 GL 16:9 attract locked 16.7ms
+  through demo stages (worst 10s window avg 25ms at stage-load transitions).
+- **Top/bottom band flicker (MMX6 16:9, user-visible) FIXED** (a0b5843): the GL
+  mirror pass scissored the FULL wide surface; the SW reference (`rt_wide`)
+  only widens X and keeps the draw-area Y clip. Under MMX6's vertical double
+  buffer (draw area alternates y=0/y=240, both bands in ONE wide surface)
+  mirror draws bled across the band boundary and presented a frame late as
+  edge flicker. Scissor is now full-width X / draw-area Y. Validated with
+  0.15s-interval capture bursts: top/bottom 16-row inter-frame instability is
+  0.26x/0.21x the scrolling middle band (edges quieter than content).
+- **Wide surfaces now carry a DEPTH24_STENCIL8 attachment** (cfa79bb): the
+  stencil-less wide FBO was a spec-gray target for the stencil-enabled mask
+  fixup passes AND left the PSX mask-bit mirror silently no-op on the wide
+  surface. (Its per-pass GPU "cost" measurements that motivated it were later
+  shown starvation-inflated; the attachment stays for mask correctness.)
+- **New permanent instrumentation**: frame_perf mirror split (GL_TIMESTAMP
+  pairs per wide pass: mirror_gpu_ms / canon_gpu_ms / mirror_pass_us), CPU-side
+  attribution (cpu_flush_ms, cpu_wide_ms, batches, wide target sets, wide FBO
+  creations per frame), and `gl_ws_ablate mode=0..3` (skip mirror / state-only /
+  no-FBO-rebind ablations) — the toolchain that exonerated the GPU and named
+  the CPU producer.
+- **MMX6 wedge incident (RESOLVED to one mechanism, poisoned overlay shards):**
+  during the session MMX6 hit fatal wedges — twice in the 16:9 attract (wild
+  dispatch 0x21010001 / 0x0C008096) and then DETERMINISTICALLY at boot frame
+  2518 (unknown dispatch 0x80095098) at BOTH aspects. Timeline nailed it: the
+  overlay self-heal wrote a fresh 001EA000 shard batch at 20:53, exactly when
+  attract wedge #1 hit (shards hot-loaded mid-run); every boot after loads
+  them and wedges at 2518; quarantining the batch
+  (cache/.../cg4_0cec55ab.quarantine) restored clean boots + attract. Most
+  plausible poison source: the INTERIM stale-verdict build (dbe7812 before the
+  8b819eb word tag) corrupted guest RAM at 16:9, and autocapture snapshotted
+  the corrupted overlay bytes into the captures the shards were compiled from.
+  Self-heal recaptures with the hardened build. NOT a ws-stack or renderer
+  defect. Tomba2 16:9 soaked clean throughout.
+
+## R2 — Vulkan renderer (3rd backend): RENDERS GAMEPLAY AT SPEED, gaps cataloged
+
+**Status as of 2026-07-03** (same branch/tree; `-DPSX_ENABLE_VULKAN=ON`, SDK
+1.4.341.1; `feat/vulkan-renderer` turned out to be already merged into master —
+only a 26-line build-guard needed salvaging from the retired _wt-vulkan worktree):
+
+- Three bring-up bugs root-caused and fixed this session:
+  1. **Boot wedge**: per-pixel GP0 uploads did 2 vkAllocateMemory + 2
+     vkQueueSubmit each (driver churn → minutes-long stall, watchdog abort).
+     Fixed with GL-style deferred batched uploads.
+  2. **Shredded 3D**: draws raced CPU rewrites of the persistently-mapped vertex
+     buffer (69.5% pixel divergence vs software at the same guest frame). Fixed
+     with sub-allocation cursors + firstVertex bases.
+  3. **Semi-transparency order violations** (59.5% divergence): VK still had
+     GL's retired whole-batch STP split; ported GL's current two-pass model
+     (ordered color pass + color-masked stencil fixup; semi prims isolated).
+- Verified (guest-frame-aligned VRAM diffs via the new frameshot.py tool +
+  window captures): title pixel-identical to software; attract within 0.62% of
+  the GL oracle; **60.5 fps sustained**; vk_perf steady-state ~0-2 allocs and
+  ≤6 submits/frame (was thousands). 24-bit FMV present path written (old one
+  was provably black) but NOT yet verified on-screen.
+
+**Gap catalog (ranked, low→high effort):**
+1. ~~Port the exact-rect pending-upload fix from GL~~ DONE 2026-07-03: exact-rect
+   list ported + VK-specific COALESCED flush (one staging pair + two submits per
+   flush regardless of rect count; the naive per-rect port re-created the submit
+   churn at 0.7 fps — VK pays per-submit where GL pays per-glTexSubImage2D).
+   UP_RECTS_MAX=64 on VK so MDEC row-coalesced FMV frames fit in one flush.
+   Verified: attract renders correctly at ~51 fps, vk_perf mostly-idle frames.
+2. ~~Verify FMV on-screen~~ DONE 2026-07-03: Whoopee logo + intro CG movie render
+   correctly on VK (window captures). NOTE Tomba2 movies are 15-bit MDEC->VRAM
+   (upload path), NOT depth24 — the depth24 compose path remains no-regression-
+   verified only; validate on a 24-bit title (MMX6 opening) later.
+3. ~~Cache the FMV present staging image~~ DONE 2026-07-03: persistent image +
+   mapped staging keyed by (w,h), freed on resize/shutdown (cpres cache).
+4. ~~DS barrier~~ DONE 2026-07-03: explicit stencil-aspect self-barrier
+   (late-tests write -> early-tests read|write) at every begin_geo_pass;
+   layouts verified against the init transition chain + render pass
+   (attachment-optimal throughout).
+4b. NEW (minor): flush_cpu_upload allocates 2 stagings per flush — ~16/frame
+   during MDEC FMV streaming only (~0 in gameplay). A sync-aware staging ring
+   would zero it; low priority.
+5. ~~Native-wide (16:9) compositor~~ DONE 2026-07-03 (0b23ea3): per-base_x wide
+   surfaces (RGBA8 color + OWN stencil image + framebuffer on the SHARED render
+   pass — every pipeline works unchanged, and the mask-bit stencil mirror is
+   real on the wide surface from day one). The mirror is a second render pass
+   appended to the SAME one-shot CB as each flushed batch (no extra submits);
+   u_xoff/u_xhalf push constants (pre-plumbed in the shaders) carry the
+   translation/wider clip. Mirror scissor = full-width X / DRAW-AREA Y (the GL
+   band-bleed lesson applied from day one). wide_clear via ClearAttachments
+   (color + stencil=bit15); full-screen overlay rects suppress the batch mirror
+   and draw one full-wide-width rect (margins dim/fade). GPU-direct present
+   blits the displayed band letterboxed at (4*wide_w : 3*native_w);
+   vkb_render_wide_display readback backs the facade + debug dump. vk_perf
+   gains wide/wclr counters. VALIDATED (Tomba2 build-vk, PSX_WS_FORCE_2D=1 —
+   master Tomba2 has no sprite-tag hooks): 16:9 attract presents full-width
+   (mine-cart demo captures), locks 60fps on normal scenes (frame_period p50
+   16.68ms), ~51-57fps on the heavy semi-prim scene (29 wide passes/frame);
+   4:3 unregressed (p50 18.1ms on the 452-flush semi-isolation scene — the
+   pre-existing item-7 profile, wide counters 0). Margins show 4:3-culled
+   geometry only — full margin content needs the cull-widened overlay cache
+   (cg4_0cec55ab.ws-experiment, not installed on master).
+6. SSAA scale >1 unvalidated on VK.
+7. Semi-prim isolation perf (one draw per semi triangle; same cost as GL today).
+
+**Validation targets:** MMX6 + Tomba2, agent does initial (window-capture series
++ frame-aligned cross-backend diffs), user does final.
+
+---
+
+## R3 — Validation sweep + merge (2026-07-03, USER-DRIVEN)
+
+Full 3-title x 3-config playthrough validation (agent launched each config windowed
++ confirmed on-screen via window_capture; user drove input + gave the verdict):
+
+| Title  | OpenGL 4:3 | Vulkan 4:3 | OpenGL 16:9 |
+|--------|:----------:|:----------:|:-----------:|
+| Tomba1 | PASS       | YELLOW     | PASS        |
+| MMX6   | PASS       | YELLOW     | YELLOW      |
+| Tomba2 | PASS*      | PASS*      | FAIL*       |
+
+\* Tomba2 = experimental / not production-ready; not merge-blocking. (Vulkan 16:9
+was intentionally skipped — user directive: all 16:9 in OpenGL only.)
+
+Findings (tracked for the next work cycle):
+- **OpenGL 4:3 is the strong, shippable path on all titles.** This is the win.
+- **Vulkan 4:3 = YELLOW everywhere** (why it ships hidden/experimental):
+  - Tomba2: sluggish FMV, minor speech-audio fidelity loss, in-game slowdown
+    (possibly progressive), text boxes don't dismiss, HUD weapon icon renders in
+    all 3 slots (only center should show).
+  - Tomba1: minor horizontal bar artifact at top of the load screen; dwarf
+    village sluggish (the known overlay-heavy scene; perf only, renders correct).
+  - MMX6: significant slowdown in Rainy Turtloid's RAIN AREA even at 4:3 —
+    VULKAN-SPECIFIC (on GL 4:3 it is subtle at most). Renders correct; perf only.
+- **OpenGL 16:9:** Tomba1 clean PASS. MMX6 YELLOW (rain-area lag evident at 16:9;
+  same Rainy Turtloid perf hot-spot). Tomba2 FAIL — widescreen does NOT engage
+  (renders 4:3 pillarboxed in the wide window + slow); expected, master Tomba2
+  has no sprite-tag ws hooks (ws work parked at 4:3).
+
+**Policy gates confirmed already in-tree (no code change needed for the merge):**
+- Vulkan is hidden by default: the shared launcher offers only
+  Software<->OpenGL; PSX_ENABLE_VULKAN defaults OFF (runtime.cmake);
+  runtime downgrades renderer=vulkan -> opengl when not compiled (main.cpp:2463).
+  Vulkan stays a dev/CLI-only backend (--renderer vulkan on a VK-enabled build).
+- Widescreen carries an EXPERIMENTAL tag in the launcher.
+
+**MERGED to master 2026-07-03** (runtime-only; codegen hash unchanged, no regen).
+Game pins bumped to the new psxrecomp master. No release builds cut (user directive).
+
+**Open follow-ups (next cycle):** VK perf (MMX6 rain-area, dwarf village, Tomba2
+in-game — likely the CPU-bound dirty-RAM ws classifier path and/or VK per-submit
+cost); VK correctness (Tomba2 persistent text boxes + 3-slot HUD icon; Tomba1 load
+bar artifact); Tomba2 widescreen sprite-tag hooks; MMX6 Rainy Turtloid perf even on
+GL 16:9; and the pending MMX6 shipping-default flip software->opengl to close
+MegaManX6Recomp ISSUES.md #7 (GL validated this session).
+
+---
+
+## W1 — Tomba2 16:9: USER-FLAGGED visible issues queue (2026-07-06, NOT STARTED)
+
+User-prioritized alongside the P0 crash work (ISSUES.md #8). None of these have
+been investigated yet — this section is the work queue + every known lead.
+All Tomba2, GL 16:9, worktree `_wt-tomba2-ipr` / `Tomba2Recomp` build-t2.
+
+### W1.1 — Black background columns in 16:9 (P3; incl. beach area)
+
+- **Symptom:** huge black regions where the 2D far backdrop should fill the wide
+  margins (user Image 1: large black sky scene); also a ~24px black column in
+  beach-village at game-x 85–109.
+- **Class:** 2D far-backdrop doesn't cover the wide FBO edges.
+- **Prior art / leads:**
+  - `[widescreen.bg2d]` config (recompiler/src/config_loader.cpp:699).
+  - Memory `ws_backdrop_preload.md` (Tomba1): far-backdrop void = early
+    sprite-tagged 0x65 tile grid; fix = centre-stretch gated preload.
+  - Memory `ws_draw_census_8c.md` (Tomba1 8C scene): void was GTE-3D driver
+    FUN_8004db3c; fixed via depth-gated un-squash. The **8C draw-census ring**
+    is the attribution instrument (always-on; query, don't arm).
+- **Next step:** per-scene attribution — which producer draws the sky strips,
+  and why the wide margins get no tiles. Attract may cover some scenes; the
+  beach needs navigation (user drive or save).
+
+### W1.2 — 4:3 object culling visible at wide edges (P2 cull widening)
+
+- **Symptom:** objects pop in/out at the 4:3 boundary in 16:9 (world objects
+  culled by game code against 4:3 screen extents).
+- **Ghidra cull sites already identified** (tomba2_ram.bin; overlay addresses —
+  validate per scene variant before wiring):
+  - `FUN_8003e030`: sltiu 0x140 @ 0x8003E228
+  - `FUN_80069b6c`: addiu +0xE6 @ 0x80069B84 + sltiu 0x1CD @ 0x80069B8C
+  - `0x80110A08`: addiu +0x80 / sltiu 0x101
+- **Fix shape:** `[widescreen.cull]` bias_sites/range_sites per-game config
+  (enhancement-tier per-game shims are legitimate here). Prior art: Ape
+  bring-up used per-game cull imms (0x181) + signed idioms (slti/bltz)
+  (memory `ape_widescreen_bringup.md`).
+
+### W1.3 — Dialogue-box text tearing in 16:9 (P4)
+
+- **Symptom:** full-width dialogue text splits with gaps (user Image 2: "Water
+  cam…e out from th…e faucet").
+- **Cause known:** gpu.c `ws_nw_hud` thirds — left/right-third sprites are
+  anchored apart for HUD proportion; full-width dialogue glyphs tear at the
+  third boundaries. Needs a smarter anchor (e.g. detect wide text rows /
+  dialogue-box association) rather than blanket thirds.
+
+### W1.4 — Beach-area framerate (P1 perf; also user-flagged)
+
+- 2D isometric scenes run 0.42–0.70× (beach/village worst). The convergence
+  blockers are FIXED (autocapture futility backoff + entry-based coverage in
+  tools/compile_overlays.py — see handoff 2026-07-06); the campaign was
+  interrupted by ISSUES.md #8 and should resume after it: expect 2D scenes to
+  climb past 0.85 as coverage converges. Residual axes if short of ~1.0:
+  per-block pump overhead (psx_check_interrupts ~2.6M calls/s), attract
+  cycling. Measure ONLY with two freeze_check snapshots over a known wall
+  interval (executed throughput = d(psx_cycle_count) − d(cycles_skipped));
+  phase_profile is a ring read and returns instantly.
+- CAUTION: any pace numbers taken in diff mode before ISSUES.md #9's redesign
+  lands are garbage (the wedged shadow silently disabled all native dispatch).
+
+## L1 — Load-time-toward-0 burndown (2026-07-14, ACTIVE — guinea pig: Tomba 1)
+
+Full analysis + gates/kill criteria: `docs/LOAD_TIME_ZERO.md` (this branch,
+`spike/load-time-zero`). ChatGPT consult merged (thread "PSXrecomp
+workspace"). Already-settled items are NOT re-tried: turbo_loads (shipped,
+~2x), disc_speed divisor 4x/instant (proven unsafe — MMX6 VSync-callback
+wedge), yield pumps r1/r2 (proven fatal — green-thread corruption), BIOS CD
+HLE (rejected — no landmine, no host win). The frame:
+`wall = guest_time x host_cost_per_guest_sec`; under turbo the window is
+emulation-throughput-bound, so the safe axis is host cost (multiplies with
+turbo), the risky axis is guest time.
+
+**Prioritized burndown (most agnostic + most likely beneficial first):**
+
+- [x] **L1.0 — E0 `load_probe_v2`: load-window decomposition on Tomba 1.**
+  100% agnostic, zero risk, prices every bet below. Split a real pig-load
+  window into guest time (seek / sector cadence / per-sector processing /
+  explicit waits) and host time (native code / decompressors / interp /
+  CD-event machinery / SPU / GPU / pump). Existing rings first
+  (freeze_check, cdrom_bursts, dirty_ram_stats per_pc, phase_profile);
+  extend rings only where attribution is blind. Decisive question: why
+  only ~2x during a presentation-suppressed window? Thresholds: decomp
+  ≥~40% host → shards serious; ≤~8% → kill shards; CD/event/SPU machinery
+  dominates → L1.2; wall-clock limiter found → fix that first.
+- [ ] **L1.1 — Turbo hardening.** (a) re-validate SDL pump under a live
+  burst (fix appears in-tree: pump precedes the turbo early-return);
+  (b) audio at the HOST SINK only (drop excess samples, crossfade on
+  exit; never guest state); (c) root-cause MMX5 dev-tools+turbo 0xE10
+  boot wedge (foundation timing bug).
+- [x] **L1.2 — Event-horizon acceleration + batched device ticking.**
+  Provably side-effect-free poll/idle regions jump to the next scheduled
+  observable event with exact cycle credit + identical event ordering;
+  devices advance to deadlines instead of per-block ticks. Attacks the
+  ~2x ceiling directly; class-level, all titles inherit. Gate set from
+  L1.0's poll/idle share. Shipped: deadline-based device servicing, six Tomba
+  wait sites, and proof-gated generic idle skipping. Default-off cross-game
+  smoke validation passed on MMX5 and MMX6. Kill: <10% gain or ONE event-order
+  divergence.
+- [x] **L1.3 — Load-path overlay coverage (killed by gate).** L1.0 measured
+  zero in-window interpreter instructions, so there is no coverage win to buy.
+- [x] **L1.4 — Data shards (rejected/quarantined): verify-only SHADOW
+  mode, then replay.** Gated on L1.0 (decomp ≥~20-25% host share).
+  Correctness bar: temporal write visibility — replay sound only if
+  IRQs-off across the window OR duration < next observable event.
+- [x] **L1.5 — Authentic drive backlog (killed as acceleration).** Passive
+  deadline-vs-exposure probe measured 1,304/1,304 data sectors available on
+  their exact scheduled cycle, then the intentional fixed 5,000-cycle INT1
+  presentation delay. Zero early/late sectors, holds, pending/lost INT1s, or
+  overwrites: there is no artificial lateness for backlog/catch-up to remove.
+- [x] **L1.6 — Seek-only latency probe (killed on Tomba).** The measured
+  New Game window issued zero seek commands. Read-start latency was only
+  7,676,928 / 298,130,657 cycles (2.57%); pause latency was 8.11% but is an
+  authentic CPU-visible ordering contract, not a safe seek-speedup target.
+- [ ] **L1.7 — Phase-2 doors (open only with cause):** per-title read
+  speedup with XA/CDDA/MDEC exclusions; decompressor HLE (only via L1.4
+  failing for a named reason); load-transition state cache (the only
+  true near-zero; needs thousands-of-frames differential validation).
+
+**Live status / decision ledger (Tomba 1, 2026-07-14):**
+
+| Item | Verdict | Evidence / measured result |
+|---|---|---|
+| L1.0 decomposition | DONE | 761 sectors, ~9.5 s baseline window; zero in-window interp; host/static execution dominated. |
+| L1.1 turbo hardening | IMPLEMENTED ON TOMBA; CROSS-GAME SMOKE PASSED | SDL pump remains before every turbo return; 4-frame engage + 6-frame release debounce passed live QA. Opt-in host-audio sink advances canonical SPU state while discarding only accelerated host output; Tomba listening QA passed after 1,100,752 discarded SPU frames. MMX5 and MMX6 debug-tools builds booted through loads into live gameplay with normal visuals/audio; the historic intermittent MMX5 0xE10 root cause remains a separate long-run investigation. |
+| L1.2 event horizon | IMPLEMENTED; CROSS-GAME SMOKE PASSED | Production cycle advancement already batches device service at event/MMIO deadlines. Six configured PsyQ CD-wait sites delivered ~27% + ~9% stages. Generic idle-loop skip then cut warm bursts 0.53->0.34 s and 2.19->1.73 s, with 4,599 skips / 765M guest cycles and zero CD overwrites. Strictly per-game opt-in; MMX5/MMX6 exercised the default-off compatibility path successfully. |
+| L1.3 overlay coverage | KILLED | Interpreter share was zero in the measured load window. |
+| L1.4 asset/data replay | REJECTED FOR NOW | `FUN_8003EF50` replay produced title/game texture corruption despite zero verifier failures: v1 temporal verifier is unsound. Data shards default off and artifacts removed. |
+| Configurable warm CD routes (L1.7 read-speed branch) | ACCEPTED, STRICTLY PER-GAME OPT-IN | Framework accepts up to 16 strict LBA routes with mismatch fallback and consumer-paced IRQ/DMA. Only data-read cadence accelerates; XA/CDDA, seek, and motor timing remain authentic. Tomba multi-route regression: 3 matches, 1,944 accelerated sectors, zero overwrites. Legacy singular config is deprecated. |
+| L1.5 authentic backlog | DONE / KILLED AS ACCELERATION | 1,304/1,304 sectors exact-deadline; INT1 exposure exactly +5,000 cycles; zero holds, pending/lost, or overwrites. |
+| L1.6 seek-only probe | DONE / KILLED ON TOMBA | Automated New Game: 0 seeks across 792 data sectors. Read-start latency was 2.57% of the data span, below the 10% gate. Pause was 8.11% but remains authentic because early completion is a known race/wedge class. |
+| L1.7 state cache / broader HLE | DEFERRED | User excludes savestates; decompressor replay failed correctness. |
+
+Method, every experiment: measure first via always-on rings; start flag-gated;
+one per session; kill criterion written before code. `idle_skip`, warm CD routes,
+and the turbo host-audio sink are all strictly per-game opt-in. MMX6 remains the
+next deeper corpus/soak target after its successful boot/load/gameplay smoke.
+
+---
+
+## W2 — Tomba 1 (SCUS-94236) 16:9: HUD at the true wide corners (DEFERRED 2026-07-10)
+
+User ask: in native-wide 16:9, re-anchor the HUD to the wide corners
+(repositioned, never stretched). First attempt shipped and was REVERTED the
+same day (game.toml `nw_hud_corners` back to false; the framework machinery
+stays, inert + A/B-able). What was learned, so the next attempt starts ahead:
+
+- **Mechanism reused:** `[widescreen] nw_hud_corners` (gpu.c `ws_nw_hud_shift`
+  thirds translate, from the MMX4/5 campaign) + a new tag-title scoping: polys
+  and lines never shift (world/characters), rect-family prims shift only when
+  UNTAGGED. TCP `ws_hud_mode {"tag_rects":0|1}` A/Bs the tagged-rect gate live.
+- **What worked:** vitality gauge + life-counter (untagged rects, fully inside
+  one outer third) anchored flush to the wide corners, world untouched.
+- **Failure 1 — composite tear (same class as W1.3):** the in-world dialogue
+  box ("It's locked...") is a composite of untagged rects SPANNING zone
+  boundaries: its left/right end caps sit in the outer thirds and get pulled
+  to opposite screen edges while the text stays centred — the box visibly
+  splits. A blanket per-prim thirds rule cannot ship; it needs composite-group
+  awareness (e.g. group prims drawn adjacently in the packet arena / same OT
+  bucket, shift a group only if the WHOLE group fits in one zone).
+- **Failure 2 — AP counter immobile:** the AP composite (0x65/0x67 rects,
+  x≈220-292, y≈8-12) renders through the TAGGED sprite funnel (0x8005E08C),
+  so the untagged-only gate skips it. Census now records a `tagged` column
+  (gpu.c WsCensusEntry) — verify with `ws_census`. Lifting the gate via
+  ws_hud_mode shifts it, but then tagged world-anchored rects (collectible
+  sprites) near edges would shift too — needs the same group/HUD-band
+  discrimination as Failure 1 or a per-title HUD packet arena range
+  (`nw_left_hud_packet` exists for exactly this; needs Tomba's HUD arena
+  addresses from a census session: HUD prims live in the 0x000Bxxxx/0x000Cxxxx
+  double-buffered packet arenas alongside everything else, so the range must
+  come from finer addresses).
+- **Groundwork landed on `feat/ws-2d-scene-pillarbox`:** census `tagged`
+  column, `ws_hud_mode` live A/B, and the untagged-rect scoping that makes
+  `nw_hud_corners` safe to experiment with on tag titles.
+
+---
+
+## G1 — Sub-pixel vertex precision + perspective-correct textures (issue #92)
+
+PS1 polygon jitter ("wobble", "bouncing lines") and warped floor/wall textures
+have one root cause each, both in the fixed-point geometry pipeline:
+
+- **Jitter.** The GTE computes the projected screen position in 16.16, then
+  saturates it to an integer pixel when it pushes SXY. The fraction is thrown
+  away. A slowly moving mesh therefore snaps its vertices between whole pixels
+  and the model shimmers.
+- **Texture warp.** The GPU interpolates UV *affinely* across a triangle, with
+  no 1/z term, so a large floor or wall polygon's texture swims as the camera
+  moves.
+
+Both are addressed as **opt-in, visual-only** enhancements. The PS1-visible GTE
+SXY FIFO stays integer and fully faithful — a game's own post-projection
+screen-bounds culls and any SXY readback see exactly what hardware produces.
+Nothing about guest state changes; the correction lives entirely on the host
+render path.
+
+### Configuration
+
+```toml
+[video]
+geometry_correction   = true   # sub-pixel vertex precision (kills the wobble)
+perspective_texturing = true   # perspective-correct UVs on world polygons
+supersampling         = 2      # REQUIRED for geometry_correction to be visible
+```
+
+Both default **false** (the faithful floor). They are independent — a title may
+want stable geometry without changing texture mapping. Settable per-game in
+`game.toml` and per-player in `settings.toml` (the player's file wins, and a
+launcher save round-trips both keys rather than dropping them).
+
+`geometry_correction` needs `supersampling >= 2`: at native resolution the
+corrected position rounds back to the pixel it started on, so there is nothing
+to see. The runtime prints a note at startup when it is on at scale 1.
+
+### How it works
+
+The recompiler emits GTE commands as calls to a single runtime entry point
+(`gte_execute`), which both the compiled backend and the dirty-RAM interpreter
+share — so unlike an interpreter/dynarec emulator there is no dispatch hook to
+add, just one funnel to instrument.
+
+1. **`runtime/src/gte.cpp`** — RTPS/RTPT keep the discarded 16.16 fraction in a
+   side cache keyed by the packed SXY word it rounded to (`geom_note`).
+   Saturated (off-screen) projections are rejected: they carry no usable
+   sub-pixel information.
+2. **SWC2 provenance** — the recompiler, strict translator, dirty-RAM interp,
+   overlay ABI (v14) and fallback interp all call
+   `gte_precision_store_word(addr, reg)` when a projection register is stored to
+   guest RAM, recording *which RAM address* a projection landed at. Perspective
+   texturing only fires when all three of a triangle's position words came from
+   such a store at that exact DMA packet address — which preserves the
+   association through ordering-table reordering and rejects CPU-built UI and
+   2D sprites outright. A plain `sw` to a tracked address invalidates it.
+3. **`runtime/src/gpu.c`** — `prepare_precise_triangle()` /
+   `prepare_texture_triangle()` look the packet up per triangle and hand the
+   result to the renderer facade as sideband state for the next draw
+   (`gr_set_precise_triangle` / `gr_set_perspective_triangle`).
+4. **All three renderers consume it.** Software uses the fractional positions
+   in its supersampled mirror; OpenGL and Vulkan take them as float vertex
+   positions directly. For perspective UVs both GPU backends carry a per-vertex
+   `a_q` weight and emit clip coordinates pre-multiplied by `w = 1/q`, so the
+   hardware's own perspective divide interpolates a `smooth` UV varying while
+   the affine `noperspective` one stays available. **`a_q == 0` (the default)
+   makes `w` exactly 1.0 and selects the affine varying — the pre-feature
+   pipeline, unchanged.**
+
+Save states and speculative native-validation passes drop host-only provenance
+(`gte_precision_timeline_invalidate`, `gte_precision_speculative_begin/end`) so
+a rewind can never resurrect a stale projection.
+
+### Validation story
+
+By construction this feature *diverges* from stock hardware output, so the
+Beetle oracle cannot be the judge of the corrected frame. What the oracle still
+pins is the part that must not move: **with both flags off the output is
+byte-identical to the pre-feature build**, and guest-visible GTE state is
+identical either way (the SXY FIFO is untouched in both). That reduces
+validation to (a) an off/off pixel-identity check against the oracle, and
+(b) human A/B of the on/off frames on a 3D title.
+
+`gte_geometry_correction_hits()` and `gpu_texture_correction_hits()` report how
+many vertices/triangles were actually corrected — the "is this doing anything
+on this title" counter, and the thing to check first when a title shows no
+visible change.
+
+### Provenance
+
+The GTE side cache, SWC2 provenance tracking, GP0 triangle preparation and the
+software-renderer consumption path were contributed by **Kareem Olim (kem0x)**
+in [PR #14](https://github.com/mstan/psxrecomp/pull/14) and parked in commit
+`2ceaf5a` (see `docs/internal/upstream/kem0x-pr14-projection-perspective.md`),
+disabled pending generic setters. This work adds the opt-in configuration, the
+renderer-facade seam, and OpenGL + Vulkan support.
+
+### Status / next
+
+- **Done:** config plumbing (game.toml + settings.toml + launcher seed
+  round-trip), renderer-facade sideband, software / OpenGL / Vulkan consumption,
+  `[video]` plumbing unit test.
+- **Open:** per-title A/B validation. Ape Escape is the obvious first 3D
+  subject (Tomba 1/2 and MMX5/6 are largely 2D, where neither knob does much).
+- **Open:** launcher (recomp-ui) toggles. The keys round-trip through
+  `settings.toml` today, but there is no UI row yet — that lives in the
+  recomp-ui repo.
+
+### G1.1 — MEASURED REGRESSION: partial coverage cracks meshes (2026-08-05)
+
+**User verdict on Ape Escape: "little lines jittering everywhere — visually
+this is worse."** Confirmed and root-caused. `geometry_correction` must not be
+presented as usable in its current form.
+
+Measured on Ape Escape (OpenGL, supersampling 2, 213-frame window, via the new
+`geom_correction` TCP command):
+
+| | per frame |
+|---|---|
+| GP0 draw commands | ~316 (≈400–600 triangles) |
+| vertices given sub-pixel positions | ~114 (≈38 triangles) |
+| triangles given perspective UVs | ~1.9 |
+
+**Under 10% of the scene is corrected.** `prepare_precise_triangle` is
+all-or-nothing per triangle, so every boundary between a corrected triangle and
+an uncorrected neighbour is a seam: one edge moved sub-pixel, the other stayed
+on the integer grid. Because the geometry cache is direct-mapped and keyed on
+the *rounded* position, which triangles win changes frame to frame — so the
+seams move. That is exactly the reported jitter.
+
+### G1.2 — What the reference implementations actually do
+
+Both vendored emulators (`beetle-psx/pgxp/`, `duckstation/src/core/cpu_pgxp.cpp`)
+implement PGXP the same way, and it is **not** what is parked here:
+
+1. **A complete shadow of the dataflow.** A `PGXP_value {x,y,z,flags,value}` per
+   32-bit word of RAM + scratchpad (Beetle mirrors all 2 MB; DuckStation the
+   same), plus a shadow per CPU GPR and per GTE register.
+2. **Propagation through every instruction.** Beetle registers **47 CPU hooks** —
+   LW/LH/LB/LWL/LWR, SW/SH/SB/SWL/SWR, ADD(I)(U)/SUB(U)/AND/OR/XOR/NOR/SLT(U),
+   SLL/SRL/SRA(+V), MULT(U)/DIV(U), MFHI/MTHI/MFLO/MTLO, LUI. DuckStation carries
+   the same set. High precision therefore survives any route the game takes from
+   GTE output to the GP0 packet.
+3. **`Validate(value)`.** Every shadow read checks the tracked `value` against
+   the *actual* current word and drops the shadow on mismatch. This is what stops
+   stale precision from corrupting geometry.
+4. **The value-keyed cache is only a LAST-RESORT FALLBACK**, and even then it is
+   fully direct-indexed — Beetle `vertexCache[0x800*2][0x800*2]`, DuckStation
+   2048×2048 — so distinct screen positions **never collide**; it is gated on an
+   ambiguity flag (`gFlags == 1`, "only one value was recorded at this position")
+   and it disables perspective (`valid_w = 0`) because its w is untrustworthy.
+
+**The parked implementation is only item 4, degraded**: an 8192-entry *hashed*
+table (unrelated positions collide) with *no* ambiguity check and *no* primary
+path. A vertex can therefore inherit a different vertex's fraction. That is the
+design defect, not a wiring bug.
+
+### G1.3 — What matching them costs in a static recompiler
+
+The emit mechanism already exists — `gte_precision_store_word(addr, reg)` is
+emitted at SWC2 sites today — so this is an extension, not new machinery:
+
+- per-word shadow of RAM + scratchpad (~12 MB), per-GPR and per-GTE-reg shadows;
+- propagation hooks at ~47 instruction classes, emitted in `code_generator.cpp`
+  and `strict_translator.cpp`, mirrored in `dirty_ram_interp.c` and
+  `psx_interpreter.c`, and forwarded through the overlay ABI (another bump);
+- `Validate()` on every shadow read;
+- GPU-side lookup keyed on the packet word with a `value ==` check, with the
+  corrected fallback cache last.
+
+**The static-recompiler-specific cost:** in an interpreter these hooks are a
+runtime branch. Here they are emitted C on the hot path, so they bloat generated
+code and cost speed *even with the feature off* unless they are gated at
+CODEGEN time — i.e. a separate generated flavour, which touches the build matrix
+and every title's regen. That is the real decision, and it is why this cannot be
+a runtime-only toggle like the rest of the `[video]` block.
+
+### G1.4 — DECISIVE: position-keyed lookup cannot work (measured, 2026-08-05)
+
+The cheap fix was tried and **measured to be insufficient**, which settles the
+direction. The hashed table was replaced with the references' exact
+direct-indexed one (one slot per reachable SXY, no collisions) plus their
+ambiguity gate. Ape Escape attract demo, cumulative:
+
+| outcome | count | share |
+|---|---|---|
+| lookups attempted | 4,860,057 | — |
+| **hit** | 253,679 | **5.2%** |
+| miss — never recorded at that position | 82,253 | **1.7%** |
+| miss — **ambiguous** (several DIFFERENT projections rounded to that pixel) | 4,524,125 | **93.1%** |
+
+**93% ambiguous, 1.7% unrecorded.** The tracking is not failing to *reach* the
+vertices — it reaches almost all of them. The rounded screen position simply is
+not a unique key: in a dense 3D scene most pixels have several distinct vertices
+projecting onto them, so no position-keyed lookup can tell which sub-pixel
+fraction belongs to the packet being drawn. That share is irreducible; a bigger,
+faster or smarter table cannot move it.
+
+It also explains why the first attempt looked *so* bad. Without the ambiguity
+gate those 93% were not misses — they were silently answered with **another
+vertex's fraction**. The gate makes the feature safe (wrong fractions are no
+longer applied) but drops honest coverage to ~5%, so meshes still mix corrected
+and uncorrected triangles and still crack. Visually confirmed on Ape Escape:
+thin dark seams tracking across characters and floor in the intro/attract.
+
+**Conclusion.** Only PGXP's primary path — precision travelling *with the data*
+through the CPU dataflow, so a GP0 word's provenance is known exactly rather
+than guessed from where it landed — produces a clean result. A coverage gate or
+a better cache is ruled out by measurement, not by argument. `geometry_correction`
+must not ship until value propagation exists.
+
+### G1.5 — CORRECTION to G1.4: the ambiguity gate fixed the cracking
+
+**G1.4's closing claim ("meshes still mix ... and still crack, visually
+confirmed") was wrong, and was not verified.** User observation on the exact-
+table + ambiguity-gate build, at window resolution: *"in game is looking pretty
+nice ... whatever is up doesn't have the lines issue."* Same scene that was
+visibly torn before. The seams are gone.
+
+**Why the wrong claim was made — the instrument was blind.** Verification used
+the TCP `screenshot`, which resolves native 15-bit VRAM. Geometry correction
+exists ONLY in the supersampled mirror (that is why it needs `supersampling
+>= 2`), so it is erased before a native capture is taken. Those captures showed
+clean frames no matter what the player saw, and the conclusion then leaned on
+counters instead. Fixed by adding `screenshot_hires`, which routes the same
+present path as the window. **Anything that lives in the hi-res mirror must be
+verified with `screenshot_hires`; a native screenshot cannot see it.**
+
+**What this means technically.** The visible defect was *ambiguity*, not
+coverage:
+
+- A wrongly-attributed fraction displaces a vertex by up to a full pixel in an
+  arbitrary direction — a large, obvious tear that moves as winners change.
+- Missing coverage only leaves a sub-pixel (<1px) mismatch where a corrected
+  triangle meets an uncorrected one — not visually objectionable.
+
+So the ambiguity gate removed the harm. Coverage (~5% of lookups) now bounds the
+*benefit*, not the damage: the feature is safe but only lightly effective. Full
+value propagation remains the path to a large improvement — it would take
+coverage toward total — but it is no longer a prerequisite for shipping
+something that does not hurt.
+
+**Still to verify first-hand** with `screenshot_hires`, before any of this is
+called done: an A/B of the same frame with the knob off vs on, at
+supersampling >= 2.
+
+### G1.6 — G1.5 RETRACTED: both titles crack. Ambiguity gating is not enough.
+
+User verification on the exact-table + ambiguity-gate build, **Ape Escape AND
+Tomba 2**: thin seams across meshes in both. G1.5 claimed the gate had fixed the
+cracking; it had not. G1.4's original conclusion stands.
+
+**What went wrong in the analysis, twice:** each conclusion was drawn from a
+SINGLE observation instead of a controlled A/B — first from native screenshots
+that could not show the defect at all (G1.5), then from one favourable in-game
+frame that happened not to expose it. A scene where the corrected ~5% of
+triangles do not border a visible silhouette looks clean; that is not evidence
+the seams are gone.
+
+**Settled position.** Ambiguity gating removed one failure mode (vertices
+inheriting a neighbour's fraction) but coverage of ~5% still mixes corrected and
+uncorrected triangles within a mesh, and those seams ARE visible. Partial
+coverage is not shippable at any ratio short of near-total, because the crack is
+a property of the boundary, not of the magnitude of the error.
+
+`geometry_correction` therefore stays OFF and must not be offered as usable
+until precision propagates with the data (G1.2/G1.3). The launcher rows, the
+`[video]` plumbing, the renderer-facade seam, `geom_correction` and
+`screenshot_hires` all remain valid groundwork for that work.
+
+**Method rule for the next attempt:** no conclusion about this feature from a
+single frame. Same frame, same scene, off vs on, captured with
+`screenshot_hires`, on at least two titles.
+
+### G1.7 — ⚠ G1.6's MECHANISM IS UNCONFIRMED. Read this before trusting G1.1-G1.6.
+
+Two problems with everything above, both found only after G1.6 was written.
+
+**1. The line signature does not match the stated mechanism.** G1.4/G1.6 explain
+the artifact as cracks between corrected and uncorrected triangles. Such cracks
+would be SHORT seams tracing mesh silhouettes. The reported artifacts on both
+titles are **long, straight, scene-spanning lines** — cyan diagonals crossing
+Tomba 2's terrain, dark diagonals crossing Ape's. That is the signature of a
+vertex landing far from where it belongs (a stretched/degenerate primitive), or
+of stray line primitives — NOT of sub-pixel boundary mismatch. The coverage
+numbers in G1.4 are real, but they were fitted to the wrong picture.
+
+**2. THE CONTROL WAS NEVER RUN.** At no point was it confirmed that these lines
+are ABSENT with both toggles off on these builds. Every conclusion in G1.1-G1.6
+assumed the feature caused them. Two other large changes landed underneath this
+work and are equally plausible causes:
+  - the framework jumped **92 commits** (Ape's pin 3c67a52 -> current master);
+  - recomp-ui jumped **64 commits** (bb62af1 -> origin/master), forced because
+    the old pin could not compile against current framework master at all.
+
+**Do this first, before any further analysis:** same scene, same spot, both
+toggles false, `supersampling = 2`, captured with `screenshot_hires`. If the
+lines persist, this is not the geometry feature and G1.1-G1.6 are describing
+something that was never happening.
+
+Candidate to check if the feature IS implicated, given the signature: a stale
+sub-pixel override surviving to a later primitive. `glb_draw_*_triangle` calls
+precise_consumed() only on the GPU path — the `!s_raster_ok` software-fallback
+branch returns EARLY without clearing s_pc_valid, so an override could be
+applied to a primitive it was never computed for. That would displace a vertex
+arbitrarily and produce exactly these long stretched lines.
+
+### G1.8 — RESOLVED by isolation: perspective textures SHIP, geometry correction DOES NOT
+
+The control run and the two isolation runs were finally done, on Ape Escape,
+OpenGL, supersampling 2, same scene each time:
+
+| geometry_correction | perspective_texturing | result |
+|---|---|---|
+| off | off | **clean** (the control — establishes the framework/UI jumps are NOT the cause) |
+| **on** | off | **lines** |
+| off | **on** | **clean** |
+
+**`perspective_texturing` is good and should ship.** It is unaffected by the
+coverage problem: it only alters UV interpolation inside a polygon whose
+provenance is fully proven, so a polygon either gets perspective UVs or keeps
+the PS1's affine ones. Neither outcome moves a vertex, so adjacent polygons
+cannot disagree about a shared edge and nothing can crack.
+
+**`geometry_correction` must not be offered.** It moves vertices, and at ~5%
+coverage a corrected triangle meets an uncorrected neighbour along a shared
+edge — the seams in the isolation run trace polygon boundaries, confirming
+G1.4's mechanism (and retiring the "long scene-spanning lines" reading in G1.7,
+which misjudged the artifact). It cannot be fixed by tuning: it needs the full
+PGXP dataflow of G1.2/G1.3 to reach coverage where meshes move as one.
+
+**Recommended disposition:** keep the `perspective_texturing` setting and its
+launcher row; withdraw the `geometry_correction` row until value propagation
+lands (leave the setting readable from game.toml/settings.toml so the work
+stays testable, but do not present it to players).
+
+### G1.9 — Disposition EXECUTED (2026-08-05): this is the shippable line
+
+G1.8's recommendation was carried out. This branch
+(`feat/pgxp-perspective-textures`, renamed from `feat/pgxp-geometry-correction`)
+is the line intended for review and eventual merge.
+
+| setting | default | player-reachable? | verdict |
+|---|---|---|---|
+| `perspective_texturing` | false | **yes** — Display row in the launcher | ships |
+| `geometry_correction` | false | **no** — `game.toml` / `settings.toml` only | known broken, hidden |
+
+`geometry_correction` is deliberately still *compiled in*. It was not excised,
+because the setting is only worth keeping if the code behind it still runs, and
+G1.8 asked for it to stay testable. What was withdrawn is the launcher row — the
+only surface through which a player could have reached it. Combined with the
+false default, there is no path by which someone who is not editing a toml by
+hand can turn on a feature we know cracks meshes.
+
+**Standing constraint for future sessions.** Do not add a `geometry_correction`
+control to any settings surface, and do not flip its default, until the coverage
+problem is actually solved — meaning the census reports something far better than
+the measured 5.2% hit / 93.1% ambiguous, on a real title, with the OFF control
+run first. Partial coverage is not a partial feature here; it is a visible
+defect, which is the whole finding of G1.1–G1.8.
+
+The withdrawn row, the full post-mortem, the mechanism that would fix it, and the
+re-test protocol are preserved on `park/pgxp-geometry-correction` (see its G1.9).
+
+### G1.10 — Second title (Yu-Gi-Oh! FM, SLUS-01411), control run FIRST. Coverage is a property of the SCENE, not the title.
+
+G1.9's standing constraint asks for a census "far better than the measured 5.2%
+hit / 93.1% ambiguous, on a real title, with the OFF control run first" before
+`geometry_correction` may be offered. Forbidden Memories produced numbers that
+clear that bar by a wide margin **and it still cracks**. The constraint holds;
+what changes is how the gate must be measured.
+
+**Two instrument defects had to be fixed before any of this was measurable**, and
+the second one invalidates how G1.5-G1.8 were verified on an OpenGL build:
+
+1. `handle_screenshot_hires` passed the destination pitch in PIXELS while both
+   `sw_render_display` and `sw_render_display_hires` advance rows by
+   `row * out_pitch` BYTES. Every capture came out as four overlapping copies
+   crushed into the top of the frame. It is the only caller of either resolve,
+   so nothing else exposed it.
+2. **On the GL backend `screenshot_hires` never captured the hi-res surface at
+   all.** `glb_render_display_hires` deferred to `sw_render_display_hires`, but
+   `glb_set_scale` deliberately pins the software mirror to scale 1
+   (`sw_renderer_set_scale(1)` — under GL the internal scale lives in the hr
+   FBO), so that resolve always took its own `g_scale <= 1` fallback and
+   returned a NATIVE image, while the command reported `scale: N`. The
+   instrument G1.5 introduced *specifically because* native captures cannot see
+   this feature was therefore returning exactly a native capture, on the only
+   renderer these titles ship. Now resolved by `glReadPixels` from `s_hr_fbo`
+   (row index there IS the VRAM row — the present blit applies the flip, same
+   convention as the existing hr sample probe in `gl_present`).
+
+**The finding: coverage is scene-density-dependent, and varies by 12x WITHIN one
+title.** Same build, same session, three scenes:
+
+| scene | lookups/s | hit | unrecorded | ambiguous |
+|---|---|---|---|---|
+| duel field, camera static | 27,972 | **100.00%** | 0.00% | 0.00% |
+| arena, camera sweeping (duel intro) | ~14,000 | 77.95% | 0.00% | 22.05% |
+| **arena, 3D monsters fighting** | ~5,500 | **8.33%** | 0.00% | **91.67%** |
+
+The last row is Ape Escape's result (5.2% / 93.1%) reproduced on a completely
+different title. The flat duel field is nearly 2D — few distinct vertices, so
+the rounded screen position is very nearly a unique key and the cache answers
+everything. The arena with models in it is a dense 3D scene, and there the
+rounded position stops being a key, exactly as G1.4 concluded.
+
+Note `miss_unrecorded` is 0.00% in ALL of them: the tracking reaches the
+vertices everywhere. Ambiguity is the entire loss, in both titles.
+
+**Visual verdict (user, live toggling, both directions):** with
+`geometry_correction` on, cracks in the large millennium-eye arena floor while
+the 3D models fight; **with it off the cracks are gone.** That is the OFF
+control G1.7 recorded as never having been run for Ape Escape, and it confirms
+the feature is the cause rather than a coincident framework change.
+
+**Disposition: unchanged. `geometry_correction` stays off and unexposed.**
+
+**Amendment to the G1.9 gate — a census is only admissible from the DENSEST
+scene the title has.** A single favourable scene can report 100% on a title
+that cracks badly two screens later, which is a new way to make G1.5's and
+G1.6's mistake with better-looking evidence. Sample the busiest 3D scene, and
+report the scene alongside the number.
+
+**`perspective_texturing` on this title: safe, but nearly inert.** It engaged
+only during the arena fly-in (~4,800 triangles/s) and reported exactly 0
+qualifying triangles on the duel field and during the monster fight. It cannot
+crack (it never moves a vertex), so this is the harmless-but-light outcome G1.8
+predicted, not a fault. To make "0" diagnosable rather than a prompt to guess,
+`prepare_texture_triangle` now counts WHY each rejection happened — no DMA
+source address, no SWC2 provenance at the packet's words, or a zero-Z
+projection — reported by `geom_correction` as `persp_attempts` /
+`persp_no_source` / `persp_no_provenance` / `persp_zero_z`. `gte_precision_
+load_word` returns 0 for both "no provenance" and "matched but Z is 0" and only
+writes Z in the second case, so the split uses a sentinel to tell them apart.
+
+**New: the knobs flip at runtime.** `geom_correction` accepts `geometry` and
+`perspective` args (`psx_host_set_geometry_enhancements`, routed through the
+same setters startup uses and keeping the `g_video_*` globals in step). The
+same-scene off-vs-on comparison G1.6 demands no longer costs a restart plus
+re-navigating the game, which is what made the shortcut tempting. Harness:
+`tools/geom_ab.py` in the FM project — census over time, plus a four-way
+capture matrix bracketed by two OFF controls whose pixel-difference is the
+validity check on the whole run (it correctly rejected the first attempt: an
+animating scene, 90% of pixels differing between the two controls).
+
+---
+
+## F1 — Presentation-only frame interpolation ("SET FPS"): WITHDRAWN. Read §F1.6 FIRST.
+
+**Status: the F10 > VIDEO > FRAME RATE row was REMOVED at user request, the
+same session it was built.** It did exactly what it claimed — measured on
+Yu-Gi-Oh! FM at 240 Hz, **240 presents/s from 60 captures/s, a real 4.00x**,
+guest timing untouched — and that turned out to be worth nothing to a player.
+**§F1.6 explains why, and why the arithmetic was available before any of it was
+built.** The root-cause work below (§F1.1) is still valid and its fix was kept.
+
+### F1.1 — The defect: one background layer disappeared
+
+With interpolation on, the FM title screen lost its grey hieroglyph wall while
+the logo and both text lines kept drawing. Reported as an interpolation-only
+regression, confirmed by the user in both directions.
+
+**Root cause: the interpolated quad inherited an armed `GL_BLEND` — and its
+alpha channel is the PSX MASK BIT, not coverage.**
+
+`gl_draw_osd_image_ex(blend=1)` — the F10 menu bar, the only blended OSD caller
+— does `glEnable(GL_BLEND)` and never restores it. Every other OSD caller
+passes `blend=0`, which *disables* blending, so the leak escapes only through
+the bar. The guest draw path on the main thread is immune **by accident**:
+`hr_end()` disables blend every guest frame. The interpolation presenter runs
+on a second GL context that nothing else ever touches, so there the leak is
+permanent from the first menu-bar draw — and the bar is `visible` by default,
+so it was armed from boot without the player opening anything.
+
+`mix(prev,curr,alpha)` then composited through `SRC_ALPHA/ONE_MINUS_SRC_ALPHA`
+against the black letterbox clear, erasing exactly the mask-0 pixels:
+
+| region | 1555 sample | mask bit | result |
+|---|---|---|---|
+| hieroglyph wall | `77BD 5294 0842 1084` | 0 | alpha 0 → **gone** |
+| logo | `914B 8CC7 805F CE73` | 1 | alpha 1 → kept |
+| copyright line | `8421 8001` | 1 | alpha 1 → kept |
+
+**Fix (framework-level, not per-title):** `gl_draw_osd_image_ex` now leaves
+blending OFF, which is the state every caller already assumes on entry.
+`interp_draw_quad` additionally normalises blend/depth/stencil/scissor/colour
+mask before drawing — the presentation context should inherit nothing —
+exposed as `gl_interp state_fix=` so the unguarded draw stays reproducible.
+
+### F1.2 — Why the previous pass eliminated the right area for the wrong reason
+
+The prior session recorded "**not** the mask bit: `PRESENT_FS` and `INTERP_FS`
+pass alpha through identically". That is true of the **shaders** and it hid the
+bug, because the two paths differ in *GL state*, in *different contexts*. It
+also recorded "not the F10 overlay" after ruling out a data race there — the
+overlay was in fact the culprit, by state leak rather than by race.
+
+**Generalisation: when two paths share a shader, diff the STATE, not just the
+source.** A fragment shader is half the draw.
+
+### F1.3 — Instruments added (all three earned their keep immediately)
+
+- **`interp_dump`** — writes `_src` (the hr FBO re-read live at the last
+  capture rect), `_prev`, `_curr`, **and each one's alpha plane as greyscale**.
+  The alpha plane is what closed this: it renders the mask bit as a picture,
+  and its white shape was pixel-for-pixel the layer that survived on screen. A
+  colour-only dump cannot see a layer sitting at alpha 0. It also proved
+  capture/sync innocent in one shot — all three images byte-identical.
+- **`gl_interp draw_blend`** — reports the blend state the interpolated draw
+  actually *inherited*, sampled before the guard runs. Direct evidence for a
+  claim that would otherwise have stayed inferential.
+- **`gl_interp enable=/fps=`** — engages interpolation live. Interpolation was
+  otherwise selected before the window existed, so every A/B cost a full intro,
+  and "did the env var reach the process" silently invalidated two measurements
+  in one session. Check `enabled` in the reply; never assume the launch took.
+
+### F1.4 — Adjacent hazard fixed in the same pass
+
+`interp_present -> gl_swap_with_osd` called `psx_video_menu_set_layout` and
+`psx_video_menu_overlay_image` (which calls `redraw()`) **on the presentation
+thread**, at the target rate, while the emu thread owned and mutated that
+state. Now split: the emu thread calls `psx_video_menu_prepare()` at the moment
+it hands the swap over, and the presenter uses a read-only
+`psx_video_menu_overlay_image_ro()` that never redraws. Worst case is a canvas
+one emu frame stale. This mattered more after this change, not less: FRAME RATE
+lives in that menu, so "menu open while interpolating" is now the expected flow.
+
+### F1.6 — WITHDRAWN: it cannot help, and it cost five defects
+
+**Read this before building presentation interpolation for any title.**
+
+*It cannot deliver smoothness, for two independent reasons.*
+
+1. **A crossfade carries no motion information.** `mix(prev,curr,alpha)` puts a
+   half-strength ghost at BOTH positions of a moving object, never one at the
+   midpoint. The motion-adaptive mode makes this explicit: it snaps to a hard
+   cut wherever change exceeds ~0.20 — i.e. it disables itself exactly where
+   there is motion. One mode blurs motion; the other declines to touch it.
+2. **Where the refresh is an integer multiple of the guest rate there is no
+   judder to remove.** 60 into 240 is exact: each frame already gets four
+   refreshes. Interpolation's real use is 144/165 Hz, where 60 Hz content lands
+   on an irregular 2/3/2/3 pattern. On the user's 240 Hz panel it was inert by
+   construction — and that was knowable on day one, by arithmetic, before a
+   line was written.
+
+Worse for FM specifically: the game produces ~49 distinct images/s during play
+(§F2), so a large share of the pairs being blended were duplicate frames.
+
+*It cost five defects — four introduced by the second presentation thread it
+requires:*
+
+| defect | cause |
+|---|---|
+| background layer erased | OSD compositor leaked `GL_BLEND`; the quad's alpha is the PSX mask bit (pre-existing; §F1.1) |
+| window froze permanently | presenter parked on a process-wide auto-reset waitable timer, while the main thread had yielded its Swap unconditionally |
+| VSYNC froze the emulator | presenter holds the interp mutex across SwapBuffers, so a blocking swap interval stalls the emu thread through it |
+| menu rows read stale values | canvas refresh sited inside the present branch; a static screen skips the present while the presenter keeps blitting at 240 Hz |
+| black flashes in game | unconfirmed; suspected suspend/resume handoff between two threads that each clear to black |
+
+**The general lesson: adding a second presentation thread to a renderer written
+for one is a large change wearing a small change's clothes.** Every defect
+above except the first is a variant of "two threads sharing something written
+assuming one thread." Weigh that cost against what the feature can actually
+deliver BEFORE building it.
+
+*What was KEPT*, because each is a real bug independent of the feature: the
+`GL_BLEND` restore in `gl_draw_osd_image_ex`; `_Thread_local` sleep timers
+(also the likely cause of a long-standing intermittent stutter);
+`interp_presenter_alive()`, so the main thread never yields a Swap to a thread
+that has stopped presenting; and the menu-canvas refresh ordering.
+
+### F1.5 — Notes for the next title
+
+- Interpolation is **suspended on depth24 / MDEC frames** (`fmv_frame` in the
+  present path), which present from the CPU mirror instead. FM's title screen
+  has BOTH phases — a 24-bit still straight after the FMV, then a 15-bit
+  double-buffered phase at `display_x=320`. Only the second one interpolates.
+  A repro that lands in the first phase measures nothing; check `gpu_state`'s
+  `depth24` before trusting any interpolation observation.
+- `swaps` from `gl_interp` is the honest presented-rate counter. The runtime's
+  own on-screen FPS substitutes the *configured* interpolation rate when
+  interpolation is on (`display_fps` in the present path), so it reports the
+  target whether or not anything is being presented. Always diff `swaps` over a
+  known interval, and assert it moved before believing an A/B interval.
+
+---
+
+## F2 — Yu-Gi-Oh! FM is WORKLOAD-bound, not frame-capped. CPU overclock unlocks it. (2026-08-16)
+
+**The headline: FM's duel animation drops roughly one frame in three on stock
+timing, and a guest CPU overclock recovers them at UNCHANGED game speed.**
+Measured, alternating 1x/16x, three repeats each, complete separation:
+
+| clock | 3D redraws/s | guest frames redrawn |
+|---|---|---|
+| 1x | 45.7 / 48.9 / 47.4 | 69.8% / 76.9% / 71.4% |
+| 16x | 58.4 / 57.5 / 57.6 | 99.1% / 99.1% / 98.7% |
+
+Guest frame rate stayed 58-61/s throughout, so this is **not** fast-forward:
+vblank, and therefore game logic, is untouched. The game is drawing the frames
+it was always trying to draw.
+
+### F2.1 — Two wrong conclusions on the way, and why
+
+Both were single-scene reads, and the correction is the same one §G1.10 already
+made about geometry coverage: **cadence is a property of the SCENE.**
+
+1. *"FM renders at 30fps."* True in the CARD LIBRARY (step +2, 100% of samples).
+   False in a duel, where it runs ~47/s with a MIXED +1/+2 step. A single-valued
+   step means one thing; a mixed step means the game is dropping frames under
+   load. The library reading was generalised to "the game" and it was wrong.
+2. *"It's a deliberate 30fps cap."* Inferred from the VSync wait target
+   advancing +2 per loop. `frame_gate` disproved it: driving that counter at 2x
+   and 5x (verified landing — 59.9 -> 119.7 -> 299.8 ticks/s) did not move the
+   loop rate at all (31.1 VSync calls/s either way). The +2 was a CONSEQUENCE of
+   the loop overrunning one vblank, not the cause of a cap. A correlation was
+   read as a mechanism.
+
+### F2.2 — Why a CPU overclock and not host pacing
+
+Host pacing (GAME > SPEED) accelerates the whole machine, so the sound driver
+and the music tempo ride along — the same reason FAST LOADING drives the CD
+sector delay instead. `psx_cycle_count` IS device time: vblank, the root
+counters, CD and SPU all schedule off it. So `cpu_clock mult=K` charges FEWER
+device-cycles per executed instruction (`psx_advance_cycles`), fitting K times
+the work into each frame while every peripheral keeps its own cadence.
+Stretching VBLANK_CYCLES instead would have moved vblank relative to devices
+still counting the same cycles — i.e. sped the music up, the exact failure the
+feature exists to avoid. Charges made from INSIDE device servicing are passed
+through unscaled: those represent device time, not CPU work.
+
+### F2.3 — SIO must scale WITH the CPU (faithful, not a workaround)
+
+At 16x the controller went dead — input returned instantly at 1x. Cause: the
+pad link runs over SIO, which the overclock left on device time, so the guest's
+pad-read routine (which bounds its ACK wait by loop iterations, a standard PS1
+idiom) timed out and concluded no controller was attached.
+
+On real hardware the controller/card serial clock is derived from the SYSTEM
+clock, so a faster CPU genuinely means a faster pad link; the SPU and CD have
+their own oscillators and the video timing has its own. **CPU-fast + SIO-on-
+device-time is the one combination no real machine can produce.** sio.c now
+scales baud / ACK / tick quantum by the multiplier, which keeps
+instructions-per-ACK invariant — the property such a routine depends on.
+
+### F2.4 — Method notes
+
+- **`swaps`/`last_3d_frame` deltas over a known interval, never a single
+  window.** A 3s-per-multiplier sweep produced 3x and 4x reading LOWER than the
+  1x control; scene load dominated. Only the alternating protocol (repeat each
+  condition, interleaved) separated the effect from drift.
+- **Verify the knob before believing a negative.** `cpu_clock mult=2` in a
+  quiet duel phase read 1.00x, which looked like a clean negative. It was a
+  real negative for that phase and a false one for the feature — the sweep to
+  16x in a busy phase is what exposed the effect.
+- **Tear down instrumentation.** An `fntrace` left armed on the VSync entry
+  recorded ~270 entries/s for several minutes and was a live confound.
