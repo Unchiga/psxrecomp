@@ -6158,6 +6158,10 @@ static void rewind_pause_present(void) {
 }
 
 /* Freeze guest in vblank present while the rewind filmstrip is open. */
+/* Defined below, with the save-state overlay that is its other caller. */
+static void mouse_to_drawable(int raw_x, int raw_y, int *ox, int *oy,
+                              int *ow, int *oh);
+
 static void rewind_host_pause_loop(void) {
     while (psx_rewind_is_open()) {
         SDL_Event ev;
@@ -6184,6 +6188,40 @@ static void rewind_host_pause_loop(void) {
                 if (!repeat &&
                     host_keymap_match(HOST_KEYMAP_REWIND, (int)key, (int)mod)) {
                     psx_rewind_toggle();
+                }
+            } else if (ev.type == SDL_MOUSEMOTION) {
+                int mx, my, dw, dh;
+                mouse_to_drawable(ev.motion.x, ev.motion.y, &mx, &my, &dw, &dh);
+                psx_rewind_hover(mx, my, dw, dh);
+            } else if (ev.type == SDL_MOUSEWHEEL) {
+                /* Wheel seeks the strip. There is no scroll position to move
+                 * independently — the strip is centred on the selection — so
+                 * scrolling IS seeking, same as the save-state slot list. */
+                int dy = ev.wheel.y;
+                if (dy > 0) psx_rewind_move(-1);
+                else if (dy < 0) psx_rewind_move(+1);
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN &&
+                       ev.button.button == SDL_BUTTON_LEFT) {
+                int mx, my, dw, dh;
+                mouse_to_drawable(ev.button.x, ev.button.y, &mx, &my, &dw, &dh);
+                /* A card only SELECTS. Loading discards everything since that
+                 * snapshot, so it stays on the footer button where it cannot
+                 * happen by brushing the strip — the same call the save-state
+                 * rows make for the same reason. */
+                const int snap = psx_rewind_hit_thumb(mx, my, dw, dh);
+                if (snap >= 0) {
+                    psx_rewind_select(snap);
+                } else {
+                    switch (psx_rewind_hit_action(mx, my, dw, dh)) {
+                        case PSX_RW_ACTION_LOAD:
+                            psx_rewind_accept();
+                            break;
+                        case PSX_RW_ACTION_CLOSE:
+                            psx_rewind_cancel();
+                            break;
+                        default:
+                            break;
+                    }
                 }
             }
         }

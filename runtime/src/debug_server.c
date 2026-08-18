@@ -13849,6 +13849,22 @@ static void handle_savestate_input_trace(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+/* rewind_state — is the filmstrip up, which snap is selected, how many exist,
+ * and which one the mouse is over. Needed because the panel is a host overlay
+ * driven by real input: the VRAM screenshot cannot see it and nothing else
+ * reports it. Pair with menu_click / menu_move, which push real SDL mouse
+ * events through the same path a physical mouse takes. */
+static void handle_rewind_state(int id, const char *json)
+{
+    extern void psx_rewind_debug(int *, int *, int *, int *);
+    int open = 0, sel = 0, count = 0, hover = -1;
+    (void)json;
+    psx_rewind_debug(&open, &sel, &count, &hover);
+    send_fmt("{\"id\":%d,\"ok\":true,\"open\":%d,\"sel\":%d,"
+             "\"count\":%d,\"hover\":%d}",
+             id, open, sel, count, hover);
+}
+
 /* savestate_menu_state — is the slot menu up, and on which slot. The menu is
  * driven by real key/pad input, so without this its state could only be judged
  * from pixels, and the overlay is host-drawn (invisible to the VRAM
@@ -13921,6 +13937,7 @@ static const CmdEntry s_commands[] = {
     { "rank_fade_ring",    handle_rank_fade_ring },
     { "savestate_input_trace", handle_savestate_input_trace },
     { "savestate_menu_state", handle_savestate_menu_state },
+    { "rewind_state",      handle_rewind_state },
     { "card_drops_state",  handle_card_drops_state },
     { "card_drops_list",   handle_card_drops_list },
     { "frame_pacing",      handle_frame_pacing },

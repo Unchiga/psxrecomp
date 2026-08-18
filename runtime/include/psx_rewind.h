@@ -45,6 +45,32 @@ int  psx_rewind_toggle(void);          /* open/close; 1 if state changed */
 int  psx_rewind_cancel(void);          /* close without load */
 int  psx_rewind_accept(void);          /* stage load of selected snap */
 void psx_rewind_move(int delta);       /* -1 / +1 selection */
+void psx_rewind_select(int index);     /* absolute selection; ignores out-of-range */
+
+/* Mouse support for the filmstrip.
+ *
+ * Coordinates are DRAWABLE pixels, and surface_w/surface_h the drawable size.
+ * The panel is authored against a fixed 640x176 canvas that the renderer
+ * stretches across the full window width and slides up from the bottom edge,
+ * so the window -> canvas mapping lives here, next to the geometry it has to
+ * agree with, and accounts for the slide animation. Everything reports "no
+ * hit" while the panel is off screen or mid-slide.
+ *
+ * _hit_thumb returns the snap index under the cursor, or -1. Clicking a
+ * thumbnail only SELECTS it; loading is the footer's job, deliberately, since
+ * a load discards live progress and a stray click should not cost that.
+ * _hit_action covers the footer legends, which were already drawn as buttons.
+ * _hover updates the highlight and marks the panel dirty only on a real
+ * change, so a moving cursor does not force a redraw every frame. */
+enum { PSX_RW_ACTION_NONE = 0, PSX_RW_ACTION_LOAD, PSX_RW_ACTION_CLOSE };
+int  psx_rewind_hit_thumb(int x, int y, int surface_w, int surface_h);
+int  psx_rewind_hit_action(int x, int y, int surface_w, int surface_h);
+void psx_rewind_hover(int x, int y, int surface_w, int surface_h);
+
+/* Debug-server surface (rewind_state). The filmstrip is driven by real input
+ * and drawn as a host overlay, so it is invisible to the VRAM screenshot and
+ * had no readback at all. */
+void psx_rewind_debug(int *open, int *sel, int *count, int *hover);
 
 /* Edge-triggered nav with repeat. *_down is 1 while held. */
 void psx_rewind_nav_held(int left_down, int right_down, int accept_down,

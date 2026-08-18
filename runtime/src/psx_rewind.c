@@ -34,6 +34,16 @@
 #define RW_PANEL_W     640
 #define RW_PANEL_H     176
 #define RW_SLIDE_MS    180u
+/* Footer legend hit boxes, in canvas coords. The glyph is ~18px wide and the
+ * label advances 8px per character, both drawn at fy = RW_PANEL_H - 22. SEEK
+ * and the hotkey hint are deliberately absent: they name inputs rather than
+ * offering an action, so a click on them does nothing. */
+#define RW_FOOT_Y0   (RW_PANEL_H - 26)
+#define RW_FOOT_Y1   (RW_PANEL_H - 2)
+#define RW_LOAD_X0   112
+#define RW_LOAD_X1   180
+#define RW_CLOSE_X0  212
+#define RW_CLOSE_X1  288
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 /* Public-domain 8x8 ASCII 32..90 (subset of font8x8_basic). */
@@ -123,6 +133,28 @@ int  psx_rewind_toggle(void) { return 0; }
 int  psx_rewind_cancel(void) { return 0; }
 int  psx_rewind_accept(void) { return 0; }
 void psx_rewind_move(int delta) { (void)delta; }
+void psx_rewind_select(int index) { (void)index; }
+int  psx_rewind_hit_thumb(int x, int y, int surface_w, int surface_h)
+{
+    (void)x; (void)y; (void)surface_w; (void)surface_h;
+    return -1;
+}
+int  psx_rewind_hit_action(int x, int y, int surface_w, int surface_h)
+{
+    (void)x; (void)y; (void)surface_w; (void)surface_h;
+    return PSX_RW_ACTION_NONE;
+}
+void psx_rewind_hover(int x, int y, int surface_w, int surface_h)
+{
+    (void)x; (void)y; (void)surface_w; (void)surface_h;
+}
+void psx_rewind_debug(int *open, int *sel, int *count, int *hover)
+{
+    if (open)  *open  = 0;
+    if (sel)   *sel   = 0;
+    if (count) *count = 0;
+    if (hover) *hover = -1;
+}
 void psx_rewind_nav_held(int left_down, int right_down, int accept_down,
                          int cancel_down, uint32_t now_ms)
 {
@@ -164,6 +196,7 @@ static RwThumb *s_thumbs;
 static uint32_t *s_ticks;
 static uint32_t s_count;
 static int s_sel;
+static int s_hover = -1;   /* thumbnail under the mouse, -1 = none */
 
 static int s_open;
 static float s_slide;
@@ -547,6 +580,10 @@ int psx_rewind_toggle(void)
     s_open = 1;
     s_anim_dir = 1;
     s_anim_t0 = 0u;
+    /* Forget where the mouse was last time: the strip is rebuilt around a new
+     * selection, so a stale index would highlight an unrelated card until the
+     * cursor next moved. */
+    s_hover = -1;
     /* Swallow currently-held Back/L3/A so open doesn't instantly cancel. */
     s_left_was = s_right_was = s_acc_was = s_can_was = 1;
     s_rep_dir = 0;
@@ -590,6 +627,100 @@ void psx_rewind_move(int delta)
         s_sel = 0;
     if (s_sel >= n)
         s_sel = n - 1;
+    s_panel_dirty = 1;
+}
+
+/* Defined with the rasterizer below, which is the other consumer. */
+static void thumb_rect(int i, int *rx, int *ry, int *rw, int *rh);
+
+void psx_rewind_select(int index)
+{
+    if (!s_open || !s_count)
+        return;
+    if (index < 0 || index >= (int)s_count || index == s_sel)
+        return;
+    s_sel = index;
+    s_panel_dirty = 1;
+}
+
+/* Drawable coords -> panel canvas coords.
+ *
+ * Mirrors how the renderer composites the panel: stretched across the full
+ * window width, height scaled from the 480-tall reference present, and slid up
+ * from the bottom edge by psx_rewind_slide(). Returns 0 when the point misses,
+ * including while the strip is still animating in — clicking a half-open panel
+ * would otherwise hit whatever happened to be under the cursor. */
+static int panel_point(int x, int y, int surface_w, int surface_h,
+                       int *out_x, int *out_y)
+{
+    int dh, vy, cx, cy;
+    if (!s_open || surface_w <= 0 || surface_h <= 0)
+        return 0;
+    if (s_slide < 0.999f)          /* only accept a fully docked panel */
+        return 0;
+    dh = (surface_h * RW_PANEL_H) / 480;
+    if (dh < 8)
+        dh = RW_PANEL_H;
+    vy = surface_h - dh;
+    if (y < vy || y >= surface_h || x < 0 || x >= surface_w)
+        return 0;
+    cx = (int)(((long)x * RW_PANEL_W) / surface_w);
+    cy = (int)(((long)(y - vy) * RW_PANEL_H) / dh);
+    if (cx < 0 || cx >= RW_PANEL_W || cy < 0 || cy >= RW_PANEL_H)
+        return 0;
+    if (out_x) *out_x = cx;
+    if (out_y) *out_y = cy;
+    return 1;
+}
+
+int psx_rewind_hit_thumb(int x, int y, int surface_w, int surface_h)
+{
+    int cx, cy, i;
+    if (!panel_point(x, y, surface_w, surface_h, &cx, &cy))
+        return -1;
+    /* Front to back from the selection outwards: the selected card is drawn
+     * larger and overlaps its neighbours, so it has to win a shared pixel the
+     * same way it does on screen. */
+    for (i = 0; i < (int)s_count; i++) {
+        int rx, ry, rw, rh;
+        int j = (i == 0) ? s_sel : (i <= s_sel ? s_sel - i : i - s_sel - 1);
+        if (j < 0 || j >= (int)s_count)
+            continue;
+        thumb_rect(j, &rx, &ry, &rw, &rh);
+        if (cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh)
+            return j;
+    }
+    return -1;
+}
+
+int psx_rewind_hit_action(int x, int y, int surface_w, int surface_h)
+{
+    int cx, cy;
+    if (!panel_point(x, y, surface_w, surface_h, &cx, &cy))
+        return PSX_RW_ACTION_NONE;
+    if (cy < RW_FOOT_Y0 || cy >= RW_FOOT_Y1)
+        return PSX_RW_ACTION_NONE;
+    if (cx >= RW_LOAD_X0 && cx < RW_LOAD_X1)
+        return PSX_RW_ACTION_LOAD;
+    if (cx >= RW_CLOSE_X0 && cx < RW_CLOSE_X1)
+        return PSX_RW_ACTION_CLOSE;
+    return PSX_RW_ACTION_NONE;
+}
+
+void psx_rewind_debug(int *open, int *sel, int *count, int *hover)
+{
+    if (open)  *open  = s_open;
+    if (sel)   *sel   = s_sel;
+    if (count) *count = (int)s_count;
+    if (hover) *hover = s_hover;
+}
+
+void psx_rewind_hover(int x, int y, int surface_w, int surface_h)
+{
+    int h = psx_rewind_hit_thumb(x, y, surface_w, surface_h);
+    if (h == s_hover)
+        return;                    /* no redraw for a cursor that only moved */
+    s_hover = h;
     s_panel_dirty = 1;
 }
 
@@ -669,12 +800,40 @@ float psx_rewind_slide(void)
     return s_slide;
 }
 
+/* Where thumbnail `i` sits on the panel canvas.
+ *
+ * Defined once because two consumers have to agree exactly: the rasterizer
+ * that draws the strip, and the hit test behind the mouse. A second copy of
+ * this arithmetic would drift the moment either changed, and the symptom —
+ * clicking one card and selecting its neighbour — is the kind of thing that
+ * only shows up at the edges of the strip.
+ *
+ * The strip is centred on the selection rather than scrolled: the selected
+ * card is bigger, sits slightly higher, and everything after it is pushed
+ * right by the extra width. */
+static void thumb_rect(int i, int *rx, int *ry, int *rw, int *rh)
+{
+    const int card_w = 96, card_h = 72;
+    const int sel_w = 120, sel_h = 90;
+    const int gap = 10, y = 28;
+    const int origin = (RW_PANEL_W / 2) - (s_sel * (card_w + gap)) - sel_w / 2;
+    int x = origin + i * (card_w + gap);
+    if (i > s_sel)
+        x += (sel_w - card_w);
+    if (rx) *rx = x;
+    if (ry) *ry = (i == s_sel) ? (y - 8) : y;
+    if (rw) *rw = (i == s_sel) ? sel_w : card_w;
+    if (rh) *rh = (i == s_sel) ? sel_h : card_h;
+}
+
 static void blit_thumb(uint32_t *dst, int dw, int x0, int y0, int tw, int th,
-                       const uint32_t *src, int sel)
+                       const uint32_t *src, int sel, int hover)
 {
     int x, y, dx, dy;
-    uint32_t border = sel ? 0xFFFFD24Du : 0xFF3A3A3Au;
-    int bw = sel ? 3 : 1;
+    /* Hover reads as a dimmer version of the selection colour, so "the mouse
+     * is here" and "this is the one that loads" stay distinguishable. */
+    uint32_t border = sel ? 0xFFFFD24Du : hover ? 0xFF8A7330u : 0xFF3A3A3Au;
+    int bw = sel ? 3 : hover ? 2 : 1;
     for (y = -bw; y < th + bw; y++) {
         dy = y0 + y;
         if (dy < 0 || dy >= RW_PANEL_H)
@@ -818,9 +977,8 @@ static void draw_text(uint32_t *dst, int dw, int x0, int y0, const char *s,
 static void rasterize_panel(void)
 {
     uint32_t *d = s_panel;
-    int i, n, card_w, card_h, gap, x, y, sel_w, sel_h;
+    int i, n, x, y;
     int fy;
-    int center_x, origin;
     char buf[96];
     char hk[32];
 
@@ -853,25 +1011,13 @@ static void rasterize_panel(void)
         return;
     }
 
-    card_w = 96;
-    card_h = 72;
-    sel_w = 120;
-    sel_h = 90;
-    gap = 10;
-    center_x = RW_PANEL_W / 2;
-    origin = center_x - (s_sel * (card_w + gap)) - sel_w / 2;
-
-    y = 28;
     for (i = 0; i < n; i++) {
-        int w = (i == s_sel) ? sel_w : card_w;
-        int h = (i == s_sel) ? sel_h : card_h;
-        int yy = (i == s_sel) ? (y - 8) : y;
-        x = origin + i * (card_w + gap);
-        if (i > s_sel)
-            x += (sel_w - card_w);
+        int w, h, yy;
+        thumb_rect(i, &x, &yy, &w, &h);
         if (x + w < 0 || x >= RW_PANEL_W)
             continue;
-        blit_thumb(d, RW_PANEL_W, x, yy, w, h, s_thumbs[i].px, i == s_sel);
+        blit_thumb(d, RW_PANEL_W, x, yy, w, h, s_thumbs[i].px,
+                   i == s_sel, i == s_hover);
     }
     s_panel_dirty = 0;
 }
