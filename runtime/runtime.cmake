@@ -292,6 +292,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_host.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_perf.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_rank_logic.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rank_meter.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rank_sprites.c
