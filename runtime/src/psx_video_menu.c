@@ -120,6 +120,7 @@ static int s_canvas_ready;
 static int s_changed;
 static int s_quit;
 static int s_savestate;
+static int s_rewind;
 
 static int s_lw = 640, s_lh = 480, s_ui = 1;   /* logical size + magnification */
 static int s_hover_menu = -1, s_hover_row = -1;
@@ -230,7 +231,7 @@ static int menu_rows(int m) {
     if (m == MENU_AUDIO) return 3;
     if (m == MENU_CHEATS) return 4;
     if (m == MENU_MODS) return 1;
-    if (m == MENU_GAME) return 3;
+    if (m == MENU_GAME) return 4;
     return 1;
 }
 
@@ -247,7 +248,7 @@ static int row_kind(int m, int row) {
      * it are a number and an option, so unlike FILE this menu has no
      * whole-menu answer, and num_range below reports 0 here, which would
      * otherwise make it an IT_OPTION that cycles nothing. */
-    if (m == MENU_GAME && row == 2) return IT_ACTION;
+    if (m == MENU_GAME && (row == 2 || row == 3)) return IT_ACTION;
     if (num_range(m, row, &lo, &hi)) return IT_NUMBER;
     return IT_OPTION;
 }
@@ -346,7 +347,8 @@ static const char *row_label(int m, int row) {
     if (m == MENU_GAME)
         return (row == 0) ? "SPEED"
              : (row == 1) ? "FAST LOADING"
-                          : "SAVE / LOAD STATE";
+             : (row == 2) ? "SAVE / LOAD STATE"
+                          : "REWIND";
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER) ? "MASTER"
              : (row == AUD_MUSIC)  ? "MUSIC"
@@ -458,6 +460,10 @@ static const char *row_hint(int m, int row) {
      * which is expected from a hotkey but surprising from a menu row. */
     if (m == MENU_GAME && row == 2)
         return "PAUSES THE GAME UNTIL YOU PICK A SLOT";
+    /* Names the hotkey as well as the effect: the row exists because the
+     * feature was previously reachable only by a key nothing advertised. */
+    if (m == MENU_GAME && row == 3)
+        return "STEP BACK THROUGH RECENT FRAMES - ALSO F8";
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER)
                    ? "SCALES EVERYTHING - ENTER TO TYPE"
@@ -860,6 +866,7 @@ void psx_video_menu_init(const PsxVideoMenuState *initial) {
     s_changed = 0;
     s_quit = 0;
     s_savestate = 0;
+    s_rewind = 0;
     s_hover_menu = s_hover_row = -1;
     s_dirty = 1;
 }
@@ -1109,7 +1116,10 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
                  * collapse, which is not incidental: the overlay the host is
                  * about to open runs its own pause loop and takes the keyboard
                  * and pad, so an expanded dropdown would fight it for keys. */
-                if (s_menu == MENU_GAME) s_savestate = 1;
+                if (s_menu == MENU_GAME) {
+                    if (r == 3) s_rewind = 1;
+                    else        s_savestate = 1;
+                }
                 psx_video_menu_collapse();
             }
         } else if (k == IT_NUMBER) {
@@ -1192,7 +1202,10 @@ int psx_video_menu_handle_key(int key) {
                 else {
                     /* See the mouse path: raise the one-shot, then collapse so
                      * the save-state overlay's pause loop owns the keyboard. */
-                    if (s_menu == MENU_GAME) s_savestate = 1;
+                    if (s_menu == MENU_GAME) {
+                        if (s_item[s_menu] == 3) s_rewind = 1;
+                        else                     s_savestate = 1;
+                    }
                     psx_video_menu_collapse();
                 }
             } else if (k == IT_NUMBER) {
@@ -1226,6 +1239,12 @@ int psx_video_menu_take_savestate(void) {
     int s = s_savestate;
     s_savestate = 0;
     return s;
+}
+
+int psx_video_menu_take_rewind(void) {
+    int r = s_rewind;
+    s_rewind = 0;
+    return r;
 }
 
 /* ---- settings persistence ------------------------------------------------

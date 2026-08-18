@@ -6752,6 +6752,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             else
                 savestate_menu_toggle(0);
         }
+        /* GAME > REWIND. psx_rewind_toggle() refuses silently when the feature
+         * is off (depth 0) and toasts for itself during netplay, so only the
+         * silent case needs a word here — for the same reason the row above
+         * gets one, a menu row that visibly does nothing reads as broken. */
+        if (psx_video_menu_take_rewind()) {
+            if (savestate_menu_open)
+                host_osd_push("Close save states first", 1200);
+            else if (!psx_rewind_toggle() && !psx_rewind_enabled())
+                host_osd_push("Rewind is off (set snapshots above 0)", 1500);
+        }
         savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
         psx_rewind_note_frame();

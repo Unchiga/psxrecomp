@@ -177,6 +177,13 @@ int  psx_video_menu_take_quit(void);
  * keyboard and pad without two menus contending for input. */
 int  psx_video_menu_take_savestate(void);
 
+/* 1 exactly once after the player picks GAME > REWIND. Same hands-off contract
+ * as QUIT and SAVE / LOAD STATE: this module knows nothing about rewind, it
+ * only reports that the row was chosen. The host decides whether rewind can
+ * actually open (it is unavailable during netplay, and off entirely when the
+ * snapshot depth is zero) and says so if not. */
+int  psx_video_menu_take_rewind(void);
+
 /* Bar height in LOGICAL pixels (multiply by the ui scale for drawable px).
  * The renderer reserves this strip at the top so the game is letterboxed
  * BELOW the bar rather than hidden underneath it. */
