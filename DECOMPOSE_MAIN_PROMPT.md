@@ -260,8 +260,13 @@ git submodule update --init lib/retcomm-rbengine
 cmake -S . -B build-dbg -DPSX_REWIND=ON
 ```
 
-`build/` (release) is still `PSX_REWIND=OFF` - reconfigure it the same way
-before shipping if rewind is meant to be in the build.
+**Both** builds are now `PSX_REWIND=ON` (`build-dbg` and `build`). The release
+build was reconfigured and rebuilt the same way; it boots with the rewind
+banner, which `psx_rewind_configure()` only prints after the snap ring and its
+two side arrays all allocate (the failure path says "rewind alloc failed" and
+disables instead). Note the release build has `PSX_DEBUG_TOOLS=OFF`, so there
+is no debug server to drive F8 or the menu row in it - the behavioural check
+was done in `build-dbg`, where the code path is identical.
 
 **`lib/recomp-net` is in the same state** (declared in `.gitmodules`, empty,
 unregistered), so netplay is presumably equally unbuilt. Not touched: nothing
