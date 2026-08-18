@@ -11673,6 +11673,29 @@ namespace {
 }  // namespace
 #endif
 
+/* Which generic launcher features this platform is allowed to offer.
+ *
+ * Widescreen/View mode and Skip FMVs are mod-owned on PSX. Their legacy
+ * game.toml offer flags remain parseable for old projects but deliberately
+ * cannot expose generic launcher controls or activate the features. Trusted
+ * activation plugins apply them after launcher/settings resolution.
+ *
+ * Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
+ * former game.toml `offer_turbo_loads` opt-out is deprecated and ignored:
+ * offering the generic switch is no longer possible for any title, so a
+ * config that forgot to migrate can no longer force turbo on.
+ *
+ * These were locals in main() until the startup phases were split out. They
+ * are policy, not boot state — every phase from config resolution through the
+ * lobby rematch path reads them, and all of them are false for every PSX
+ * title — so they live at file scope rather than being threaded through
+ * PsxBootConfig, where a per-run field would imply they can vary. */
+constexpr bool ws_offered = false;
+constexpr bool ws_ultrawide_offered = false;
+constexpr bool frame_interpolation_offered = false;
+constexpr bool skip_fmv_offered = false;
+constexpr bool turbo_loads_offered = false;
+
 /* Boot configuration resolved during startup.
  *
  * main() used to hold these as ~80 separate locals in one 3,000-line scope,
@@ -11928,19 +11951,6 @@ int main(int argc, char** argv) {
         boot.player_deadzone[i] = kDefaultDeadzoneRaw;
         boot.ctrl_locked_mode[i] = PSXRecompV4::PAD_MODE_ANALOG;
     }
-    /* Widescreen/View mode and Skip FMVs are mod-owned on PSX. Their legacy
-     * game.toml offer flags remain parseable for old projects but deliberately
-     * cannot expose generic launcher controls or activate the features. Trusted
-     * activation plugins apply them after launcher/settings resolution. */
-    constexpr bool ws_offered = false;
-    constexpr bool ws_ultrawide_offered = false;
-    constexpr bool frame_interpolation_offered = false;
-    constexpr bool skip_fmv_offered = false;
-    /* Load acceleration is likewise mod-owned (Fast Loading / CD Speed). The
-     * former game.toml `offer_turbo_loads` opt-out is deprecated and ignored:
-     * offering the generic switch is no longer possible for any title, so a
-     * config that forgot to migrate can no longer force turbo on. */
-    constexpr bool turbo_loads_offered = false;
     /* Legacy single deadzone (<0 => keep per-slot / input.ini defaults). */
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
