@@ -13907,6 +13907,288 @@ static bool init_runtime_devices(char** argv, PsxBootConfig& boot,
     return true;
 }
 
+/* Open the game window and everything attached to it: SDL, the audio device,
+ * the controller handles, the GL or Vulkan context, the F10 overlay menu and
+ * the save-state slots.
+ *
+ * Headless mode takes the other branch and skips all of it -- the TCP debug
+ * server is then the only frontend, which is what the soak fleet and the
+ * screenshot harness run against.
+ *
+ * Returns false if any of it fails; each site reports its own reason first. */
+static bool open_game_window(char** argv, PsxBootConfig& boot) {
+  if (g_headless) {
+    std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+  } else {
+    /* ---- SDL init ---- */
+    /* Scale quality governs SDL's logical-size -> window scaling. Linear when
+     * antialiasing is on so the (super)sampled frame stays smooth when the
+     * window is resized; nearest preserves crisp pixels otherwise. */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
+     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
+     * as a game controller rather than a raw HID device. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+    /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
+     * it also preserves DualSense rumble on the explicit SDL2 fallback. */
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
+                            SDL_HINT_OVERRIDE);
+    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
+     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
+     * Xbox One/Series controller would be claimed by nobody -> not a GameController
+     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
+     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+            std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+            return false;
+        }
+    }
+    load_input_config(argv[0]);
+    /* The launcher / settings.toml / game.toml deadzone (when set) is the
+     * user-facing authority; apply it over the input.ini value here, after
+     * load_input_config has read input.ini. */
+    if (boot.resolved_deadzone >= 0)
+        controller_deadzone = std::max(0, std::min(32767, boot.resolved_deadzone));
+    else
+        controller_deadzone = kDefaultDeadzoneRaw;
+    for (int s = 0; s < PSX_MAX_PLAYERS; ++s) {
+        if (boot.player_deadzone[s] >= 0)
+            g_players[s].deadzone = std::max(0, std::min(32767, boot.player_deadzone[s]));
+        else
+            g_players[s].deadzone = controller_deadzone;
+    }
+    controller_deadzone = g_players[0].deadzone;
+    refresh_player_devices();  /* open SDL handles to match the player config */
+#ifndef PSX_SDL_NO_AUDIO
+    audio_trace_init();
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+        PsxSdlAudioSpec want = {};
+        PsxSdlAudioSpec have = {};
+        want.freq = g_audio_freq;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 1024;
+        const bool legacy = audio_legacy_mode();
+        want.allow_frequency_change = legacy ? 0 : 1;
+        if (!legacy)
+            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        sdl_audio_device = psx_sdl_audio_open(&want, &have);
+        if (sdl_audio_device) {
+            if (!legacy) {
+                rab_config cfg; rab_config_defaults(&cfg);
+                cfg.channels    = 2;
+                cfg.source_rate = 44100.0;            /* SPU render rate */
+                cfg.host_rate   = (double)have.freq;  /* actual device rate */
+                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+            }
+            g_audio_host_rate = have.freq;
+            audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
+            (void)psx_sdl_audio_resume(sdl_audio_device);
+        }
+    }
+    /* Always register: SPU advance is guest-cycle budgeted and must not
+     * depend on a successful host open (Win↔Linux aux/spu fork). Routed
+     * through the gated wrapper so turbo mute/sink still apply. */
+    psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
+#endif
+
+    Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    if (g_video_renderer == 1) {
+        configure_core_gl_context_attributes();
+        win_flags |= SDL_WINDOW_OPENGL;
+    }
+    if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
+    /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
+     * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
+     * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
+     * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
+    win_flags |= psx_fullscreen_flag_for_mode(g_fullscreen);
+    int game_w = g_video_win_w, game_h = 0;
+    /* Open at the user-chosen window size (default 1280 wide) instead of the
+     * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
+     * height follows the configured display aspect (4:3 native, wider for the
+     * widescreen hack); the present path letterboxes to the same aspect, so
+     * the image scales to fill the larger window with no further distortion. */
+    clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
+    sdl_window = SDL_CreateWindow(
+        boot.window_title.c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        game_w, game_h,
+        win_flags
+    );
+    if (!sdl_window) {
+        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        return false;
+    }
+    psx_apply_window_icon(sdl_window, argv[0]);
+    /* Boot-time controller open happened before this point; raise its toast
+     * now that there is a window to draw it on. */
+    psx_flush_pending_pad_toast();
+
+    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
+     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
+     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
+     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
+     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
+     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
+     * worse than a benign slow beat). */
+    {
+        SDL_DisplayMode dm;
+        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
+        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
+            double host_hz = (double)dm.refresh_rate;
+            g_host_refresh_hz = host_hz;
+            if (host_hz >= 58.8 && host_hz <= 61.2) {
+                g_frame_period_base_ms = 1000.0 / host_hz;
+                frame_period_refresh();
+                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
+                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
+            } else {
+                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
+                            "59.94 Hz pacing\n", dm.refresh_rate);
+            }
+        }
+    }
+
+    /* OpenGL backend: create the GL context now. On failure, relabel the
+     * facade back to software (rasterization already runs through software in
+     * this phase) and fall through to the SDL_Renderer present path below. */
+    if (g_video_renderer == 1) {
+        gl_renderer_set_swap_interval(g_video_vsync);   /* applied at context init */
+        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        if (!g_gl_active) {
+            gr_set_backend(GR_BACKEND_SOFTWARE);
+            gl_renderer_set_cpu_auth_dual(0);
+            g_gl_fbo_present = 0;
+            s_netplay_gl_present = 0;
+            if (boot.net_cfg.enabled) {
+                gr_set_scale(1);
+                s_netplay_sim_native_scale = 1;
+            }
+        } else if (boot.net_cfg.enabled || s_netplay_gl_present) {
+            /* Dual-raster: FBO present at settings SSAA; SW@1× authority.
+             * Scale was applied via s_req_scale before init_gpu_raster. */
+            gl_renderer_set_cpu_auth_dual(1);
+            g_gl_fbo_present = 1;
+            s_netplay_gl_present = 1;
+            s_netplay_sim_native_scale = 1;
+        }
+        /* The GL backend establishes its real internal scale HERE (raster init),
+         * which is AFTER the earlier offline `g_video_scale = gr_scale()` sync.
+         * Re-sync offline so staging matches. Netplay keeps g_video_scale as
+         * the settings preference (equals gr_scale() under dual-raster). */
+        if (!netplay_cpu_auth_gpu())
+            g_video_scale = gr_scale();
+        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
+                                      (double)g_frame_interpolation_fps,
+                                      /*blend_mode*/ 0);
+    }
+    /* Vulkan backend: create the instance/device/swapchain on the
+     * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
+     * already initialized the software renderer on the shared VRAM array). */
+    if (g_video_renderer == 2) {
+        vk_renderer_set_present_mode(g_video_vsync);
+        g_vk_active = (vk_renderer_init_context(sdl_window) != 0);
+        if (!g_vk_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+        if (!netplay_cpu_auth_gpu())
+            g_video_scale = gr_scale();
+    }
+    latency_ring_set_backend(g_vk_active ? "vulkan" : g_gl_active ? "opengl" : "software");
+    latency_ring_set_present_mode(g_video_vsync);
+    /* Title bar shows the clean game title (set at window creation); the active
+     * renderer is reported via the debug server / config, not appended here. */
+
+    /* Force OpenGL renderer.
+     *
+     * History (TombaRecomp/ISSUES.md #6):
+     *   1. Originally SDL_RENDERER_ACCELERATED with fallback to software.
+     *      Froze "Not Responding" after extended uptime — was thought to
+     *      be GPU-driver-side hangs.
+     *   2. Switched to SDL_RENDERER_SOFTWARE only. Still froze. Software
+     *      renderer goes through Windows GDI; the GDI path hangs the SDL
+     *      main thread under heavy emulation load.
+     *   3. Bisection: NO_AUDIO+NO_RENDER ran indefinitely (~7+ min, 40k+
+     *      frames) but the game never progressed past BIOS boot because
+     *      it depends on the renderer being present. NO_AUDIO alone with
+     *      software renderer froze at frame 3084 — same as full debug
+     *      build. So audio is innocent; software renderer (GDI path) is
+     *      the culprit.
+     *   4. SDL_HINT_RENDER_DRIVER=opengl + SDL_RENDERER_ACCELERATED.
+     *      Ran indefinitely past every prior freeze point. OpenGL driver
+     *      uses a different presentation path that doesn't hit the GDI
+     *      hang. This is now the default.
+     *
+     * Note: the freeze became prevalent only after the FMV-speed fix
+     * (commit b486c13) raised cycle throughput. Before that, the slower
+     * MDEC/DMA workload was below whatever GDI threshold trips the bug. */
+    /* The OpenGL force above is a Windows-only workaround for the GDI
+     * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
+     * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
+     * fall back progressively if a driver can't provide vsync/accel. */
+  if (!g_gl_active && !g_vk_active) {
+#ifdef _WIN32
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
+    /* Vsync off (g_video_vsync==0) drops PRESENTVSYNC for lowest display
+     * latency; the wall-clock pacer still holds 59.94Hz (may tear). */
+    Uint32 rflags = SDL_RENDERER_ACCELERATED |
+                    (g_video_vsync != 0 ? SDL_RENDERER_PRESENTVSYNC : 0u);
+    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, rflags);
+    if (!sdl_renderer)
+        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
+    if (!sdl_renderer) {
+        std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        return false;
+    }
+
+    /* Present in a logical space of the configured aspect (640x480 at native
+     * 4:3, wider at widescreen aspects; scaled by the supersampling factor so
+     * the full internal resolution reaches a large/fullscreen window; SDL
+     * still scales and letterboxes to the real output). Identity in the
+     * default window when supersampling is off, so native rendering is
+     * unchanged. Netplay CPU-auth: always 1× (sim has no hi-res mirror). */
+    {
+        const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
+        g_logical_w = 480 * g_video_aspect_num * tex_scale / g_video_aspect_den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
+    }
+  }
+
+    /* Staging buffer + backing texture are sized for the internal resolution
+     * (640x512 native, times the supersampling factor). Netplay: 1×. */
+    {
+        const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
+        sdl_pixel_buf = (uint32_t*)std::malloc(
+            (size_t)640 * tex_scale * 512 * tex_scale * sizeof(uint32_t));
+        if (!sdl_pixel_buf) {
+            std::fprintf(stderr, "failed to allocate %dx staging buffer\n", tex_scale);
+            return false;
+        }
+    }
+
+  if (!g_gl_active && !g_vk_active) {
+    const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
+    sdl_texture = SDL_CreateTexture(
+        sdl_renderer,
+        SDL_PIXELFORMAT_ARGB8888,
+        SDL_TEXTUREACCESS_STREAMING,
+        640 * tex_scale, 512 * tex_scale
+    );
+    if (!sdl_texture) {
+        std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_SetTextureScaleMode(sdl_texture,
+                            g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+  }
+  }
+    return true;
+}
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -14057,275 +14339,7 @@ CPUState cpu;
     if (!init_runtime_devices(argv, boot, disc_path_str, rematch_session))
         return 1;
 
-  if (g_headless) {
-    std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
-  } else {
-    /* ---- SDL init ---- */
-    /* Scale quality governs SDL's logical-size -> window scaling. Linear when
-     * antialiasing is on so the (super)sampled frame stays smooth when the
-     * window is resized; nearest preserves crisp pixels otherwise. */
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
-     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
-     * as a game controller rather than a raw HID device. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
-    /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
-     * it also preserves DualSense rumble on the explicit SDL2 fallback. */
-    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
-                            SDL_HINT_OVERRIDE);
-    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
-     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
-     * Xbox One/Series controller would be claimed by nobody -> not a GameController
-     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
-     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
-    if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
-            std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-            return 1;
-        }
-    }
-    load_input_config(argv[0]);
-    /* The launcher / settings.toml / game.toml deadzone (when set) is the
-     * user-facing authority; apply it over the input.ini value here, after
-     * load_input_config has read input.ini. */
-    if (boot.resolved_deadzone >= 0)
-        controller_deadzone = std::max(0, std::min(32767, boot.resolved_deadzone));
-    else
-        controller_deadzone = kDefaultDeadzoneRaw;
-    for (int s = 0; s < PSX_MAX_PLAYERS; ++s) {
-        if (boot.player_deadzone[s] >= 0)
-            g_players[s].deadzone = std::max(0, std::min(32767, boot.player_deadzone[s]));
-        else
-            g_players[s].deadzone = controller_deadzone;
-    }
-    controller_deadzone = g_players[0].deadzone;
-    refresh_player_devices();  /* open SDL handles to match the player config */
-#ifndef PSX_SDL_NO_AUDIO
-    audio_trace_init();
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-        PsxSdlAudioSpec want = {};
-        PsxSdlAudioSpec have = {};
-        want.freq = g_audio_freq;
-        want.format = AUDIO_S16SYS;
-        want.channels = 2;
-        want.samples = 1024;
-        const bool legacy = audio_legacy_mode();
-        want.allow_frequency_change = legacy ? 0 : 1;
-        if (!legacy)
-            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
-        sdl_audio_device = psx_sdl_audio_open(&want, &have);
-        if (sdl_audio_device) {
-            if (!legacy) {
-                rab_config cfg; rab_config_defaults(&cfg);
-                cfg.channels    = 2;
-                cfg.source_rate = 44100.0;            /* SPU render rate */
-                cfg.host_rate   = (double)have.freq;  /* actual device rate */
-                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
-            }
-            g_audio_host_rate = have.freq;
-            audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
-            (void)psx_sdl_audio_resume(sdl_audio_device);
-        }
-    }
-    /* Always register: SPU advance is guest-cycle budgeted and must not
-     * depend on a successful host open (Win↔Linux aux/spu fork). Routed
-     * through the gated wrapper so turbo mute/sink still apply. */
-    psx_set_midframe_audio_pump(sdl_audio_pump_midframe);
-#endif
-
-    Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
-    if (g_video_renderer == 1) {
-        configure_core_gl_context_attributes();
-        win_flags |= SDL_WINDOW_OPENGL;
-    }
-    if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
-    /* Fullscreen on launch (launcher's tri-state Fullscreen control): 1 =
-     * borderless desktop fullscreen (keeps the desktop resolution, letterboxes
-     * the image), 2 = exclusive fullscreen (real display-mode change), 0 =
-     * windowed. Matches the in-game Alt+Enter / Cmd+Ctrl+F hotkey behaviour. */
-    win_flags |= psx_fullscreen_flag_for_mode(g_fullscreen);
-    int game_w = g_video_win_w, game_h = 0;
-    /* Open at the user-chosen window size (default 1280 wide) instead of the
-     * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
-     * height follows the configured display aspect (4:3 native, wider for the
-     * widescreen hack); the present path letterboxes to the same aspect, so
-     * the image scales to fill the larger window with no further distortion. */
-    clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
-    sdl_window = SDL_CreateWindow(
-        boot.window_title.c_str(),
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        game_w, game_h,
-        win_flags
-    );
-    if (!sdl_window) {
-        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    psx_apply_window_icon(sdl_window, argv[0]);
-    /* Boot-time controller open happened before this point; raise its toast
-     * now that there is a window to draw it on. */
-    psx_flush_pending_pad_toast();
-
-    /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
-     * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
-     * count (2/3/1 beat) that reads as moving-object judder. If the panel is
-     * within ~2% of 60 Hz, nudge the pacer to the exact panel period so the pacer
-     * and vsync agree and 30fps content pads to a steady 2 refreshes each.
-     * Non-~60Hz panels keep the PSX rate (vsync then governs; wrong-speed sim is
-     * worse than a benign slow beat). */
-    {
-        SDL_DisplayMode dm;
-        int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);
-        if (disp_idx >= 0 && SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 && dm.refresh_rate > 0) {
-            double host_hz = (double)dm.refresh_rate;
-            g_host_refresh_hz = host_hz;
-            if (host_hz >= 58.8 && host_hz <= 61.2) {
-                g_frame_period_base_ms = 1000.0 / host_hz;
-                frame_period_refresh();
-                std::printf("psxrecomp: sync-to-host-refresh: pacing to %d Hz panel "
-                            "(%.4f ms/frame)\n", dm.refresh_rate, g_frame_period_ms);
-            } else {
-                std::printf("psxrecomp: host panel %d Hz not ~60 Hz; keeping PSX "
-                            "59.94 Hz pacing\n", dm.refresh_rate);
-            }
-        }
-    }
-
-    /* OpenGL backend: create the GL context now. On failure, relabel the
-     * facade back to software (rasterization already runs through software in
-     * this phase) and fall through to the SDL_Renderer present path below. */
-    if (g_video_renderer == 1) {
-        gl_renderer_set_swap_interval(g_video_vsync);   /* applied at context init */
-        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
-        if (!g_gl_active) {
-            gr_set_backend(GR_BACKEND_SOFTWARE);
-            gl_renderer_set_cpu_auth_dual(0);
-            g_gl_fbo_present = 0;
-            s_netplay_gl_present = 0;
-            if (boot.net_cfg.enabled) {
-                gr_set_scale(1);
-                s_netplay_sim_native_scale = 1;
-            }
-        } else if (boot.net_cfg.enabled || s_netplay_gl_present) {
-            /* Dual-raster: FBO present at settings SSAA; SW@1× authority.
-             * Scale was applied via s_req_scale before init_gpu_raster. */
-            gl_renderer_set_cpu_auth_dual(1);
-            g_gl_fbo_present = 1;
-            s_netplay_gl_present = 1;
-            s_netplay_sim_native_scale = 1;
-        }
-        /* The GL backend establishes its real internal scale HERE (raster init),
-         * which is AFTER the earlier offline `g_video_scale = gr_scale()` sync.
-         * Re-sync offline so staging matches. Netplay keeps g_video_scale as
-         * the settings preference (equals gr_scale() under dual-raster). */
-        if (!netplay_cpu_auth_gpu())
-            g_video_scale = gr_scale();
-        gl_renderer_set_interpolation(g_frame_interpolation, g_host_refresh_hz,
-                                      (double)g_frame_interpolation_fps,
-                                      /*blend_mode*/ 0);
-    }
-    /* Vulkan backend: create the instance/device/swapchain on the
-     * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
-     * already initialized the software renderer on the shared VRAM array). */
-    if (g_video_renderer == 2) {
-        vk_renderer_set_present_mode(g_video_vsync);
-        g_vk_active = (vk_renderer_init_context(sdl_window) != 0);
-        if (!g_vk_active) gr_set_backend(GR_BACKEND_SOFTWARE);
-        if (!netplay_cpu_auth_gpu())
-            g_video_scale = gr_scale();
-    }
-    latency_ring_set_backend(g_vk_active ? "vulkan" : g_gl_active ? "opengl" : "software");
-    latency_ring_set_present_mode(g_video_vsync);
-    /* Title bar shows the clean game title (set at window creation); the active
-     * renderer is reported via the debug server / config, not appended here. */
-
-    /* Force OpenGL renderer.
-     *
-     * History (TombaRecomp/ISSUES.md #6):
-     *   1. Originally SDL_RENDERER_ACCELERATED with fallback to software.
-     *      Froze "Not Responding" after extended uptime — was thought to
-     *      be GPU-driver-side hangs.
-     *   2. Switched to SDL_RENDERER_SOFTWARE only. Still froze. Software
-     *      renderer goes through Windows GDI; the GDI path hangs the SDL
-     *      main thread under heavy emulation load.
-     *   3. Bisection: NO_AUDIO+NO_RENDER ran indefinitely (~7+ min, 40k+
-     *      frames) but the game never progressed past BIOS boot because
-     *      it depends on the renderer being present. NO_AUDIO alone with
-     *      software renderer froze at frame 3084 — same as full debug
-     *      build. So audio is innocent; software renderer (GDI path) is
-     *      the culprit.
-     *   4. SDL_HINT_RENDER_DRIVER=opengl + SDL_RENDERER_ACCELERATED.
-     *      Ran indefinitely past every prior freeze point. OpenGL driver
-     *      uses a different presentation path that doesn't hit the GDI
-     *      hang. This is now the default.
-     *
-     * Note: the freeze became prevalent only after the FMV-speed fix
-     * (commit b486c13) raised cycle throughput. Before that, the slower
-     * MDEC/DMA workload was below whatever GDI threshold trips the bug. */
-    /* The OpenGL force above is a Windows-only workaround for the GDI
-     * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
-     * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
-     * fall back progressively if a driver can't provide vsync/accel. */
-  if (!g_gl_active && !g_vk_active) {
-#ifdef _WIN32
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
-#endif
-    /* Vsync off (g_video_vsync==0) drops PRESENTVSYNC for lowest display
-     * latency; the wall-clock pacer still holds 59.94Hz (may tear). */
-    Uint32 rflags = SDL_RENDERER_ACCELERATED |
-                    (g_video_vsync != 0 ? SDL_RENDERER_PRESENTVSYNC : 0u);
-    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, rflags);
-    if (!sdl_renderer)
-        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
-    if (!sdl_renderer) {
-        std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
-        return 1;
-    }
-
-    /* Present in a logical space of the configured aspect (640x480 at native
-     * 4:3, wider at widescreen aspects; scaled by the supersampling factor so
-     * the full internal resolution reaches a large/fullscreen window; SDL
-     * still scales and letterboxes to the real output). Identity in the
-     * default window when supersampling is off, so native rendering is
-     * unchanged. Netplay CPU-auth: always 1× (sim has no hi-res mirror). */
-    {
-        const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        g_logical_w = 480 * g_video_aspect_num * tex_scale / g_video_aspect_den;
-        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * tex_scale);
-    }
-  }
-
-    /* Staging buffer + backing texture are sized for the internal resolution
-     * (640x512 native, times the supersampling factor). Netplay: 1×. */
-    {
-        const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-        sdl_pixel_buf = (uint32_t*)std::malloc(
-            (size_t)640 * tex_scale * 512 * tex_scale * sizeof(uint32_t));
-        if (!sdl_pixel_buf) {
-            std::fprintf(stderr, "failed to allocate %dx staging buffer\n", tex_scale);
-            return 1;
-        }
-    }
-
-  if (!g_gl_active && !g_vk_active) {
-    const int tex_scale = netplay_cpu_auth_gpu() ? 1 : g_video_scale;
-    sdl_texture = SDL_CreateTexture(
-        sdl_renderer,
-        SDL_PIXELFORMAT_ARGB8888,
-        SDL_TEXTUREACCESS_STREAMING,
-        640 * tex_scale, 512 * tex_scale
-    );
-    if (!sdl_texture) {
-        std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    SDL_SetTextureScaleMode(sdl_texture,
-                            g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
-  }
-  }
+    if (!open_game_window(argv, boot)) return 1;
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
