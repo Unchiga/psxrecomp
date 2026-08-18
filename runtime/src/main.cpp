@@ -13591,153 +13591,23 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
     return LauncherOutcome::Boot;
 }
 
-int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
-    std::fprintf(stderr, "psxrecomp: main() entered\n");
-    std::fflush(stderr);
-#if defined(RECOMP_LAUNCHER)
-    launcher_boot_timing_mark("host:main_enter");
-#endif
-
-    /* Setup-host zip-root exe: after Generate & rebuild, hand off to the
-     * product binary under build-release/ (bios/, mods/, assets/, settings). */
-    /* Guard must match the declaration above, which is nested inside
-     * RECOMP_LAUNCHER: codegen_setup.c needs recomp_launcher.h, so a
-     * PSX_RECOMP_UI=OFF build (headless/generated) links no definition and
-     * previously failed to compile this call. There is no setup-host handoff
-     * without the launcher, so skipping it there is the correct behavior. */
-#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER)
-    psx_game_codegen_forward_if_built(argc, argv);
-#endif
-
-    /* Install crash handlers early so they catch issues during init too.
-     * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
-    psx_crash_trace_install_handlers();
-#if defined(RECOMP_LAUNCHER)
-    launcher_boot_timing_mark("host:crash_handlers");
-#endif
-
-    /* Startup-resolved configuration; the field comments document each source. */
-    PsxBootConfig boot;
-
-    if (!resolve_boot_config(argc, argv, boot)) return 1;
-
-    switch (run_launcher_session(argc, argv, boot)) {
-        case LauncherOutcome::Quit:   return 0;
-        case LauncherOutcome::Failed: return 1;
-        case LauncherOutcome::Boot:   break;
-    }
-
-    /* CLI overrides win over config — applied last, before backend/port init.
-     * Enables a soak fleet: several instances on distinct ports + renderers,
-     * including BIOS instances that have no [game]-block config. */
-    if (boot.cli_debug_port >= 0) boot.debug_port      = (uint16_t)boot.cli_debug_port;
-    if (boot.cli_renderer   >= 0) g_video_renderer = boot.cli_renderer;
-    if (boot.cli_window_title)    boot.window_title     = boot.cli_window_title;
-    if (boot.cli_memcard_dir) {
-        boot.memcard_dir = std::filesystem::path(boot.cli_memcard_dir);
-        if (boot.memcard_dir.is_relative())
-            boot.memcard_dir = exe_dir_from_argv(argv[0]) / boot.memcard_dir;
-        boot.memcard_dir = boot.memcard_dir.lexically_normal();
-        boot.memcard1_path.clear();
-        boot.memcard2_path.clear();
-    }
-
-    std::filesystem::path resolved_bios =
-        resolve_bios_for_runtime(boot.bios_path, argv[0], boot.bios_explicit);
-    if (resolved_bios.empty()) {
-        std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
-        return 1;
-    }
-    if (boot.game_config_path || boot.disc_override_path || !boot.resolved_disc.empty()) {
-        boot.resolved_disc = resolve_disc_for_runtime(boot.resolved_disc, boot.disc_override_path, boot.game_id, argv[0]);
-        if (boot.game_config_path && boot.resolved_disc.empty()) {
-            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
-            return 1;
-        }
-    }
-
-    /* memcard_dir was resolved to its default before the launcher (above). */
-
-    /* A disc-patching mod builds a private patched image; mount that instead of
-     * the stock disc, leaving the user's original untouched (master behaviour). */
-    const std::filesystem::path& mod_disc =
-        PSXRecompV4::mod_runtime_effective_disc_path();
-    std::string disc_path_str =
-        (mod_disc.empty() ? boot.resolved_disc : mod_disc).string();
-    if (!mod_disc.empty()) {
-        std::fprintf(stdout,
-            "psxrecomp: stock disc remains %s; mounting private mod cache %s\n",
-            boot.resolved_disc.string().c_str(), mod_disc.string().c_str());
-    }
-
-    std::string bios_path_str = resolved_bios.string();
-    static int s_emu_session = 0;
-    const bool rematch_session = (++s_emu_session > 1);
-session_reboot:
-    /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
-    std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s%s\n",
-                 bios_path_str.c_str(),
-                 rematch_session ? " (rematch)" : "");
-    /* Soft-exit longjmps out of device service with a leftover guest clock;
-     * rematch must start from cycle 0 or vblanks never fire again. */
-    psx_cycles_reset_for_boot();
-    starvation_ring_reset();
-    present_session_reset();
-    /* Rematch ≈ cold start for netplay sim residue a cold peer lacks
-     * (pad edges, dig0 latch, tip densify, FMV flags, IRQ resume).
-     * Idempotent with BYE teardown; device *_init still runs below. */
-    psx_netplay_cold_reset();
-    {
-        extern uint64_t s_frame_count;
-        extern uint32_t g_debug_current_func_addr;
-        extern uint32_t g_debug_last_store_pc;
-        extern int g_call_unit_depth;
-        extern int g_psx_dispatch_depth;
-        s_frame_count = 0;
-        g_debug_current_func_addr = 0;
-        g_debug_last_store_pc = 0;
-        /* Soft-exit mid-call can skip the depth restore if the longjmp path
-         * was not taken; sticky depth suppresses overlay IRQ delivery and
-         * freezes rematch after lockstep armed. */
-        g_call_unit_depth = 0;
-        g_psx_dispatch_depth = 0;
-    }
-    /* Cold start activates via resolve_bios_for_runtime before this label.
-     * Rematch only rewrites bios_path_str — without re-activate, memory_init
-     * loads new ROM bytes against the prior match's linked backend (e.g.
-     * SCPH-1001 dump + sticky OPENBIOS) and dig0 never publishes cleanly. */
-    if (!validate_bios_for_launch(std::filesystem::path(bios_path_str))) {
-        std::fprintf(stderr, "psxrecomp: BIOS activate failed for %s%s\n",
-                     bios_path_str.c_str(),
-                     rematch_session ? " (rematch)" : "");
-        return 1;
-    }
-    if (rematch_session) {
-        std::fprintf(stdout,
-            "psxrecomp: rematch BIOS activated id=%s bundled=%d "
-            "deliver_event_ret=0x%x shell_entry=0x%x\n",
-            psx_bios_image.image_id ? psx_bios_image.image_id : "?",
-            psx_bios_image.image_bundled ? 1 : 0,
-            (unsigned)psx_bios_image.deliver_event_ret,
-            (unsigned)psx_bios_image.shell_entry_phys);
-        std::fflush(stdout);
-    }
-    memory_init(bios_path_str.c_str());
-#ifndef PSX_HAVE_VULKAN
-    /* Vulkan was not compiled in (PSX_ENABLE_VULKAN=OFF or no SDK found).
-     * Refuse a vulkan request from ANY source (config / CLI / launcher seed)
-     * and fall back to OpenGL, so the window is never created with
-     * SDL_WINDOW_VULKAN against an inert backend stub. */
-    if (g_video_renderer == 2) {
-        std::fprintf(stdout, "psxrecomp: Vulkan renderer is not available in this build "
-                             "(PSX_ENABLE_VULKAN=OFF); using OpenGL instead.\n");
-        g_video_renderer = 1;
-    }
-CPUState cpu;
-#endif
+/* Bring the emulated machine up: renderer, GPU and its supersampling, the
+ * peripheral devices, the disc, and the guards that have to be armed before
+ * any guest code runs.
+ *
+ * Order matters more than it looks. Supersampling has to follow gpu_init but
+ * precede GL context creation, because the hi-res textures and both FBOs are
+ * sized once at context init and nothing can resize them afterwards. The
+ * text-image guard is armed only after the disc path resolves, since the disc
+ * is one of its two possible sources. Mod disc patches come after the guard,
+ * so a patched image is never mistaken for a divergent one.
+ *
+ * Returns false when a disc was requested but nothing mounted -- the player
+ * has already been shown why, and booting on into an empty drive would just
+ * render a black screen. */
+static bool init_runtime_devices(char** argv, PsxBootConfig& boot,
+                                 const std::string& disc_path_str,
+                                 bool rematch_session) {
     /* Netplay: CPU VRAM is digest/snap authority. Prefer dual-raster OpenGL
      * (SW@1× + GL@settings SSAA FBO present, never glReadPixels). Vulkan
      * present not yet cpu-auth — fall back to a software window. */
@@ -13946,7 +13816,7 @@ CPUState cpu;
         detail += "\n\nIf this is a .cue, check that every FILE line it names "
                   "exists next to it; selecting the .bin directly also works.";
         launcher_warning("Disc Could Not Be Mounted", detail);
-        return 1;
+        return false;
     }
     for (const auto& route : boot.warm_cd_routes) {
         cdrom_register_warm_route(route.arm_lba, route.lbas.data(),
@@ -14034,6 +13904,158 @@ CPUState cpu;
      * the BIOS hands control to the game EXE — not on the BIOS shell. */
     if (boot.game_entry_pc != 0)
         fntrace_set_game_range(boot.game_entry_pc, 0);
+    return true;
+}
+
+int main(int argc, char** argv) {
+    /* Force line-buffered output so messages appear even if killed. */
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    std::fprintf(stderr, "psxrecomp: main() entered\n");
+    std::fflush(stderr);
+#if defined(RECOMP_LAUNCHER)
+    launcher_boot_timing_mark("host:main_enter");
+#endif
+
+    /* Setup-host zip-root exe: after Generate & rebuild, hand off to the
+     * product binary under build-release/ (bios/, mods/, assets/, settings). */
+    /* Guard must match the declaration above, which is nested inside
+     * RECOMP_LAUNCHER: codegen_setup.c needs recomp_launcher.h, so a
+     * PSX_RECOMP_UI=OFF build (headless/generated) links no definition and
+     * previously failed to compile this call. There is no setup-host handoff
+     * without the launcher, so skipping it there is the correct behavior. */
+#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER)
+    psx_game_codegen_forward_if_built(argc, argv);
+#endif
+
+    /* Install crash handlers early so they catch issues during init too.
+     * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
+    psx_crash_trace_install_handlers();
+#if defined(RECOMP_LAUNCHER)
+    launcher_boot_timing_mark("host:crash_handlers");
+#endif
+
+    /* Startup-resolved configuration; the field comments document each source. */
+    PsxBootConfig boot;
+
+    if (!resolve_boot_config(argc, argv, boot)) return 1;
+
+    switch (run_launcher_session(argc, argv, boot)) {
+        case LauncherOutcome::Quit:   return 0;
+        case LauncherOutcome::Failed: return 1;
+        case LauncherOutcome::Boot:   break;
+    }
+
+    /* CLI overrides win over config — applied last, before backend/port init.
+     * Enables a soak fleet: several instances on distinct ports + renderers,
+     * including BIOS instances that have no [game]-block config. */
+    if (boot.cli_debug_port >= 0) boot.debug_port      = (uint16_t)boot.cli_debug_port;
+    if (boot.cli_renderer   >= 0) g_video_renderer = boot.cli_renderer;
+    if (boot.cli_window_title)    boot.window_title     = boot.cli_window_title;
+    if (boot.cli_memcard_dir) {
+        boot.memcard_dir = std::filesystem::path(boot.cli_memcard_dir);
+        if (boot.memcard_dir.is_relative())
+            boot.memcard_dir = exe_dir_from_argv(argv[0]) / boot.memcard_dir;
+        boot.memcard_dir = boot.memcard_dir.lexically_normal();
+        boot.memcard1_path.clear();
+        boot.memcard2_path.clear();
+    }
+
+    std::filesystem::path resolved_bios =
+        resolve_bios_for_runtime(boot.bios_path, argv[0], boot.bios_explicit);
+    if (resolved_bios.empty()) {
+        std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
+        return 1;
+    }
+    if (boot.game_config_path || boot.disc_override_path || !boot.resolved_disc.empty()) {
+        boot.resolved_disc = resolve_disc_for_runtime(boot.resolved_disc, boot.disc_override_path, boot.game_id, argv[0]);
+        if (boot.game_config_path && boot.resolved_disc.empty()) {
+            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
+            return 1;
+        }
+    }
+
+    /* memcard_dir was resolved to its default before the launcher (above). */
+
+    /* A disc-patching mod builds a private patched image; mount that instead of
+     * the stock disc, leaving the user's original untouched (master behaviour). */
+    const std::filesystem::path& mod_disc =
+        PSXRecompV4::mod_runtime_effective_disc_path();
+    std::string disc_path_str =
+        (mod_disc.empty() ? boot.resolved_disc : mod_disc).string();
+    if (!mod_disc.empty()) {
+        std::fprintf(stdout,
+            "psxrecomp: stock disc remains %s; mounting private mod cache %s\n",
+            boot.resolved_disc.string().c_str(), mod_disc.string().c_str());
+    }
+
+    std::string bios_path_str = resolved_bios.string();
+    static int s_emu_session = 0;
+    const bool rematch_session = (++s_emu_session > 1);
+session_reboot:
+    /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
+    std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s%s\n",
+                 bios_path_str.c_str(),
+                 rematch_session ? " (rematch)" : "");
+    /* Soft-exit longjmps out of device service with a leftover guest clock;
+     * rematch must start from cycle 0 or vblanks never fire again. */
+    psx_cycles_reset_for_boot();
+    starvation_ring_reset();
+    present_session_reset();
+    /* Rematch ≈ cold start for netplay sim residue a cold peer lacks
+     * (pad edges, dig0 latch, tip densify, FMV flags, IRQ resume).
+     * Idempotent with BYE teardown; device *_init still runs below. */
+    psx_netplay_cold_reset();
+    {
+        extern uint64_t s_frame_count;
+        extern uint32_t g_debug_current_func_addr;
+        extern uint32_t g_debug_last_store_pc;
+        extern int g_call_unit_depth;
+        extern int g_psx_dispatch_depth;
+        s_frame_count = 0;
+        g_debug_current_func_addr = 0;
+        g_debug_last_store_pc = 0;
+        /* Soft-exit mid-call can skip the depth restore if the longjmp path
+         * was not taken; sticky depth suppresses overlay IRQ delivery and
+         * freezes rematch after lockstep armed. */
+        g_call_unit_depth = 0;
+        g_psx_dispatch_depth = 0;
+    }
+    /* Cold start activates via resolve_bios_for_runtime before this label.
+     * Rematch only rewrites bios_path_str — without re-activate, memory_init
+     * loads new ROM bytes against the prior match's linked backend (e.g.
+     * SCPH-1001 dump + sticky OPENBIOS) and dig0 never publishes cleanly. */
+    if (!validate_bios_for_launch(std::filesystem::path(bios_path_str))) {
+        std::fprintf(stderr, "psxrecomp: BIOS activate failed for %s%s\n",
+                     bios_path_str.c_str(),
+                     rematch_session ? " (rematch)" : "");
+        return 1;
+    }
+    if (rematch_session) {
+        std::fprintf(stdout,
+            "psxrecomp: rematch BIOS activated id=%s bundled=%d "
+            "deliver_event_ret=0x%x shell_entry=0x%x\n",
+            psx_bios_image.image_id ? psx_bios_image.image_id : "?",
+            psx_bios_image.image_bundled ? 1 : 0,
+            (unsigned)psx_bios_image.deliver_event_ret,
+            (unsigned)psx_bios_image.shell_entry_phys);
+        std::fflush(stdout);
+    }
+    memory_init(bios_path_str.c_str());
+#ifndef PSX_HAVE_VULKAN
+    /* Vulkan was not compiled in (PSX_ENABLE_VULKAN=OFF or no SDK found).
+     * Refuse a vulkan request from ANY source (config / CLI / launcher seed)
+     * and fall back to OpenGL, so the window is never created with
+     * SDL_WINDOW_VULKAN against an inert backend stub. */
+    if (g_video_renderer == 2) {
+        std::fprintf(stdout, "psxrecomp: Vulkan renderer is not available in this build "
+                             "(PSX_ENABLE_VULKAN=OFF); using OpenGL instead.\n");
+        g_video_renderer = 1;
+    }
+CPUState cpu;
+#endif
+    if (!init_runtime_devices(argv, boot, disc_path_str, rematch_session))
+        return 1;
 
   if (g_headless) {
     std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
