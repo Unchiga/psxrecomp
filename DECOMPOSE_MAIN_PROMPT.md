@@ -107,6 +107,11 @@ Do not re-derive these; do re-verify one before acting on it.
   **First change to reduce the file total: 15,450 -> 14,996.** Its scoring path
   is NOT covered by any oracle — it needs a live duel, and no reachable
   savestate provides one (slot 11's guest is parked in the BIOS VSync spin).
+- **`psx_runtime_perf.cpp` (346 lines)** — the opt-in cadence probe. Section
+  timers took `&g_runtime_perf.pacer_ticks`, so callers knew the state layout;
+  they now name a section and the struct is private. 14,754 -> 14,448.
+- **`psx_post_load_probe.c` (~455 lines)** — the post-restore freeze probe.
+  14,448 -> **14,034**.
 - **`psx_savestate_host.c` (334 lines, 2026-08-18)** — the slot menu's state
   machine plus the post-restore input guard and its trace ring. 14,996 ->
   14,708. Raw SDL polling and the host pause loop stayed in main.cpp on
@@ -169,11 +174,12 @@ rematch.
    `main.cpp`, with the caveat that each needs its own exclusive-vs-shared
    check before you commit:
    - menu glue (~268) — `psx_apply_video_menu_state`; `psx_video_menu.c` exists
-   - audio (~247) — `psx_sdl_audio.cpp` already exists
-   - perf diag (~248) — `runtime_perf_*`, contiguous at ~2826-3087, self-named.
-     Its one wart: call sites pass `&g_runtime_perf.<field>` to
-     `runtime_perf_section_end`, so a clean module wants named section IDs.
-   - load probe (~117) — `post_load_probe_*`
+   - audio (~250) — `psx_sdl_audio.cpp` already exists. NOT yet gated; note
+     `psx_audio_out_stats` stays in main.cpp either way (it reads the DRC and
+     SDL device state and is the `audio_stats` TCP surface).
+   - perf diag — DONE, see above.
+   - load probe — DONE, see above (it was ~415 lines, not the ~117 the old
+     cluster map claimed; re-measure before trusting any figure in that table).
    The ones with an existing sibling module are the best value: the split is
    already half-made, and the pattern is proven three times now.
 
@@ -240,7 +246,7 @@ were throwaway, so rebuild them, but rebuild them to THIS shape.
    differ ONLY by the edits you intended. This is what caught nothing and
    proved everything — and it is the only real check available for the
    launcher region (below).
-5. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
+6. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
    compiled clean and the behavioural pass still found a real latent bug.
 
 ## REWIND IS NOW BUILT (was off; fixed 2026-08-18)
@@ -368,6 +374,14 @@ cmake --build build -j         # release
   raw SDL in ahead of it breaks main.cpp's own build. Keep SDL out of module
   headers entirely (pass keycodes as `int`, as `psx_savestate_menu.h` does) and
   include `psx_sdl.h` in the `.c`.
+- **Plain C where possible, but check first — converting is not free.** The
+  cadence probe used in-class member initialisers, a by-value struct and a
+  const reference; the regex written to strip those initialisers also stripped
+  them off LOCAL variables, and only the compiler caught it. It is now
+  `psx_runtime_perf.cpp` and the move is byte-identical apart from linkage.
+  The load probe, by contrast, was C-clean apart from `std::` prefixes and
+  became a proper `.c`. Grep the candidate for `std::`, `nullptr`, `class`,
+  `&x =` and in-struct `= value` BEFORE choosing the language.
 - Modules are plain **C** where possible (`cpu_state.h`, `mod_plugins.h`,
   `host_osd.h` are C-safe with `extern "C"` guards). Going C++ -> C the fallout
   is mechanical: drop `extern "C"`, strip `std::` from memcpy/memset/snprintf,
