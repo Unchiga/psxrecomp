@@ -102,26 +102,46 @@ Do not re-derive these; do re-verify one before acting on it.
 
   Plus the five `*_offered` policy constants hoisted to file scope, which were
   what actually blocked the first phase.
+- **`psx_rank_logic.c` (498 lines, 2026-08-18)** — the game-logic half of the
+  duel rank meter, moved out beside `psx_rank_meter.c` (its compositor).
+  **First change to reduce the file total: 15,450 -> 14,996.** Its scoring path
+  is NOT covered by any oracle — it needs a live duel, and no reachable
+  savestate provides one (slot 11's guest is parked in the BIOS VSync spin).
 
 ## WHERE THIS STANDS NOW — READ BEFORE PLANNING
 
-`main()` reads like a table of contents and the startup work is done. **The
-file total did not drop** (15,363 -> 15,450), because the four phases are still
-`static` functions inside `main.cpp`. That was deliberate, and the reason is
-the thing to fix next:
+`main()` reads like a table of contents and the startup work is done.
+`main.cpp` is **14,996** lines (was 15,363 at the campaign start; the four
+phase extractions moved code *within* the file, `psx_rank_logic.c` was the
+first that moved code *out*).
 
-**`resolve_boot_config` alone references 54 `main.cpp` file-scope symbols**,
-~35 of them the `static` settings globals (`g_video_*`, `g_audio_*`, `g_fmv_*`,
-`g_ws_*`) declared around lines 1119-1590. Nothing outside `main.cpp` can see
-them, so no phase can move to its own translation unit until they do.
+### The phase functions should stay in main.cpp — this was measured
 
-**So the next step is not another phase extraction — it is a settings module.**
-Give those globals a real home (`psx_video_settings.h` / `.c` or similar,
-`extern` declarations, definitions in the new TU). Once they are visible, the
-four phase functions move out of `main.cpp` almost mechanically, and THAT is
-what finally moves the file total. `PsxBootConfig` moves to a header in the
-same step (its prerequisites — `RuntimeConfig`, `PSX_DEFAULT_BIOS_PATH`,
-`PSX_WINDOW_TITLE` — travel with it).
+The previous handoff said "extract the settings globals, then the phase
+functions leave almost mechanically". **That was wrong, and the number is
+why.** Moving the four phase functions to their own TU needs **96 shared
+symbols exported**, not the ~35 settings globals:
+
+| shared symbol group | examples |
+|---|---|
+| SDL/renderer handles | `sdl_renderer` (42 uses), `sdl_texture`, `sdl_pixel_buf`, `sdl_audio_device`, `g_gl_active`, `g_vk_active` |
+| video settings | `g_video_aspect_num/den`, `g_video_vsync`, `g_video_scale`, `g_video_aa`, `g_fullscreen` |
+| host helpers | `exe_dir_from_argv`, `resolve_bios_path`, `refresh_player_devices`, `controller_deadzone` |
+| pad/netplay state | `g_players`, `s_netplay_gl_present`, `s_drc`, `s_picker_game_name` |
+
+Only 22 of the 118 symbols the phases touch are exclusive to them. Exporting
+the SDL handles and renderer flags through a public header to buy a 2,340-line
+move would spread `main.cpp`'s internals across the tree and make the design
+*worse*. **Do not do it.** The phases are already named, already readable, and
+already the "table of contents" the style instruction asked for. Leave them.
+
+### Extract cohesive FEATURES instead — that is what moves the file
+
+`psx_rank_logic.c` is the proof: 442 lines out, 26 of its 28 dependencies were
+exclusive to it, and the one genuinely shared symbol (`g_rank_meter`) became a
+better API (`psx_rank_logic_set_mode`) than the open-coded clamp it replaced.
+**Run the exclusive-vs-shared split before committing to any candidate** — a
+cluster with a handful of shared symbols is a module; one with 96 is not.
 
 ### What is left inside `main()` (1,258 lines)
 
@@ -131,31 +151,34 @@ same step (its prerequisites — `RuntimeConfig`, `PSX_DEFAULT_BIOS_PATH`,
 | `session_reboot:` -> lobby | 726 | CPU wiring, BIOS backend select, execute, shutdown |
 | `soft_return_lobby:` -> end | 446 | netplay lobby rematch |
 
-**The `goto` pair is the blocker for the rest.** `session_reboot:` (line ~14277)
-is jumped to from `goto session_reboot` at the very end of the lobby block
-(~15442), and `goto soft_return_lobby` runs the other way. That makes the whole
-region one control-flow unit; no part of it can become a plain function until
-the label pair is turned into a real loop (`for (;;)`), which is a
-behaviour-affecting restructure on the netplay rematch path — **and netplay is
-not covered by either oracle.** Do not attempt it without a way to test a real
+**The `goto` pair blocks the rest.** `session_reboot:` is jumped to from the
+end of the lobby block, and `goto soft_return_lobby` runs the other way, so the
+whole region is one control-flow unit. Turning the label pair into a real loop
+is a behaviour-affecting restructure on the netplay rematch path, **and netplay
+is covered by neither oracle.** Do not attempt it without a way to test a real
 rematch.
 
 ## THE PLAN, IN ORDER OF VALUE PER RISK
 
-1. **Settings-globals module** — the unblocker described above. Mechanical,
-   compiler-verified, and it is what lets the file total finally move.
-2. **Move the four phase functions out of `main.cpp`** once (1) lands.
-3. **Easy clusters** (~1,200): audio, perf diag, load probe, savestate-menu
-   host glue, rank glue. Proven pattern, low coupling.
-4. **input/pad** (~1,100). Cheap globals but scattered; move function by
+1. **More feature modules, largest first.** Measured clusters still in
+   `main.cpp`, with the caveat that each needs its own exclusive-vs-shared
+   check before you commit:
+   - savestate menu host glue (~417) — `psx_savestate_menu.c` already exists
+   - menu glue (~268) — `psx_apply_video_menu_state`; `psx_video_menu.c` exists
+   - audio (~247) — `psx_sdl_audio.cpp` already exists
+   - perf diag (~248) — `runtime_perf_*`, contiguous at ~2826-3087, self-named.
+     Its one wart: call sites pass `&g_runtime_perf.<field>` to
+     `runtime_perf_section_end`, so a clean module wants named section IDs.
+   - load probe (~117) — `post_load_probe_*`
+   The three with an existing sibling module are the best value: the split is
+   already half-made, and the pattern is proven.
+2. **input/pad** (~1,100). Cheap globals but scattered; move function by
    function, never by line range.
-5. **present path** (~1,550). 102 shared globals, hot path, interpolation
+3. **present path** (~1,550). 102 shared globals, hot path, interpolation
    thread and `s_interp_mutex`. Highest risk — last, with a soak test.
-6. **The tail** — netplay glue, pad sampling, probes.
-
-`debug_server.c` is **15,038 lines** with the same disease. It is a dispatch
-table of independent handlers, so it splits far more easily — good parallel
-work when you want a lower-risk win.
+4. **`debug_server.c`** is 15,038 lines with the same disease. It is a dispatch
+   table of independent handlers, so it splits far more easily — good parallel
+   work when you want a lower-risk win.
 
 ## HOW TO VERIFY (do not skip; this caught real bugs)
 
@@ -265,6 +288,12 @@ cmake --build build -j         # release
   pointers.
 - Heredocs through the Bash tool mangle backslashes and some quoting; write
   scripts with a file-writing tool, or use `chr(92)` for backslash in Python.
+- **The tree is CRLF.** Two traps, both hit on 2026-08-18: a Python
+  `str.replace` whose needle uses `\n` silently matches NOTHING (no error, the
+  patch just does not apply — check your replacements landed), and writing with
+  `open(..., newline='\r\n')` on content that already has CRLF produces
+  `\r\r\n`. That still compiles, so only a diff catches it. Read with
+  `newline=''`, detect the terminator, and translate needles into it.
 
 ## GIT
 
