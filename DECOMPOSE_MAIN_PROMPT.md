@@ -107,6 +107,11 @@ Do not re-derive these; do re-verify one before acting on it.
   **First change to reduce the file total: 15,450 -> 14,996.** Its scoring path
   is NOT covered by any oracle — it needs a live duel, and no reachable
   savestate provides one (slot 11's guest is parked in the BIOS VSync spin).
+- **`psx_savestate_host.c` (334 lines, 2026-08-18)** — the slot menu's state
+  machine plus the post-restore input guard and its trace ring. 14,996 ->
+  14,708. Raw SDL polling and the host pause loop stayed in main.cpp on
+  purpose; the guard reaches them via one hook,
+  `psx_savestate_host_resume_inputs_held()`. Fully verified (see below).
 
 ## WHERE THIS STANDS NOW — READ BEFORE PLANNING
 
@@ -163,15 +168,20 @@ rematch.
 1. **More feature modules, largest first.** Measured clusters still in
    `main.cpp`, with the caveat that each needs its own exclusive-vs-shared
    check before you commit:
-   - savestate menu host glue (~417) — `psx_savestate_menu.c` already exists
    - menu glue (~268) — `psx_apply_video_menu_state`; `psx_video_menu.c` exists
    - audio (~247) — `psx_sdl_audio.cpp` already exists
    - perf diag (~248) — `runtime_perf_*`, contiguous at ~2826-3087, self-named.
      Its one wart: call sites pass `&g_runtime_perf.<field>` to
      `runtime_perf_section_end`, so a clean module wants named section IDs.
    - load probe (~117) — `post_load_probe_*`
-   The three with an existing sibling module are the best value: the split is
-   already half-made, and the pattern is proven.
+   The ones with an existing sibling module are the best value: the split is
+   already half-made, and the pattern is proven three times now.
+
+   **Rewind glue is the obvious next one** (`rewind_poll_nav`,
+   `rewind_host_pause_loop`, `rewind_pause_present`, ~110 lines at 6367-6493,
+   interleaved with what used to be the savestate glue). `psx_rewind.c` exists.
+   Expect the same shape as save states: the state machine moves, the SDL event
+   pumping and pause loop stay.
 2. **input/pad** (~1,100). Cheap globals but scattered; move function by
    function, never by line range.
 3. **present path** (~1,550). 102 shared globals, hot path, interpolation
@@ -207,12 +217,24 @@ were throwaway, so rebuild them, but rebuild them to THIS shape.
    `draw_offset` (double-buffer phase), `gpustat` (bit 31 is the interlace
    line, bits 0-4 the live texture page), and `sub`/`prev_page`/`applies`/
    `overrides` on `card_drops_p3` (per-render counters).
-3. **Byte-identity check for moved code.** `git show <rev>:runtime/src/main.cpp`,
+3. **Feature-specific observables.** The generic oracles say nothing about the
+   feature you just moved, so drive it directly:
+   - save-state menu: `menu_key key=1073741888` (F7) opens it, then
+     `savestate_menu_state` reports `open`/`slot`. Slot digits are SDLK_1..9
+     (49-57), arrows are `1073741903`/`1073741904`, Escape is `27`, `l`=108
+     loads. **Loading slot 2 is safe** (read-only); never test the SAVE path
+     against a slot without checking it first.
+   - `savestate_input_trace` after a load shows `arm-hold`, `arm-load`, `cap`
+     — that covers the guard and the trace ring in one shot.
+   - rank meter: `rank_meter_state` / `rank_fade_ring`.
+   If a cluster has NO observable, build one before moving it — that is rule 3,
+   and `savestate_menu_state` was added for exactly this reason.
+4. **Byte-identity check for moved code.** `git show <rev>:runtime/src/main.cpp`,
    pull the original line range, diff it against the new function body. It must
    differ ONLY by the edits you intended. This is what caught nothing and
    proved everything — and it is the only real check available for the
    launcher region (below).
-4. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
+5. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
    compiled clean and the behavioural pass still found a real latent bug.
 
 ## ⚠ THE LAUNCHER IS NOT BUILDABLE IN THIS CHECKOUT
@@ -281,6 +303,11 @@ cmake --build build -j         # release
   or it dies when the shell that started it is torn down.
 - Sources in `runtime/src`, headers in `runtime/include`; add new modules to the
   source list in `runtime/runtime.cmake`.
+- **Never include `<SDL3/SDL.h>` from a module header.** `psx_sdl.h` is the
+  seam that enables SDL3's old-name compatibility; a module header that pulls
+  raw SDL in ahead of it breaks main.cpp's own build. Keep SDL out of module
+  headers entirely (pass keycodes as `int`, as `psx_savestate_menu.h` does) and
+  include `psx_sdl.h` in the `.c`.
 - Modules are plain **C** where possible (`cpu_state.h`, `mod_plugins.h`,
   `host_osd.h` are C-safe with `extern "C"` guards). Going C++ -> C the fallout
   is mechanical: drop `extern "C"`, strip `std::` from memcpy/memset/snprintf,
