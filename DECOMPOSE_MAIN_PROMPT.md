@@ -243,20 +243,40 @@ were throwaway, so rebuild them, but rebuild them to THIS shape.
 5. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
    compiled clean and the behavioural pass still found a real latent bug.
 
-## ⚠ REWIND IS NOT BUILT IN THIS CHECKOUT
+## REWIND IS NOW BUILT (was off; fixed 2026-08-18)
 
-`PSX_REWIND:BOOL=OFF` in **both** `build-dbg` and `build`. Turning it on needs
-the retcomm-rbengine snap-ring backend (`lib/retcomm-rbengine`, or
-`-DRECOMP_RBENGINE_ROOT=...`); without it CMake hard-errors rather than
-building a stub. `psx_rewind.c` still compiles, but `PSX_HAS_RBENGINE_SNAP` is
-never defined, the ring is never allocated, and `psx_rewind_enabled()` is 0
-forever.
+It shipped disabled: `PSX_REWIND:BOOL=OFF` in both builds, because
+`lib/retcomm-rbengine` was an empty directory. `.gitmodules` declared it, but
+the baseline commit was made from a working tree and lost the gitlink, so
+`git submodule status` listed nothing and `PSX_REWIND=ON` hard-errors without
+the snap-ring backend. **Every rewind entry point was dead** - F8, the pad
+hotkey, and the menus - which is not a regression anyone introduced.
 
-**So rewind is unreachable by every route today** — F8, the Select+R3 pad
-hotkey, and the GAME > REWIND menu row all do nothing. Verified empirically:
-the guest keeps advancing frames through all three. Do not read a dead rewind
-hotkey as a regression, and do not try to verify rewind behaviour here. A
-build with the submodule is required.
+Fixed: the submodule is registered (commit `ec7fe61`) and `build-dbg` is
+configured `-DPSX_REWIND=ON`. To reproduce elsewhere:
+
+```
+git submodule update --init lib/retcomm-rbengine
+cmake -S . -B build-dbg -DPSX_REWIND=ON
+```
+
+`build/` (release) is still `PSX_REWIND=OFF` - reconfigure it the same way
+before shipping if rewind is meant to be in the build.
+
+**`lib/recomp-net` is in the same state** (declared in `.gitmodules`, empty,
+unregistered), so netplay is presumably equally unbuilt. Not touched: nothing
+this session exercised it. Check before trusting any netplay behaviour.
+
+### Verifying rewind over TCP
+
+`menu_key` pushes an SDL_KEYDOWN, so it drives anything that reads key EVENTS,
+but **not** `SDL_GetKeyboardState`. `rewind_poll_nav` polls the physical
+keyboard, so Escape/arrows cannot be faked - Escape will NOT close the
+filmstrip over TCP. F8 works, because the pause loop handles it as an event.
+
+The observable is the frame counter: rewind freezes the guest, so `frame`
+stops advancing while it is open and resumes on close. Confirmed working via
+both routes - F8, and GAME > REWIND (F10 bar -> Right x2 -> Down x3 -> Enter).
 
 ## ⚠ THE LAUNCHER IS NOT BUILDABLE IN THIS CHECKOUT
 
