@@ -279,9 +279,23 @@ but **not** `SDL_GetKeyboardState`. `rewind_poll_nav` polls the physical
 keyboard, so Escape/arrows cannot be faked - Escape will NOT close the
 filmstrip over TCP. F8 works, because the pause loop handles it as an event.
 
-The observable is the frame counter: rewind freezes the guest, so `frame`
-stops advancing while it is open and resumes on close. Confirmed working via
-both routes - F8, and GAME > REWIND (F10 bar -> Right x2 -> Down x3 -> Enter).
+The observable is `rewind_state` (open / sel / count / hover), plus the frame
+counter: rewind freezes the guest, so `frame` stops advancing while it is open
+and resumes on close. Confirmed working via both routes - F8, and GAME > REWIND
+(F10 bar -> Right x2 -> Down x3 -> Enter).
+
+**Mouse** is drivable with `menu_move` / `menu_click`, which push real SDL mouse
+events in WINDOW pixels. The panel occupies the bottom strip: with a 1280x960
+drawable it is y 608..960, canvas x maps as `win_x / 2`, canvas y as
+`(win_y - 608) / 2`. Useful points at that size: a card left of the selection
+~(404, 736), LOAD ~(292, 932), CLOSE ~(500, 932).
+
+**Hover cannot be tested reliably this way** - the physical cursor generates its
+own SDL_MOUSEMOTION events that race the synthetic ones, so `hover` flickers
+between the real position and yours. Clicks change persistent state and are
+immune; assert on `sel` instead. Note the strip re-centres on the selection, so
+clicking the same point repeatedly keeps selecting the next card along rather
+than being a no-op.
 
 ## ⚠ THE LAUNCHER IS NOT BUILDABLE IN THIS CHECKOUT
 
