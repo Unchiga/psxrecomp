@@ -13751,6 +13751,17 @@ static void handle_card_drops_list(int id, const char *json)
              id, distinct, total, body);
 }
 
+/* frame_pacing — base cadence, GAME SPEED multiplier and target period. */
+static void handle_frame_pacing(int id, const char *json)
+{
+    (void)json;
+    extern void psx_frame_pacing_state(double *, int *, double *);
+    double base = 0.0, period = 0.0; int mult = 0;
+    psx_frame_pacing_state(&base, &mult, &period);
+    send_fmt("{\"id\":%d,\"ok\":true,\"base_ms\":%.4f,\"speed_mult\":%d,"
+             "\"period_ms\":%.4f}", id, base, mult, period);
+}
+
 /* card_drops_p3 — the CARD DROPS results page (page 3).
  * stream=<hex> [subs=N] stages a raw text stream rendered verbatim on the
  * page (round-1 escape experiments); no args reads the page state back. */
@@ -13897,6 +13908,7 @@ static const CmdEntry s_commands[] = {
     { "savestate_input_trace", handle_savestate_input_trace },
     { "card_drops_state",  handle_card_drops_state },
     { "card_drops_list",   handle_card_drops_list },
+    { "frame_pacing",      handle_frame_pacing },
     { "card_drops_p3",     handle_card_drops_p3 },
     { "card_drops_set",    handle_card_drops_set },
     { "card_drops_layout", handle_card_drops_layout },

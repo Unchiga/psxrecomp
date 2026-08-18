@@ -1203,11 +1203,26 @@ static double        g_frame_period_ms = PSX_FRAME_PERIOD_MS;
 static double        g_frame_period_base_ms = PSX_FRAME_PERIOD_MS;
 static int           g_frame_speed_mult = 1;
 
+/* Pacing state for the `frame_pacing` debug command: base cadence, the GAME
+ * SPEED multiplier and the resulting target period. Exists because "the
+ * multiplier did not take effect at startup" is otherwise indistinguishable
+ * between a bad stored value, a lost seed and a pacer that ignores it. */
+extern "C" void psx_frame_pacing_state(double *base_ms, int *mult,
+                                       double *period_ms);
+
 static void frame_period_refresh(void) {
     g_frame_period_ms = (g_frame_period_base_ms > 0.0)
                             ? g_frame_period_base_ms / (double)g_frame_speed_mult
                             : 0.0;
 }
+
+extern "C" void psx_frame_pacing_state(double *base_ms, int *mult,
+                                       double *period_ms) {
+    if (base_ms)   *base_ms   = g_frame_period_base_ms;
+    if (mult)      *mult      = g_frame_speed_mult;
+    if (period_ms) *period_ms = g_frame_period_ms;
+}
+
 static bool          g_mod_native_vblank_rate = false;
 static uint32_t      g_mod_native_vblank_fps = 0;
 /* Activation-time request. -1 means no enabled mod owns load acceleration. */
@@ -14510,6 +14525,17 @@ CPUState cpu;
         g_video_vsync     = (vms.vsync == PSX_VM_VSYNC_OFF)      ? 0
                           : (vms.vsync == PSX_VM_VSYNC_ADAPTIVE) ? -1
                                                                  : 1;
+        /* Push the STORED choice at the live renderer. The comment above used
+         * to claim this lands before the GL context is created; it does not —
+         * the context comes up at "gl_renderer_set_swap_interval(g_video_vsync)"
+         * during video init, which runs BEFORE menu_settings.ini is read here.
+         * So a stored "vsync off" left the swap interval at its pre-settings
+         * value, and a blocking swap capped presentation at the panel rate —
+         * which silently defeated GAME SPEED (the pacer asked for 180 fps and
+         * the swap held it at 60) until the player toggled the vsync row and
+         * psx_apply_video_menu_state finally pushed it through. */
+        if (g_gl_active) gl_renderer_set_swap_interval(g_video_vsync);
+        if (g_vk_active) vk_renderer_set_present_mode(g_video_vsync);
         /* Same reason as the rows below: a stored GAME SPEED never reached the
          * pacer, because psx_apply_video_menu_state only fires on a CHANGE and
          * nothing seeded the multiplier here — the menu showed 3x while the
