@@ -13849,6 +13849,20 @@ static void handle_savestate_input_trace(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+/* savestate_menu_state — is the slot menu up, and on which slot. The menu is
+ * driven by real key/pad input, so without this its state could only be judged
+ * from pixels, and the overlay is host-drawn (invisible to the VRAM
+ * screenshot). Pair with menu_key to open it headlessly. */
+static void handle_savestate_menu_state(int id, const char *json)
+{
+    extern void psx_savestate_menu_debug(int *, int *);
+    int open = 0, slot = 0;
+    (void)json;
+    psx_savestate_menu_debug(&open, &slot);
+    send_fmt("{\"id\":%d,\"ok\":true,\"open\":%d,\"slot\":%d}",
+             id, open, slot);
+}
+
 /* warm_cd_route: live A/B toggle and fail-closed route counters. */
 static void handle_warm_cd_route(int id, const char *json)
 {
@@ -13906,6 +13920,7 @@ static const CmdEntry s_commands[] = {
     { "rank_meter_state",  handle_rank_meter_state },
     { "rank_fade_ring",    handle_rank_fade_ring },
     { "savestate_input_trace", handle_savestate_input_trace },
+    { "savestate_menu_state", handle_savestate_menu_state },
     { "card_drops_state",  handle_card_drops_state },
     { "card_drops_list",   handle_card_drops_list },
     { "frame_pacing",      handle_frame_pacing },

@@ -289,6 +289,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/bios_hle.c
     ${PSXRECOMP_ROOT}/runtime/src/bios_hle_plan.c
     ${PSXRECOMP_ROOT}/runtime/src/savestate.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_host.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rank_logic.c
