@@ -212,6 +212,23 @@ static char s_rank_last_line[64];
  * screen, occluded, mode off — and they are indistinguishable from the pixels,
  * which is how the occlusion deadlock survived a play session unnoticed. */
 static int s_rank_dbg_anchor, s_rank_dbg_occluded, s_rank_dbg_x, s_rank_dbg_y;
+
+/* ---- flicker hold ---------------------------------------------------------
+ *
+ * Showing the meter the instant its anchor is visible makes it STROBE through
+ * a fusion: the summon animation slides the HUD out and back and draws card art
+ * across the meter's rect, so "anchor present and not occluded" flips several
+ * times a second and the meter blinks in and out with it.
+ *
+ * So the two directions are deliberately asymmetric. Hiding is immediate --
+ * the moment anything covers the meter it must go, or it draws over the game's
+ * own art. Showing has to wait for the condition to hold steady for a stretch,
+ * which is what turns a strobe into "hidden for the duration of the fusion,
+ * back once the board settles". Frames, at 60 Hz, so about a fifth of a second
+ * -- long enough to swallow an animation's worth of flapping, short enough
+ * that returning to a quiet board does not feel laggy. */
+#define PSX_RANK_SHOW_HOLD 12
+static int s_rank_show_steady;
 /* Duel-start fade ramp. Expressed as a FRAME COUNT rather than a per-frame
  * step so the duration is exact and halving it is halving one number.
  *
@@ -256,13 +273,18 @@ void psx_rank_meter_fade_debug(int *fade, int *fade_t) {
 }
 
 void psx_rank_meter_debug(int *mode, int *active, int *anchor,
-                                     int *occluded, int *x, int *y) {
-    if (mode)     *mode     = g_rank_meter;
-    if (active)   *active   = s_rank_active;
-    if (anchor)   *anchor   = s_rank_dbg_anchor;
-    if (occluded) *occluded = s_rank_dbg_occluded;
-    if (x)        *x        = s_rank_dbg_x;
-    if (y)        *y        = s_rank_dbg_y;
+                                     int *occluded, int *x, int *y,
+                                     int *show_hold) {
+    if (mode)      *mode      = g_rank_meter;
+    if (active)    *active    = s_rank_active;
+    if (anchor)    *anchor    = s_rank_dbg_anchor;
+    if (occluded)  *occluded  = s_rank_dbg_occluded;
+    if (x)         *x         = s_rank_dbg_x;
+    if (y)         *y         = s_rank_dbg_y;
+    /* Counts up to PSX_RANK_SHOW_HOLD; below it the meter is deliberately
+     * hidden. Without this a "why is the meter gone" question has no answer
+     * short of re-deriving the flicker rule from the pixels. */
+    if (show_hold) *show_hold = s_rank_show_steady;
 }
 
 /* Drop the meter and forget what was on screen, so the next duel re-pushes
@@ -362,6 +384,7 @@ void psx_rank_logic_tick(void) {
             /* HUD is off screen entirely. Disarm the occlusion rect as well —
              * see below for why a stale one is not merely useless but fatal. */
             gpu_sprite_watch_occlusion(0, 0, 0, 0);
+            s_rank_show_steady = 0;
             psx_rank_meter_set(0, 0, 0, 0, 0);
         } else {
             /* Update values and position FIRST, then re-arm the occlusion rect
@@ -427,8 +450,11 @@ void psx_rank_logic_tick(void) {
             }
             s_rank_fade_eff = fade_out;
             psx_rank_meter_set_fade(fade_out);
-            psx_rank_meter_set(occluded ? 0 : 1, shown, pow, letter,
-                               with_score);
+            if (occluded) s_rank_show_steady = 0;
+            else if (s_rank_show_steady < PSX_RANK_SHOW_HOLD)
+                s_rank_show_steady++;
+            psx_rank_meter_set(s_rank_show_steady >= PSX_RANK_SHOW_HOLD ? 1 : 0,
+                               shown, pow, letter, with_score);
             /* Line the POW/TEC badge's top up with the FIELD box's top edge.
              *
              * set_origin takes where the LETTER goes, and the canvas starts
@@ -449,6 +475,7 @@ void psx_rank_logic_tick(void) {
             gpu_sprite_watch_occlusion(ex, ey, ew, eh);
         }
     } else {
+        s_rank_show_steady = 0;
         psx_rank_meter_set(0, 0, 0, 0, 0);
         gpu_sprite_watch_occlusion(0, 0, 0, 0);
     }

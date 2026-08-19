@@ -5306,7 +5306,7 @@ static void handle_rank_meter_tune(int id, const char *json)
 static void handle_rank_meter_state(int id, const char *json)
 {
     (void)json;
-    extern void psx_rank_meter_debug(int *, int *, int *, int *, int *, int *);
+    extern void psx_rank_meter_debug(int *, int *, int *, int *, int *, int *, int *);
     extern void psx_rank_meter_fade_debug(int *, int *);
     extern void psx_rank_meter_origin(int *, int *);
     extern int  psx_rank_meter_image(const uint32_t **, int *, int *);
@@ -5314,7 +5314,8 @@ static void handle_rank_meter_state(int id, const char *json)
     int ox = 0, oy = 0, w = 0, h = 0;
     int fade = 0, fade_t = 0;
     const uint32_t *px = 0;
-    psx_rank_meter_debug(&mode, &active, &anchor, &occ, &ax, &ay);
+    int show_hold = 0;
+    psx_rank_meter_debug(&mode, &active, &anchor, &occ, &ax, &ay, &show_hold);
     psx_rank_meter_fade_debug(&fade, &fade_t);
     psx_rank_meter_origin(&ox, &oy);
     int visible = psx_rank_meter_image(&px, &w, &h);
@@ -5327,11 +5328,12 @@ static void handle_rank_meter_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d,\"duel_active\":%d,"
              "\"fade\":%d,\"fade_t\":%d,"
              "\"anchor_found\":%d,\"anchor_x\":%d,\"anchor_y\":%d,"
-             "\"occluded\":%d,\"visible\":%d,\"origin_x\":%d,"
+             "\"occluded\":%d,\"show_hold\":%d,\"visible\":%d,\"origin_x\":%d,"
              "\"origin_y\":%d,\"w\":%d,\"h\":%d,"
              "\"box\":[%d,%d,%d,%d],\"native\":[%d,%d],"
              "\"dest\":[%d,%d,%d,%d],\"occluder\":[%d,%d,%d,%d]}",
-             id, mode, active, fade, fade_t, anchor, ax, ay, occ, visible,
+             id, mode, active, fade, fade_t, anchor, ax, ay, occ, show_hold,
+             visible,
              ox, oy, w, h,
              pl[0],pl[1],pl[2],pl[3], pl[4],pl[5], pl[6],pl[7],pl[8],pl[9],
              oc[0],oc[1],oc[2],oc[3]);
@@ -13512,11 +13514,11 @@ static uint64_t    s_rank_fade_ring_n;
 
 static void rank_fade_ring_record(void)
 {
-    extern void psx_rank_meter_debug(int *, int *, int *, int *, int *, int *);
+    extern void psx_rank_meter_debug(int *, int *, int *, int *, int *, int *, int *);
     extern void psx_rank_meter_fade_debug(int *, int *);
     int mode = 0, active = 0, anchor = 0, occ = 0, ax = 0, ay = 0;
     int fade = 0, fade_t = 0;
-    psx_rank_meter_debug(&mode, &active, &anchor, &occ, &ax, &ay);
+    psx_rank_meter_debug(&mode, &active, &anchor, &occ, &ax, &ay, NULL);
     psx_rank_meter_fade_debug(&fade, &fade_t);
     RankFadeRec *e = &s_rank_fade_ring[s_rank_fade_ring_n % RANK_FADE_RING_CAP];
     e->frame    = (uint32_t)s_frame_count;

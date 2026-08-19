@@ -27,8 +27,10 @@ void psx_rank_logic_set_mode(int mode);
 void psx_rank_logic_arm_sprite_watch(void);
 
 /* Debug-server surface; names predate the split (see psx_rank_logic.c). */
+/* `show_hold` counts consecutive unoccluded frames; the meter only draws once
+ * it reaches the hold, which is what stops a fusion strobing it. */
 void psx_rank_meter_debug(int *mode, int *active, int *anchor,
-                          int *occluded, int *x, int *y);
+                          int *occluded, int *x, int *y, int *show_hold);
 void psx_rank_meter_fade_debug(int *fade, int *fade_t);
 
 #ifdef __cplusplus
