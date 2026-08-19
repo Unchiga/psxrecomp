@@ -343,7 +343,9 @@ static const char *row_label(int m, int row) {
         return (row == 0) ? "MENU BAR"
              : (row == 1) ? "DUEL RANK"
              : (row == 2) ? "FUSION HINT"
-                          : "SUGGEST BY";
+             /* Named to read as a continuation of the row above it: on its own
+              * "SUGGEST BY" gives no clue which feature it belongs to. */
+                          : "SUGGEST FUSION BY";
     if (m == MENU_CHEATS)
         return (row == 0) ? "LIFE POINTS"
              : (row == 1) ? "STARCHIPS"
