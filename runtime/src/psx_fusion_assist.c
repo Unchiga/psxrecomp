@@ -369,15 +369,21 @@ static int line_better(const BestLine *a, const BestLine *b)
     return (s_rank_by_def ? a->atk : a->def) > (s_rank_by_def ? b->atk : b->def);
 }
 
+/* `fused` says at least one step of this line was a REAL fusion. Without it
+ * every pair of cards looks like a line, because a step that does not fuse
+ * still leaves the incoming card standing -- so the search would happily
+ * "recommend" two unrelated cards whose only effect is discarding the first.
+ * A hand with no fusions in it must come back empty, not come back with the
+ * biggest card in it dressed up as a suggestion. */
 static void best_search(const PsxFusionCard *hand, int n, uint8_t used,
-                        uint16_t carry, int depth, uint8_t *path,
+                        uint16_t carry, int depth, uint8_t *path, int fused,
                         BestLine *best)
 {
     /* Belt and braces on the recursion depth. `n` cannot exceed the hand size,
      * but that is only provable at the call site, and this writes into a
      * fixed-size array on every level -- so bound it where the writes are. */
     if (depth > PSX_FUSION_HAND_MAX) return;
-    if (depth >= 2) {
+    if (depth >= 2 && fused) {
         BestLine cand;
         cand.result = carry;
         cand.len = depth;
@@ -389,11 +395,12 @@ static void best_search(const PsxFusionCard *hand, int n, uint8_t used,
     if (depth >= n || depth >= PSX_FUSION_HAND_MAX) return;
     for (int i = 0; i < n; i++) {
         if (used & (1u << i)) continue;
-        const uint16_t next = depth ? chain_step(carry, hand[i].id, NULL)
+        int kind = PSX_FUSION_NONE;
+        const uint16_t next = depth ? chain_step(carry, hand[i].id, &kind)
                                     : hand[i].id;
         path[depth] = hand[i].slot;
         best_search(hand, n, (uint8_t)(used | (1u << i)), next, depth + 1,
-                    path, best);
+                    path, fused || kind != PSX_FUSION_NONE, best);
     }
 }
 
@@ -408,7 +415,7 @@ int psx_fusion_assist_best(uint16_t *result, int *atk, int *def, int *cards,
     memset(&best, 0, sizeof best);
     uint8_t path[PSX_FUSION_HAND_MAX];
     if (psx_fusion_db_ready())
-        best_search(hand, n, 0, 0, 0, path, &best);
+        best_search(hand, n, 0, 0, 0, path, 0, &best);
 
     if (result) *result = best.result;
     if (atk)    *atk    = best.atk;

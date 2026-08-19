@@ -357,9 +357,13 @@ static void compose(char *out, int cap, uint8_t *badges)
             for (int i = 0; i < nbest && i < PSX_FUSION_HAND_MAX; i++)
                 if (pick[i] < PSX_FUSION_HAND_MAX) badges[pick[i]] = (uint8_t)(i + 1);
     }
-    /* NUMBERS-only stops here: the badges are already set, and the caller
-     * wants the cards marked without a line of text over the field. */
-    if (!show || s_mode < PSX_FUSION_HINT_FULL) return;
+    if (s_mode < PSX_FUSION_HINT_FULL) return;
+    /* A hand that makes nothing says so. Silence would be ambiguous — the
+     * player cannot tell "nothing here" from "the hint is off or broken". */
+    if (!show) {
+        snprintf(out, (size_t)cap, "No fusions in hand");
+        return;
+    }
 
     char name[40];
     card_name(show, name, sizeof name);
