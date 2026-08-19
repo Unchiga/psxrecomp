@@ -85,6 +85,53 @@ enum { MENU_FILE = 0, MENU_VIEW = 1, MENU_VIDEO = 2, MENU_AUDIO = 3,
        MENU_GAME = 4, MENU_CHEATS = 5, MENU_MODS = 6, MENU_COUNT = 7 };
 /* AUDIO rows. MASTER scales everything; MUSIC and SOUND are the split buses. */
 enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2 };
+
+/* ---- per-title registration ---------------------------------------------
+ * Rows a game registers live here rather than in the dispatch chains below,
+ * which stay the framework's own. Fixed capacity on purpose: this runs before
+ * the guest starts and a title registering more than this has a design
+ * problem, not an allocation problem. */
+#define VM_MENU_MAX 12
+#define VM_REG_MAX  32
+
+typedef struct VmRegRow {
+    int   menu;
+    int   kind;              /* PSX_VM_ROW_* */
+    const char *label;
+    const char *hint;
+    const char *const *choices;
+    int   choice_count;
+    int   lo, hi;
+    int   slider;
+    const char *key;         /* menu_settings.ini name; NULL = not persisted */
+    int   value;
+    void (*on_change)(int);
+    void (*on_activate)(void);
+} VmRegRow;
+
+static VmRegRow    s_reg[VM_REG_MAX];
+static int         s_reg_count;
+static const char *s_menu_extra_title[VM_MENU_MAX];
+static int         s_menu_total = MENU_COUNT;
+
+/* Registered rows for menu m, and the n-th of them. */
+static int reg_count_for(int m) {
+    int i, n = 0;
+    for (i = 0; i < s_reg_count; i++) if (s_reg[i].menu == m) n++;
+    return n;
+}
+/* Defined below, next to builtin_rows: the dispatch chains above need it. */
+static struct VmRegRow *row_reg(int m, int row);
+
+static VmRegRow *reg_at(int m, int nth) {
+    int i, n = 0;
+    for (i = 0; i < s_reg_count; i++) {
+        if (s_reg[i].menu != m) continue;
+        if (n == nth) return &s_reg[i];
+        n++;
+    }
+    return NULL;
+}
 enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
 /* ACT_DISC sits between CLOSE and QUIT so QUIT stays the last row, where
  * players expect it. Safe to renumber: unlike s_item[]'s MENU_* index, these
@@ -118,7 +165,7 @@ static const char *const RANK_LABELS[]    = { "OFF", "IN GAME",
 static int s_visible;    /* bar drawn; does not capture input */
 static int s_expanded;   /* dropdown open; DOES capture input */
 static int s_menu;
-static int s_item[MENU_COUNT];
+static int s_item[VM_MENU_MAX];
 static int s_dirty = 1;
 /* Set once redraw() has produced a canvas, so the presentation thread can tell
  * "nothing drawn yet" from "drawn and current" without redrawing itself. */
@@ -178,6 +225,13 @@ static uint32_t s_canvas[VM_MAX_W * VM_MAX_H];
  * like "3" on the way to "3000" is not fought by the clamp. */
 
 static int num_range(int m, int row, int *lo, int *hi) {
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r) {
+            if (r->kind != PSX_VM_ROW_NUMBER) return 0;
+            *lo = r->lo; *hi = r->hi; return 1;
+        }
+    }
     if (m == MENU_CHEATS && row == 0) {
         /* The patched instruction is `addiu`, whose sign-extended immediate
          * would allow up to 32767 — but the game's LP display is four digits,
@@ -199,6 +253,7 @@ static int num_range(int m, int row, int *lo, int *hi) {
 }
 
 static int num_get(int m, int row) {
+    { VmRegRow *r = row_reg(m, row); if (r) return r->value; }
     if (m == MENU_CHEATS && row == 0) return s_state.life_points;
     if (m == MENU_CHEATS && row == 1) return s_state.starchips;
     if (m == MENU_GAME && row == 0) return s_state.speed;
@@ -212,6 +267,15 @@ static int num_get(int m, int row) {
 }
 
 static void num_set(int m, int row, int v) {
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r) {
+            if (r->value == v) return;
+            r->value = v;
+            if (r->on_change) r->on_change(v);
+            return;
+        }
+    }
     if (m == MENU_CHEATS && row == 0) s_state.life_points = v;
     if (m == MENU_CHEATS && row == 1) s_state.starchips = v;
     if (m == MENU_GAME && row == 0) s_state.speed = v;
@@ -230,10 +294,13 @@ static const char *menu_title(int m) {
     if (m == MENU_AUDIO) return "AUDIO";
     if (m == MENU_GAME) return "GAME";
     if (m == MENU_CHEATS) return "CHEATS";
+    if (m == MENU_MODS) return "MODS";
+    if (m >= MENU_COUNT && m < s_menu_total && s_menu_extra_title[m])
+        return s_menu_extra_title[m];
     return "MODS";
 }
 
-static int menu_rows(int m) {
+static int builtin_rows(int m) {
     if (m == MENU_FILE) return 3;
     if (m == MENU_VIEW) return 4;
     if (m == MENU_VIDEO) return 6;
@@ -241,11 +308,27 @@ static int menu_rows(int m) {
     if (m == MENU_CHEATS) return 4;
     if (m == MENU_MODS) return 1;
     if (m == MENU_GAME) return 4;
+    if (m == MENU_MODS) return 0;   /* mods fill this; empty until they do */
     return 1;
+}
+
+/* Built-in rows first, then whatever the title registered. */
+static int menu_rows(int m) { return builtin_rows(m) + reg_count_for(m); }
+
+/* The registered row at this index, or NULL when the index is built-in. */
+static VmRegRow *row_reg(int m, int row) {
+    const int b = builtin_rows(m);
+    if (row < b) return NULL;
+    return reg_at(m, row - b);
 }
 
 static int row_kind(int m, int row) {
     int lo, hi;
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r) return (r->kind == PSX_VM_ROW_ACTION) ? IT_ACTION
+                    : (r->kind == PSX_VM_ROW_NUMBER) ? IT_NUMBER : IT_OPTION;
+    }
     if (m == MENU_FILE) return IT_ACTION;
     /* VIEW row 0 is the only ACTION here (it hides the bar); row 1 is an
      * ordinary cycling option. Returning IT_ACTION for the whole menu, as this
@@ -342,6 +425,7 @@ static void edit_nudge(int delta) {
 }
 
 static const char *row_label(int m, int row) {
+    { VmRegRow *r = row_reg(m, row); if (r) return r->label; }
     if (m == MENU_FILE)
         return (row == 0) ? "CLOSE MENU"
              : (row == 1) ? "CHANGE GAME DISC"
@@ -400,6 +484,17 @@ static const char *lp_text(int v) {
 }
 
 static const char *row_value(int m, int row) {
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r && r->kind == PSX_VM_ROW_ACTION) return "";
+        if (r && r->kind == PSX_VM_ROW_OPTION) {
+            if (r->choices && r->value >= 0 && r->value < r->choice_count)
+                return r->choices[r->value];
+            return "";
+        }
+        /* NUMBER falls through: num_range() below already answers for
+         * registered rows, and that path owns the typing caret. */
+    }
     int lo, hi;
     if (num_range(m, row, &lo, &hi)) {
         /* While typing, show the buffer plus a caret so the row reads as an
@@ -450,6 +545,11 @@ static const char *row_value(int m, int row) {
 
 static const char *row_hint(int m, int row) {
     int lo, hi;
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r && !(s_editing && m == s_menu && row == s_item[s_menu]))
+            return r->hint ? r->hint : "";
+    }
     if (s_editing && m == s_menu && row == s_item[s_menu])
         return "TYPE DIGITS  ENTER APPLY  ESC CANCEL";
     if (m == MENU_FILE)
@@ -550,6 +650,22 @@ static const char *row_hint(int m, int row) {
 }
 
 static void cycle_row(int m, int row, int delta) {
+    {
+        VmRegRow *r = row_reg(m, row);
+        if (r) {
+            if (r->kind != PSX_VM_ROW_OPTION || r->choice_count <= 0) return;
+            int v = r->value + delta;
+            while (v < 0) v += r->choice_count;
+            v %= r->choice_count;
+            if (v != r->value) {
+                r->value = v;
+                if (r->on_change) r->on_change(v);
+                s_changed = 1;
+                s_dirty = 1;
+            }
+            return;
+        }
+    }
     if (m == MENU_VIEW && row == 2) {
         int v = s_state.fusion_hint + delta;
         while (v < 0) v += 3;
@@ -700,6 +816,7 @@ static void panel_rect(int m, int *px, int *pw, int *ph) {
 
 static int row_is_slider(int m, int row) {
     int lo, hi;
+    { VmRegRow *r = row_reg(m, row); if (r) return r->slider ? 1 : 0; }
     if (!num_range(m, row, &lo, &hi)) return 0;
     if (m == MENU_AUDIO) return 1;
     if (m == MENU_GAME) return 1;                 /* SPEED 1..16 */
@@ -711,6 +828,7 @@ static int row_is_slider(int m, int row) {
 /* A value worth marking on the track, or -1. LIFE POINTS gets a notch at the
  * stock 8000 so the original value is findable by eye after dragging. */
 static int slider_mark(int m, int row) {
+    if (row_reg(m, row)) return -1;
     if (m == MENU_CHEATS && row == 0) return PSX_VM_LIFE_POINTS_DEFAULT;
     return -1;
 }
@@ -805,7 +923,7 @@ static void redraw(void) {
     fill_rect(0, 0, s_lw, VM_BAR_H, COL_BAR);
     fill_rect(0, VM_BAR_H - 1, s_lw, 1, COL_BAR_EDGE);
 
-    for (i = 0; i < MENU_COUNT; i++) {
+    for (i = 0; i < s_menu_total; i++) {
         int tx = title_x(i);
         int tw = text_w(menu_title(i), 1);
         /* A title is only "active" while its dropdown is actually open. With
@@ -917,7 +1035,7 @@ void psx_video_menu_init(const PsxVideoMenuState *initial) {
     s_visible = 1;
     s_expanded = 0;
     s_menu = MENU_VIDEO;
-    for (int i = 0; i < MENU_COUNT; i++) s_item[i] = 0;
+    for (int i = 0; i < VM_MENU_MAX; i++) s_item[i] = 0;
     s_changed = 0;
     s_quit = 0;
     s_savestate = 0;
@@ -962,7 +1080,7 @@ void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out) {
     out->visible    = s_visible;
     out->expanded   = s_expanded;
     out->menu       = s_menu;
-    out->item       = (s_menu >= 0 && s_menu < MENU_COUNT) ? s_item[s_menu] : -1;
+    out->item       = (s_menu >= 0 && s_menu < s_menu_total) ? s_item[s_menu] : -1;
     out->hover_menu = s_hover_menu;
     out->hover_row  = s_hover_row;
     out->editing    = s_editing;
@@ -1026,7 +1144,7 @@ static void to_logical(int wx, int wy, int *lx, int *ly) {
 static int hit_title(int x, int y) {
     int i;
     if (y < 0 || y >= VM_BAR_H) return -1;
-    for (i = 0; i < MENU_COUNT; i++) {
+    for (i = 0; i < s_menu_total; i++) {
         int tx = title_x(i) - VM_TITLE_PAD;
         int tw = text_w(menu_title(i), 1) + VM_TITLE_PAD * 2;
         if (x >= tx && x < tx + tw) return i;
@@ -1177,6 +1295,9 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
                     else        s_savestate = 1;
                 } else if (s_menu == MENU_FILE && r == ACT_DISC) {
                     s_pick_disc = 1;
+                } else {
+                    VmRegRow *rr = row_reg(s_menu, r);
+                    if (rr && rr->on_activate) rr->on_activate();
                 }
                 psx_video_menu_collapse();
             }
@@ -1233,11 +1354,11 @@ int psx_video_menu_handle_key(int key) {
             psx_video_menu_close();
             return 1;
         case SDLK_LEFT:
-            s_menu = (s_menu + MENU_COUNT - 1) % MENU_COUNT;
+            s_menu = (s_menu + s_menu_total - 1) % s_menu_total;
             s_dirty = 1;
             return 1;
         case SDLK_RIGHT:
-            s_menu = (s_menu + 1) % MENU_COUNT;
+            s_menu = (s_menu + 1) % s_menu_total;
             s_dirty = 1;
             return 1;
         case SDLK_UP:
@@ -1266,6 +1387,9 @@ int psx_video_menu_handle_key(int key) {
                     } else if (s_menu == MENU_FILE &&
                                s_item[s_menu] == ACT_DISC) {
                         s_pick_disc = 1;
+                    } else {
+                        VmRegRow *rr = row_reg(s_menu, s_item[s_menu]);
+                        if (rr && rr->on_activate) rr->on_activate();
                     }
                     psx_video_menu_collapse();
                 }
@@ -1306,6 +1430,87 @@ int psx_video_menu_take_rewind(void) {
     int r = s_rewind;
     s_rewind = 0;
     return r;
+}
+
+int psx_video_menu_add_menu(const char *title) {
+    if (!title || s_menu_total >= VM_MENU_MAX) return -1;
+    const int id = s_menu_total++;
+    s_menu_extra_title[id] = title;
+    s_dirty = 1;
+    return id;
+}
+
+static int vm_add(int menu, int kind, const char *label, const char *hint) {
+    if (s_reg_count >= VM_REG_MAX) return -1;
+    if (menu < 0 || menu >= s_menu_total) return -1;
+    VmRegRow *r = &s_reg[s_reg_count];
+    memset(r, 0, sizeof(*r));
+    r->menu = menu;
+    r->kind = kind;
+    r->label = label;
+    r->hint = hint;
+    s_dirty = 1;
+    return s_reg_count++;
+}
+
+int psx_video_menu_add_option(int menu, const char *label, const char *hint,
+                              const char *const *choices, int choice_count,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int)) {
+    const int h = vm_add(menu, PSX_VM_ROW_OPTION, label, hint);
+    if (h < 0) return -1;
+    VmRegRow *r = &s_reg[h];
+    r->choices = choices;
+    r->choice_count = choice_count;
+    r->key = settings_key;
+    r->value = (initial >= 0 && initial < choice_count) ? initial : 0;
+    r->on_change = on_change;
+    return h;
+}
+
+int psx_video_menu_add_number(int menu, const char *label, const char *hint,
+                              int lo, int hi, int slider,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int)) {
+    const int h = vm_add(menu, PSX_VM_ROW_NUMBER, label, hint);
+    if (h < 0) return -1;
+    VmRegRow *r = &s_reg[h];
+    r->lo = lo; r->hi = hi;
+    r->slider = slider;
+    r->key = settings_key;
+    r->value = (initial < lo) ? lo : (initial > hi) ? hi : initial;
+    r->on_change = on_change;
+    return h;
+}
+
+int psx_video_menu_add_action(int menu, const char *label, const char *hint,
+                              void (*on_activate)(void)) {
+    const int h = vm_add(menu, PSX_VM_ROW_ACTION, label, hint);
+    if (h < 0) return -1;
+    s_reg[h].on_activate = on_activate;
+    return h;
+}
+
+int psx_video_menu_get_row(int row_handle) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return 0;
+    return s_reg[row_handle].value;
+}
+
+void psx_video_menu_set_row(int row_handle, int value) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return;
+    VmRegRow *r = &s_reg[row_handle];
+    if (r->kind == PSX_VM_ROW_NUMBER) {
+        if (value < r->lo) value = r->lo;
+        if (value > r->hi) value = r->hi;
+    } else if (r->kind == PSX_VM_ROW_OPTION) {
+        if (value < 0 || value >= r->choice_count) return;
+    } else {
+        return;
+    }
+    if (r->value == value) return;
+    r->value = value;
+    if (r->on_change) r->on_change(value);
+    s_dirty = 1;
 }
 
 int psx_video_menu_take_pick_disc(void) {

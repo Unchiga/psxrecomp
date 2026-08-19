@@ -204,6 +204,55 @@ int  psx_video_menu_take_rewind(void);
  * keyboard. */
 int  psx_video_menu_take_pick_disc(void);
 
+/* ---- per-title menu extension --------------------------------------------
+ *
+ * The framework owns the menus every title has: FILE, VIEW, VIDEO, AUDIO,
+ * GAME, and an empty MODS for mods to fill. Anything specific to one game --
+ * its cheats, its overlays, its own toggles -- is registered here at startup
+ * instead of being written into this module, so the shared menu carries no
+ * game-specific text and the next title inherits the mechanism rather than
+ * the content.
+ *
+ * Register from a PSX_MOD_CONSTRUCTOR (see mod_plugins.h), before
+ * psx_video_menu_init(). Registered rows appear after a menu's built-in rows,
+ * in registration order.
+ *
+ * `settings_key` names the row in menu_settings.ini; pass NULL for a value
+ * that must NOT persist -- a live cheat written straight into guest RAM would
+ * clobber the player's real save if it were re-applied at startup.
+ *
+ * All strings must outlive the process: string literals, not stack buffers.
+ */
+enum { PSX_VM_ROW_OPTION = 0, PSX_VM_ROW_NUMBER = 1, PSX_VM_ROW_ACTION = 2 };
+
+/* Built-in menus a title may add rows to. */
+enum { PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_GAME = 4, PSX_VM_MENU_MODS = 6 };
+
+/* A new top-level menu. Returns its id, or -1 when full. */
+int psx_video_menu_add_menu(const char *title);
+
+/* Cycling option. `choices[value]` is shown. Returns a row handle, or -1. */
+int psx_video_menu_add_option(int menu, const char *label, const char *hint,
+                              const char *const *choices, int choice_count,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int value));
+
+/* Integer row. `slider` draws a drag track instead of type-only entry. */
+int psx_video_menu_add_number(int menu, const char *label, const char *hint,
+                              int lo, int hi, int slider,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int value));
+
+/* Fires a callback when chosen; holds no value. */
+int psx_video_menu_add_action(int menu, const char *label, const char *hint,
+                              void (*on_activate)(void));
+
+/* Read back / drive a registered row by its handle. Setting a value fires the
+ * row's on_change, so a caller that changed the underlying thing itself
+ * should not call this. */
+int  psx_video_menu_get_row(int row_handle);
+void psx_video_menu_set_row(int row_handle, int value);
+
 /* Bar height in LOGICAL pixels (multiply by the ui scale for drawable px).
  * The renderer reserves this strip at the top so the game is letterboxed
  * BELOW the bar rather than hidden underneath it. */
