@@ -231,7 +231,10 @@ elif [[ -d "${ROOT}/recomp-ui" ]]; then
   exit 1
 else
   echo "no recomp-ui in this project — staging a launcher-less host"
+  HAS_LAUNCHER=0
 fi
+
+HAS_LAUNCHER="${HAS_LAUNCHER:-1}"
 
 copy_proj() {
   local rel="$1"
@@ -321,6 +324,12 @@ fi
 
 bash "${STAGE_SDK}" "${stage_args[@]}"
 
+if [[ "${HAS_LAUNCHER}" == "1" ]]; then
+  STEP4="Follow the Generate & rebuild wizard."
+else
+  STEP4="Nothing else. It does the rest by itself."
+fi
+
 cat >"${STAGE}/README-SETUP.txt" <<EOF
 ${DISPLAY_NAME} ${VERSION} — setup package
 Platform: ${ARTIFACT}
@@ -334,10 +343,19 @@ Standalone:
 2. Run ${EXE_BASENAME}.
 3. Provide ${DISC_HINT} (and optional retail SCPH-1001 BIOS; otherwise
    OpenBIOS is regenerated locally).
-4. Follow the Generate & rebuild wizard. On first rebuild the host downloads
-   cmake-clang-v1 from TechnicallyComputers/retcomm-toolchains (or you can
-   pick a local cmake-clang-v1-*.zip for offline builds). System cmake/ninja
-   also works if already on PATH.
+4. ${STEP4}
+
+THE FIRST RUN TAKES A WHILE - LET IT FINISH.
+
+It downloads a compiler if you have none, translates the game to C from
+your disc, and compiles it. Expect minutes, not seconds, and a console
+window that sits there working. Every run after that starts immediately.
+
+That wait is the point. This download contains no game code and no game
+assets - not the executable, not the artwork, not the font. All of it is
+built on your machine, from the disc you already own, and never leaves it.
+Shipping a ready-made build would mean shipping Konami's work; this way
+nobody does.
 
 RetComM uses this same zip: it harvests emitters into a shared SDK cache,
 downloads the toolchain pack (or uses RETCOMM_TOOLCHAIN_DIR), and preserves
