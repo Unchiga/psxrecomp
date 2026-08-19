@@ -170,8 +170,8 @@ int psx_fusion_assist_list_json(char *out, unsigned cap)
      * answer -- but the ORDER the player selects in still decides which card
      * the game keeps, so report the pair as (first, second) with `first` being
      * the lower hand position, which is what selecting left-to-right does. */
-    struct { int i, j; uint16_t result; int kind; } hits[
-        PSX_FUSION_HAND_MAX * (PSX_FUSION_HAND_MAX - 1) / 2];
+    typedef struct { int i, j; uint16_t result; int kind; } Hit;
+    Hit hits[PSX_FUSION_HAND_MAX * (PSX_FUSION_HAND_MAX - 1) / 2];
     int nhits = 0;
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
@@ -187,24 +187,41 @@ int psx_fusion_assist_list_json(char *out, unsigned cap)
         }
     }
 
-    /* Reported in hand order. Ranking by the RESULT's attack -- what a "best
-     * fusion available" line wants -- needs the per-card stats table, which is
-     * not the record array (that holds the stats of the instance in hand, not
-     * of the card a fusion would produce) and has not been located yet. Better
-     * an honest list in hand order than a plausible-looking wrong order. */
+    /* Strongest first, by the RESULT's printed stats -- not the materials',
+     * which is why this needs the card table rather than the hand records.
+     * Attack decides, defence breaks ties: a hand offering both Kaminari
+     * Attack (1900/1500) and Nekogal #2 (1900/2000) should put Nekogal on top,
+     * which is the call a player makes too. Insertion sort over at most ten. */
+    for (int a = 1; a < nhits; a++) {
+        Hit v = hits[a];
+        int va = 0, vd = 0;
+        psx_fusion_db_stats(v.result, &va, &vd, NULL);
+        int b = a - 1;
+        for (; b >= 0; b--) {
+            int ba = 0, bd = 0;
+            psx_fusion_db_stats(hits[b].result, &ba, &bd, NULL);
+            if (ba > va || (ba == va && bd >= vd)) break;
+            hits[b + 1] = hits[b];
+        }
+        hits[b + 1] = v;
+    }
+
     unsigned p = 0;
     p += (unsigned)snprintf(out + p, cap - p,
                             "\"ready\":%d,\"in_hand\":%d,\"count\":%d,"
                             "\"fusions\":[",
                             psx_fusion_db_ready(), n, nhits);
-    for (int k = 0; k < nhits && p + 200u < cap; k++) {
+    for (int k = 0; k < nhits && p + 240u < cap; k++) {
+        int atk = 0, def = 0, type = -1;
+        psx_fusion_db_stats(hits[k].result, &atk, &def, &type);
         p += (unsigned)snprintf(out + p, cap - p,
                                 "%s{\"a\":%u,\"b\":%u,\"slot_a\":%d,"
-                                "\"slot_b\":%d,\"result\":%u,\"kind\":%d}",
+                                "\"slot_b\":%d,\"result\":%u,\"kind\":%d,"
+                                "\"atk\":%d,\"def\":%d,\"type\":%d}",
                                 k ? "," : "",
                                 hand[hits[k].i].id, hand[hits[k].j].id,
                                 hand[hits[k].i].slot, hand[hits[k].j].slot,
-                                hits[k].result, hits[k].kind);
+                                hits[k].result, hits[k].kind, atk, def, type);
     }
     p += (unsigned)snprintf(out + p, cap - p, "]");
     return (int)p;
@@ -277,11 +294,13 @@ int psx_fusion_assist_chain_json(char *out, unsigned cap)
     for (int i = 0; i < n && p + 160u < cap; i++) {
         int kind = PSX_FUSION_NONE;
         if (i) carry = chain_step(carry, steps[i].id, &kind);
+        int atk = 0, def = 0;
+        psx_fusion_db_stats(carry, &atk, &def, NULL);
         p += (unsigned)snprintf(out + p, cap - p,
                                 "%s{\"slot\":%u,\"id\":%u,\"carry\":%u,"
-                                "\"kind\":%d}",
+                                "\"kind\":%d,\"atk\":%d,\"def\":%d}",
                                 i ? "," : "", steps[i].slot, steps[i].id,
-                                carry, kind);
+                                carry, kind, atk, def);
     }
     p += (unsigned)snprintf(out + p, cap - p, "]");
     return (int)p;

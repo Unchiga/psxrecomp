@@ -222,6 +222,42 @@ uint16_t psx_fusion_db_result(uint16_t first, uint16_t second, int *out_kind)
     return 0;
 }
 
+/* ---- the card table -------------------------------------------------------
+ *
+ * 0x801D4244, one 32-bit word per card, indexed by id-1. Read off the routine
+ * that fills a card record when a hand is dealt (0x80024A94..0x80024B24),
+ * which is also where the record's atk/def come from:
+ *
+ *     w = u32 at 0x801D4244 + (id - 1) * 4
+ *     attack  = (w        & 0x1FF) * 10        `andi 0x1FF` then *5 then *2
+ *     defence = ((w >> 9) & 0x1FF) * 10        `sra 9`, same scaling
+ *     type    = (w >> 26) & 0x1F               `sra 26`, `andi 0x1F`
+ *
+ * Attack and defence check out against the GameFAQs password guide on 614 of
+ * its 620 listed cards, and every one of the six disagreements is the guide
+ * being wrong, not this: Castle of Dark Illusions really is 920/1930, Dragon
+ * Zombie really is 1600/0, and Monster Eye's 250/350 was independently
+ * confirmed from the game's own hand record earlier. The type code lands 604 of
+ * 614 cards in the right group, the strays again being guide errors (one of
+ * them spells Insect "Incest").
+ *
+ * Bits 18..25 are unread here. They are almost certainly the two guardian
+ * stars at four bits each, since that is exactly the gap between defence and
+ * type — but "almost certainly" is not measured, so nothing depends on it. */
+#define PSX_FUSION_STATS_BASE 0x801D4244u
+
+int psx_fusion_db_stats(uint16_t id, int *atk, int *def, int *type)
+{
+    if (id < 1 || id > PSX_FUSION_CARD_ID_MAX) return 0;
+    const uint32_t w =
+        psx_mod_read_word(PSX_FUSION_STATS_BASE + ((uint32_t)id - 1u) * 4u);
+    if (!w) return 0;               /* table not resident, or no such card */
+    if (atk)  *atk  = (int)(w & 0x1FFu) * 10;
+    if (def)  *def  = (int)((w >> 9) & 0x1FFu) * 10;
+    if (type) *type = (int)((w >> 26) & 0x1Fu);
+    return 1;
+}
+
 void psx_fusion_db_debug(int *ready, uint32_t *pair_base, uint32_t *equip_base,
                          int *cards_with_fusions, int *pairs,
                          int *equip_groups, int *equip_members)

@@ -44,6 +44,16 @@ int psx_fusion_db_ready(void);
  * matters for the fusion table, which sorts its two arguments itself. */
 uint16_t psx_fusion_db_result(uint16_t first, uint16_t second, int *out_kind);
 
+/* A card's printed stats, from the game's own card table. Returns 1 on
+ * success, 0 if the id is out of range or the table is not resident. `atk` and
+ * `def` come back in points (not the table's tens), `type` is the game's 5-bit
+ * type code: 0 Dragon, 1 Spellcaster, 2 Zombie, 3 Warrior, 4 Beast-Warrior,
+ * 5 Beast, 6 Winged Beast, 7 Fiend, 8 Fairy, 9 Insect, 10 Dinosaur,
+ * 11 Reptile, 12 Fish, 13 Sea Serpent, 14 Machine, 15 Thunder, 16 Aqua,
+ * 17 Pyro, 18 Rock, 19 Plant, and above that the non-monster kinds. Any
+ * pointer may be NULL. */
+int psx_fusion_db_stats(uint16_t id, int *atk, int *def, int *type);
+
 /* ---- debug-server surface ---------------------------------------------- */
 
 /* Table geometry and the validation verdict, for `fusion_db`. Any pointer may
