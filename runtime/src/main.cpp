@@ -33,6 +33,7 @@
 #include "psx_rank_meter.h"
 #include "psx_cd_overlay.h"
 #include "psx_card_drops.h"
+#include "psx_fusion_overlay.h"
 #include "host_osd.h"
 #include "psx_host_input.h"   /* our own exports: injection, pad mask, lag ring */
 #include "host_keymap.h"
@@ -5305,6 +5306,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_free_spending_tick();
         psx_rank_logic_tick();
         psx_card_drops_tick();
+        psx_fusion_overlay_tick();
         /* Drives the menu's hover-to-open dwell; the module keeps no clock. */
         psx_video_menu_tick((unsigned int)SDL_GetTicks());
         {

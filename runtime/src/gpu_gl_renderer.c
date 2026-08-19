@@ -70,6 +70,7 @@
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
 #include "psx_video_menu.h"
+#include "psx_fusion_overlay.h"
 #include "psx_rank_meter.h"
 #include "psx_cd_overlay.h"
 /* gpu.c — general "is the watched sprite group covered this frame" query. */
@@ -95,6 +96,7 @@ void gl_rank_meter_placement(int *o) {
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include "png_write.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -4254,6 +4256,78 @@ static void menu_prepare_for_present(void) {
 }
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
+/* ---- present capture -------------------------------------------------------
+ *
+ * `screenshot` resolves native 15-bit VRAM and `screenshot_hires` resolves the
+ * supersampled mirror, and BOTH run before anything is composited on top. So
+ * neither can see a single host overlay — not the rank meter, not the CARD
+ * DROPS tags, not an OSD toast. Verified the hard way: an osd_toast that was
+ * demonstrably on screen came back absent from a hi-res capture, which makes
+ * those two commands silently useless for the one kind of work that most needs
+ * a picture.
+ *
+ * This reads the real backbuffer, after every overlay and immediately before
+ * the swap, so the PNG is what the player is looking at. It runs on the render
+ * thread at the one moment the frame is complete, which is why it is a pending
+ * request serviced here rather than something the debug server can do itself.
+ */
+static volatile int  s_capture_pending;
+static char          s_capture_path[512];
+static volatile int  s_capture_result;   /* 1 ok, -1 failed, 0 not done */
+static int           s_capture_w, s_capture_h;
+
+int gr_request_present_capture(const char *path) {
+    if (!path || !*path) return 0;
+    if (s_capture_pending) return 0;
+    strncpy(s_capture_path, path, sizeof s_capture_path - 1);
+    s_capture_path[sizeof s_capture_path - 1] = '\0';
+    s_capture_result = 0;
+    s_capture_pending = 1;
+    /* A static screen skips presenting entirely, so without this the
+     * request would sit unserviced until something else moved. */
+    s_force_present_remaining = 8;
+    return 1;
+}
+
+int gr_present_capture_status(int *w, int *h) {
+    if (w) *w = s_capture_w;
+    if (h) *h = s_capture_h;
+    return s_capture_pending ? 0 : s_capture_result;
+}
+
+static void gl_service_present_capture(void) {
+    if (!s_capture_pending) return;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) { s_capture_result = -1; s_capture_pending = 0; return; }
+
+    uint8_t *rgb = (uint8_t *)malloc((size_t)ww * (size_t)wh * 3u);
+    if (!rgb) { s_capture_result = -1; s_capture_pending = 0; return; }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+
+    /* GL hands back bottom-up; PNG wants top-down. */
+    uint8_t *flip = (uint8_t *)malloc((size_t)ww * (size_t)wh * 3u);
+    if (!flip) { free(rgb); s_capture_result = -1; s_capture_pending = 0; return; }
+    for (int y = 0; y < wh; y++)
+        memcpy(flip + (size_t)y * (size_t)ww * 3u,
+               rgb + (size_t)(wh - 1 - y) * (size_t)ww * 3u, (size_t)ww * 3u);
+
+    FILE *f = fopen(s_capture_path, "wb");
+    int ok = 0;
+    if (f) {
+        ok = png_write_rgb(f, flip, (uint32_t)ww, (uint32_t)wh);
+        fclose(f);
+    }
+    free(flip);
+    free(rgb);
+    s_capture_w = ww;
+    s_capture_h = wh;
+    s_capture_result = ok ? 1 : -1;
+    s_capture_pending = 0;
+}
+
 static void gl_swap_with_osd(void) {
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
@@ -4354,6 +4428,28 @@ static void gl_swap_with_osd(void) {
                     gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
                 }
             }
+            /* Fusion assistant's line above the hand: guest-space overlay,
+             * same letterbox mapping as the two above it. No occlusion watch —
+             * it only draws while the hand is pickable, which is exactly when
+             * nothing covers that strip. */
+            if (psx_fusion_overlay_image(&px, &ow, &oh) && px) {
+                int lx, ly, lw, lh;
+                letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+                const int nw = (s_native_w > 0) ? s_native_w : 320;
+                const int nh = (s_native_h > 0) ? s_native_h : 240;
+                const int ly_top = wh - ly - lh;
+                int gx = 0, gy = 0;
+                psx_fusion_overlay_origin(&gx, &gy);
+                if (lw > 0 && lh > 0) {
+                    const int dx = lx + (gx * lw) / nw;
+                    const int dy = ly_top + (gy * lh) / nh;
+                    int dw = (ow * lw) / nw;
+                    int dh = (oh * lh) / nh;
+                    if (dw < 1) dw = 1;
+                    if (dh < 1) dh = 1;
+                    gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
+                }
+            }
             /* Menu bar last: it is the topmost UI layer. Blended, because the
              * canvas is transparent everywhere the bar/dropdown does not cover
              * and the game must remain visible underneath.
@@ -4394,6 +4490,7 @@ static void gl_swap_with_osd(void) {
         }
     }
     host_osd_present_done();
+    gl_service_present_capture();
     SDL_GL_SwapWindow(s_win);
 }
 
@@ -4512,7 +4609,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1) &&
-        !host_osd_needs_present() && !psx_rank_meter_needs_present()) {
+        !host_osd_needs_present() && !psx_rank_meter_needs_present() &&
+        !psx_fusion_overlay_needs_present()) {
         s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(0);
@@ -4620,7 +4718,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
         !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1) &&
-        !host_osd_needs_present() && !psx_rank_meter_needs_present()) {
+        !host_osd_needs_present() && !psx_rank_meter_needs_present() &&
+        !psx_fusion_overlay_needs_present()) {
         s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(1);

@@ -29,10 +29,12 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
+#include "gpu_gl_renderer.h" /* screenshot_present: the composited backbuffer */
 #include "present_ring.h"
 #include "psx_video_menu.h"   /* menu_state: is the dropdown actually open? */
 #include "psx_fusion_db.h"     /* fusion_db/fusion_try: the game's fusion data */
 #include "psx_fusion_assist.h" /* fusion_hand/fusion_list: the live duel hand */
+#include "psx_fusion_overlay.h" /* fusion_overlay: the on-screen line */
 #include "psx_host_input.h"   /* menu_click/menu_key: drive the overlay UI */
 #include "host_osd.h"         /* osd_toast: exercise the host OSD */
 #include "load_transition_ring.h"
@@ -7522,6 +7524,37 @@ static void handle_screenshot_file(int id, const char *json)
  * so what lands in the PNG is what the player sees. Falls back to the native
  * resolve when no hi-res surface exists (supersampling 1 / software), so the
  * command always answers with something truthful about the actual output. */
+/* screenshot_present -- the composited frame, overlays included.
+ *
+ * screenshot and screenshot_hires both resolve their pixels BEFORE the
+ * overlay pass runs, so neither can see the rank meter, the CARD DROPS
+ * tags, the fusion line or even an OSD toast. Measured: a toast that was
+ * plainly on screen came back absent from a hi-res capture. This asks the
+ * renderer for the real backbuffer instead and waits for the frame. */
+static void handle_screenshot_present(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_present.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = 0;
+    if (!gr_request_present_capture(path)) {
+        send_err(id, "capture busy or unavailable"); return;
+    }
+    /* Queue and return. Waiting here would be waiting on the thread that has
+     * to draw the frame, which is how the first cut of this deadlocked into a
+     * timeout on a perfectly working capture. Poll screenshot_present_status. */
+    send_fmt("{\"id\":%d,\"ok\":true,\"queued\":true,\"path\":\"%s\"}", id, path);
+}
+
+static void handle_screenshot_present_status(int id, const char *json)
+{
+    (void)json;
+    int w = 0, h = 0;
+    const int st = gr_present_capture_status(&w, &h);
+    send_fmt("{\"id\":%d,\"ok\":true,\"state\":%d,\"width\":%d,\"height\":%d}",
+             id, st, w, h);
+}
+
 static void handle_screenshot_hires(int id, const char *json)
 {
     GpuDisplayInfo di;
@@ -12256,6 +12289,22 @@ static void handle_fusion_list(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+static void handle_fusion_overlay(int id, const char *json)
+{
+    int x = json_get_int(json, "x", PSX_FUSION_OVERLAY_KEEP);
+    int y = json_get_int(json, "y", PSX_FUSION_OVERLAY_KEEP);
+    int tx = json_get_int(json, "text_x", PSX_FUSION_OVERLAY_KEEP);
+    int en = json_get_int(json, "enabled", PSX_FUSION_OVERLAY_KEEP);
+    if (x != PSX_FUSION_OVERLAY_KEEP || y != PSX_FUSION_OVERLAY_KEEP ||
+        tx != PSX_FUSION_OVERLAY_KEEP || en != PSX_FUSION_OVERLAY_KEEP)
+        psx_fusion_overlay_tune(x, y, tx, en);
+    psx_fusion_overlay_tune_get(&x, &y, &tx, &en);
+    send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"text_x\":%d,"
+             "\"enabled\":%d,\"on_screen\":%d,\"text\":\"%s\"}",
+             id, x, y, tx, en, psx_fusion_overlay_needs_present(),
+             psx_fusion_overlay_text());
+}
+
 static void handle_fusion_best(int id, const char *json)
 {
     (void)json;
@@ -12530,6 +12579,7 @@ static const CmdEntry s_commands[] = {
     { "fusion_try",        handle_fusion_try },
     { "fusion_chain",      handle_fusion_chain },
     { "fusion_best",       handle_fusion_best },
+    { "fusion_overlay",    handle_fusion_overlay },
     { "card_drops_list",   handle_card_drops_list },
     { "frame_pacing",      handle_frame_pacing },
     { "card_drops_p3",     handle_card_drops_p3 },
@@ -12738,6 +12788,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_present_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "screenshot_hires",  handle_screenshot_hires },
+    { "screenshot_present", handle_screenshot_present },
+    { "screenshot_present_status", handle_screenshot_present_status },
     { "interp_dump",       handle_interp_dump },
     { "display_ring_get",  handle_display_ring_get },
     { "display_ring_aux",  handle_display_ring_aux },

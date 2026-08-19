@@ -382,9 +382,9 @@ static void best_search(const PsxFusionCard *hand, int n, uint8_t used,
     }
 }
 
-int psx_fusion_assist_best_json(char *out, unsigned cap)
+int psx_fusion_assist_best(uint16_t *result, int *atk, int *def, int *cards,
+                           uint8_t *pick, int pick_cap)
 {
-    if (!out || cap < 192u) return 0;
     PsxFusionCard hand[PSX_FUSION_HAND_MAX];
     int n = psx_fusion_assist_hand(hand, PSX_FUSION_HAND_MAX);
     if (n > PSX_FUSION_HAND_MAX) n = PSX_FUSION_HAND_MAX;
@@ -394,6 +394,27 @@ int psx_fusion_assist_best_json(char *out, unsigned cap)
     uint8_t path[PSX_FUSION_HAND_MAX];
     if (psx_fusion_db_ready())
         best_search(hand, n, 0, 0, 0, path, &best);
+
+    if (result) *result = best.result;
+    if (atk)    *atk    = best.atk;
+    if (def)    *def    = best.def;
+    if (cards)  *cards  = best.len;
+    if (pick)
+        for (int i = 0; i < best.len && i < pick_cap; i++) pick[i] = best.slot[i];
+    return best.len;
+}
+
+int psx_fusion_assist_best_json(char *out, unsigned cap)
+{
+    if (!out || cap < 192u) return 0;
+    PsxFusionCard hand[PSX_FUSION_HAND_MAX];
+    int n = psx_fusion_assist_hand(hand, PSX_FUSION_HAND_MAX);
+    if (n > PSX_FUSION_HAND_MAX) n = PSX_FUSION_HAND_MAX;
+
+    BestLine best;
+    memset(&best, 0, sizeof best);
+    psx_fusion_assist_best(&best.result, &best.atk, &best.def, &best.len,
+                           best.slot, PSX_FUSION_HAND_MAX);
 
     unsigned p = 0;
     p += (unsigned)snprintf(out + p, cap - p,

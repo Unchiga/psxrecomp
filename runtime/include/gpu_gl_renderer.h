@@ -15,6 +15,13 @@ struct SDL_Window;
 extern "C" {
 #endif
 
+/* Capture the COMPOSITED backbuffer -- the frame with every host overlay
+ * already drawn on it, which is the only capture that can see them.
+ * Queues a request serviced on the render thread just before the swap;
+ * poll gr_present_capture_status for 1 (written), -1 (failed), 0 (pending). */
+int gr_request_present_capture(const char *path);
+int gr_present_capture_status(int *w, int *h);
+
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
