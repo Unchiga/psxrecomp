@@ -96,6 +96,21 @@ extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
 extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #endif
 #endif
+
+#if defined(PSX_HAS_SETUP_HOST) && !defined(RECOMP_LAUNCHER)
+/* Launcher-less setup host. The same title-supplied entry points the launcher
+ * build uses, plus the two the wizard would otherwise have driven. The disc
+ * picker and its acceptance gate already live in this file, so the runtime
+ * drives the flow and the title supplies only its own configuration. */
+extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
+extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
+extern "C" int  psx_game_codegen_setup_init(void);
+extern "C" int  psx_game_codegen_generate_and_build(const char* disc_path,
+                                                    char* out_exe,
+                                                    unsigned long out_cap,
+                                                    char* err_msg,
+                                                    unsigned long err_cap);
+#endif
 #include "psx_sdl.h"
 #if defined(PSX_SDL3)
 /*
@@ -12247,6 +12262,66 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
     return true;
 }
 
+#if defined(PSX_HAS_SETUP_HOST) && !defined(RECOMP_LAUNCHER) && \
+    !defined(PSX_HAS_GAME_DISPATCH)
+/* The whole first run, without a launcher.
+ *
+ * This build links no game C and no BIOS, so there is nothing to boot: the
+ * player's disc is the missing input for BOTH. Ask for it with the picker this
+ * file already owns — same modal, same acceptance gate, same disc.cfg cache as
+ * every other disc prompt, so a wrong dump is refused here with the same
+ * explanation rather than being carried into a twenty-minute build.
+ *
+ * Returns an exit code; the caller returns it directly. There is no path back
+ * into the runtime, because after a successful build the binary to run is a
+ * different one.
+ */
+static int run_setup_host_first_run(int argc, char** argv, PsxBootConfig& boot) {
+    psx_game_codegen_forward_if_built(argc, argv);
+    /* Reached only when there is no product build to forward to. */
+
+    const int status = psx_game_codegen_setup_init();
+    if (status != 1) {
+        const char* why =
+            status == 0  ? "The project folder could not be found. Keep this "
+                           "executable inside the folder it was unpacked into."
+          : status == -1 ? "The psxrecomp SDK is missing from the project "
+                           "folder. Unpack the download again, completely."
+                         : "game.toml is missing from the project folder. "
+                           "Unpack the download again, completely.";
+        launcher_warning("Setup — cannot start", why);
+        return 1;
+    }
+
+    std::filesystem::path disc = resolve_disc_for_runtime(
+        boot.resolved_disc, boot.disc_override_path, boot.game_id, argv[0]);
+    if (disc.empty()) {
+        std::fprintf(stderr, "psxrecomp: setup cancelled; no disc selected.\n");
+        return 1;
+    }
+
+    char out_exe[1100] = {0};
+    char err[1024] = {0};
+    const std::string disc_str = disc.string();
+    std::fprintf(stderr, "psxrecomp: setup — generating from %s\n",
+                 disc_str.c_str());
+    if (!psx_game_codegen_generate_and_build(disc_str.c_str(), out_exe,
+                                             (unsigned long)sizeof(out_exe),
+                                             err,
+                                             (unsigned long)sizeof(err))) {
+        launcher_warning("Setup failed", err[0] ? err : "The build did not "
+                         "complete. See the console output for details.");
+        return 1;
+    }
+
+    /* An empty out_exe on success is the Windows deferred-rebuild signal: the
+     * running .exe cannot be relinked while it holds its own file, so a helper
+     * finishes the build in its own console. relaunch_or_exit starts it. */
+    psx_game_codegen_relaunch_or_exit(disc_str.c_str());
+    return 0;   /* not reached — relaunch_or_exit exits the process */
+}
+#endif
+
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -12279,6 +12354,14 @@ int main(int argc, char** argv) {
     PsxBootConfig boot;
 
     if (!resolve_boot_config(argc, argv, boot)) return 1;
+
+#if defined(PSX_HAS_SETUP_HOST) && !defined(RECOMP_LAUNCHER) && \
+    !defined(PSX_HAS_GAME_DISPATCH)
+    /* No game C linked, so this run can only be the first one. Ahead of the
+     * BIOS check, which in a setup host has nothing to find and would exit
+     * before the disc was ever asked for. */
+    return run_setup_host_first_run(argc, argv, boot);
+#endif
 
     switch (run_launcher_session(argc, argv, boot)) {
         case LauncherOutcome::Quit:   return 0;

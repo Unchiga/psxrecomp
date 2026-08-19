@@ -3754,6 +3754,18 @@ void psxrecomp_codegen_host_forward_if_built(
 #endif /* !PSX_HAS_GAME_DISPATCH */
 }
 
+#if !defined(PSX_HAS_RECOMP_LAUNCHER)
+/* No launcher to ask which binary to restart, so answer with this process's
+ * own image. relaunch_or_exit prefers the freshly built product exe over this
+ * whenever it resolved one, so this is the fallback, not the usual answer. */
+int recomp_launcher_relaunch_exe(char* out, size_t out_sz) {
+    if (!out || out_sz < 2)
+        return 0;
+    out[0] = '\0';
+    return host_self_exe_path(out, out_sz);
+}
+#endif
+
 void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
     char exe[512];
     const char* near_exe;
@@ -3807,18 +3819,13 @@ void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
 #endif
 }
 
-void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
-                                  const PsxrecompCodegenHostConfig* cfg) {
-    if (!gi || !cfg || !cfg->cmake_target || !cfg->exe_basename)
-        return;
-
-#if !defined(PSX_HAS_SETUP_WIZARD)
-    /* Build did not opt into the setup-wizard product surface
-     * (-DPSX_SETUP_WIZARD=ON / ENABLE_SETUP_WIZARD). Leave GameInfo dark so
-     * recomp-ui never opens first-run / Generate & rebuild. */
-    (void)cfg;
-    return;
-#else
+/* Everything _apply used to do before it started filling in GameInfo. Split
+ * out because none of it is about a launcher: it is discovery of the project
+ * tree, the CLI and the toolchain, which a runtime driving its own first run
+ * needs just as much. */
+int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg) {
+    if (!cfg || !cfg->cmake_target || !cfg->exe_basename)
+        return 0;
 
     g_cfg = cfg;
     g_ready = 0;
@@ -3833,13 +3840,64 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     g_helper_path[0] = '\0';
     g_toolchain_bin[0] = '\0';
     g_cli_toolchain_bin[0] = '\0';
-    /* Keep g_wizard_bios across re-apply within the same process. */
+    /* Keep g_wizard_bios across re-init within the same process. */
 
     snprintf(g_display, sizeof(g_display), "%s",
              cfg_or(cfg->display_name, "Game"));
     snprintf(g_cmake_target, sizeof(g_cmake_target), "%s", cfg->cmake_target);
     snprintf(g_exe_basename, sizeof(g_exe_basename), "%s", cfg->exe_basename);
 
+    if (!discover_project_root(g_project_root, sizeof(g_project_root)))
+        return 0;
+    if (!resolve_cli_path(g_project_root, g_cli_path, sizeof(g_cli_path)))
+        return -1;
+    if (!join_path(g_game_toml, sizeof(g_game_toml), g_project_root,
+                   cfg_or(cfg->game_toml_relpath, "game.toml")))
+        return -2;
+    if (!path_is_file(g_game_toml))
+        return -2;
+
+    /* Ready even when Python is not on PATH yet — the toolchain step installs
+     * a portable CPython, and generate/rebuild re-resolve after
+     * activate_toolchain_path(). */
+    g_ready = 1;
+    activate_toolchain_path();
+    (void)find_python(g_python, sizeof(g_python));
+    return 1;
+}
+
+/* The launcher-free first run. The two halves are the same functions the
+ * wizard wires into GameInfo as prepare_with_progress and
+ * rebuild_with_progress; running them back to back is what the wizard does
+ * once the player has picked a disc. */
+int psxrecomp_codegen_host_generate_and_build(
+    const char* disc_path, char* out_exe, size_t out_cap,
+    char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx) {
+    char gen_out[512];
+    if (out_exe && out_cap)
+        out_exe[0] = '\0';
+    if (!host_prepare_generate(disc_path, gen_out, sizeof(gen_out), err_msg,
+                               err_cap, on_progress, progress_ctx))
+        return 0;
+    return host_rebuild_game(disc_path, out_exe, out_cap, err_msg, err_cap,
+                             on_progress, progress_ctx);
+}
+
+#if defined(PSX_HAS_RECOMP_LAUNCHER)
+void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
+                                  const PsxrecompCodegenHostConfig* cfg) {
+    if (!gi || !cfg || !cfg->cmake_target || !cfg->exe_basename)
+        return;
+
+#if !defined(PSX_HAS_SETUP_WIZARD)
+    /* Build did not opt into the setup-wizard product surface
+     * (-DPSX_SETUP_WIZARD=ON / ENABLE_SETUP_WIZARD). Leave GameInfo dark so
+     * recomp-ui never opens first-run / Generate & rebuild. */
+    (void)cfg;
+    return;
+#else
+    const int status = psxrecomp_codegen_host_init(cfg);
     const char* force_env =
         cfg_or(cfg->force_setup_env, "PSXRECOMP_FORCE_SETUP");
     const char* force = getenv(force_env);
@@ -3852,8 +3910,8 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
      * the optional SCPH1001 picker so prepare can ingest a dump first. */
     gi->has_bios = 1;
 
-    if (!discover_project_root(g_project_root, sizeof(g_project_root))) {
-        /* Still force the wizard when generated/ is missing — discover may
+    if (status == 0) {
+        /* Still force the wizard when generated/ is missing — discovery may
          * fail if the process cwd is unrelated to the project tree. */
         if (force_setup) {
             gi->needs_setup = 1;
@@ -3861,25 +3919,16 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         }
         return;
     }
-    if (!resolve_cli_path(g_project_root, g_cli_path, sizeof(g_cli_path))) {
+    if (status == -1) {
         if (psxrecomp_codegen_host_sources_missing(cfg) || force_setup) {
             gi->needs_setup = 1;
             gi->prepare_required_before_continue = 1;
         }
         return;
     }
-    if (!join_path(g_game_toml, sizeof(g_game_toml), g_project_root,
-                   cfg_or(cfg->game_toml_relpath, "game.toml")))
-        return;
-    if (!path_is_file(g_game_toml))
+    if (status != 1)
         return;
 
-    /* Wire prepare/rebuild even when Python is not on PATH yet — wizard page 0
-     * installs cmake-clang-v1 (1.0.6+ ships portable CPython under python/).
-     * generate/rebuild re-resolve after activate_toolchain_path. */
-    g_ready = 1;
-    activate_toolchain_path();
-    (void)find_python(g_python, sizeof(g_python));
     gi->persist_setup = host_persist_setup;
     gi->persist_setup_ctx = NULL;
     gi->prepare_with_progress = host_prepare_generate;
@@ -3954,3 +4003,4 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     }
 #endif /* PSX_HAS_SETUP_WIZARD */
 }
+#endif /* PSX_HAS_RECOMP_LAUNCHER */

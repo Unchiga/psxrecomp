@@ -1,14 +1,26 @@
-/* Portable recomp-ui setup host: disc → generate → cmake/PGO rebuild → relaunch.
+/* Portable setup host: disc → generate → cmake/PGO rebuild → relaunch.
  *
- * Games compile psxrecomp_codegen_host.c, fill PsxrecompCodegenHostConfig,
- * and call psxrecomp_codegen_host_apply() when building RecompLauncherCGameInfo.
+ * Two ways in:
  *
- * Requires recomp_launcher.h on the include path (recomp-ui submodule).
+ *   With recomp-ui — games fill PsxrecompCodegenHostConfig and call
+ *   psxrecomp_codegen_host_apply() when building RecompLauncherCGameInfo, and
+ *   the launcher's first-run wizard drives everything.
+ *
+ *   Without it — games call psxrecomp_codegen_host_init() once, then
+ *   psxrecomp_codegen_host_generate_and_build() from their own first-run path.
+ *   Same engine, no launcher; see psxrecomp_launcher_compat.h for why that is
+ *   only three symbols wide.
  */
 #ifndef PSXRECOMP_CODEGEN_HOST_H
 #define PSXRECOMP_CODEGEN_HOST_H
 
+#include <stddef.h>
+
+#if defined(PSX_HAS_RECOMP_LAUNCHER)
 #include "recomp_launcher.h"
+#else
+#include "psxrecomp_launcher_compat.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,8 +52,36 @@ typedef struct PsxrecompCodegenHostConfig {
     const char* prepare_note_no_cmake;
 } PsxrecompCodegenHostConfig;
 
+/* Bring the host up: find the project root, the psxrecomp CLI and game.toml,
+ * and put the portable toolchain on PATH. Call once before generating.
+ *
+ *   1  ready — generate and rebuild will run
+ *   0  no project root
+ *  -1  project root found, but no psxrecomp CLI in it
+ *  -2  no game.toml
+ *
+ * Anything but 1 means setup cannot proceed; the value says which input is
+ * missing, so a caller can tell the player what to fix rather than reporting a
+ * bare failure. */
+int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg);
+
+/* The whole first run in one call: generate C from `disc_path`, then build it.
+ * On success fills out_exe with the product binary. On failure fills err_msg
+ * and returns 0. `on_progress` may be NULL.
+ *
+ * On Windows the build half schedules a helper and asks the caller to exit --
+ * the running .exe cannot be relinked while it holds its own file. That is
+ * reported through out_exe being empty on an otherwise successful return, the
+ * same signal the launcher acts on. */
+int psxrecomp_codegen_host_generate_and_build(
+    const char* disc_path, char* out_exe, size_t out_cap,
+    char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx);
+
+#if defined(PSX_HAS_RECOMP_LAUNCHER)
 void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
                                   const PsxrecompCodegenHostConfig* cfg);
+#endif
 
 int psxrecomp_codegen_host_sources_missing(
     const PsxrecompCodegenHostConfig* cfg);

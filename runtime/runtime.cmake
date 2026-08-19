@@ -366,6 +366,13 @@ option(PSX_NETPLAY "Link recomp-net delay-sync (opt-in; needs recomp-net)" OFF)
 # titles that have not tested the self-build flow do not advertise it. Opt in
 # with -DPSX_SETUP_WIZARD=ON (or ENABLE_SETUP_WIZARD on psxrecomp_add_game_runtime
 # after setting the cache before include, same pattern as PSX_NETPLAY).
+# Compile the setup host (disc -> generate -> rebuild -> relaunch) for a build
+# that has no recomp-ui. The engine never needed the launcher; only three
+# symbols did, and psxrecomp_launcher_compat.h supplies them. A title turning
+# this on drives the flow from its own first-run path instead of the wizard.
+option(PSX_SETUP_HOST
+    "Compile the setup host for launcher-less first-run generate + rebuild" OFF)
+
 option(PSX_SETUP_WIZARD
     "Advertise first-run setup wizard + Generate & rebuild in recomp-ui" OFF)
 set(RECOMP_NET_ROOT "" CACHE PATH "Path to recomp-net; empty = auto-discover")
@@ -1304,6 +1311,12 @@ function(psxrecomp_add_runtime_target target)
     if(PSX_SETUP_WIZARD)
         target_compile_definitions(${target} PRIVATE PSX_HAS_SETUP_WIZARD=1)
     endif()
+    # Launcher-less first run. Distinct from PSX_HAS_GAME_CODEGEN, which every
+    # game runtime defines: this says the title supplies the codegen_setup
+    # entry points AND wants the runtime to drive them itself.
+    if(PSX_SETUP_HOST)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_SETUP_HOST=1)
+    endif()
 
     # First-divergence co-sim oracle (COSIM_ORACLE.md): the clean, deterministic build.
     # PSX_COSIM activates the cosim engine/hooks; PSX_NO_DEBUG_TOOLS strips ALL the laggy
@@ -1706,15 +1719,19 @@ function(psxrecomp_add_game_runtime target)
             FORCE)
     endif()
 
-    # Setup-host CI (-DPSXRECOMP_FORCE_SETUP_HOST=ON) without the wizard ships a
-    # zip that never opens first-run / Generate & rebuild (BPE regression).
-    if(PSXRECOMP_FORCE_SETUP_HOST AND NOT PSX_SETUP_WIZARD)
+    # A setup-host zip must have SOME way to reach first run, or it ships a
+    # build that can never generate anything (BPE regression). Either surface
+    # counts: the recomp-ui wizard, or a title driving the flow itself.
+    if(PSXRECOMP_FORCE_SETUP_HOST AND NOT PSX_SETUP_WIZARD AND NOT PSX_SETUP_HOST)
         message(FATAL_ERROR
-            "PSXRECOMP_FORCE_SETUP_HOST=ON requires PSX_SETUP_WIZARD=ON.\n"
-            "Add ENABLE_SETUP_WIZARD to psxrecomp_add_game_runtime(...), and/or:\n"
+            "PSXRECOMP_FORCE_SETUP_HOST=ON needs a first-run surface.\n"
+            "With recomp-ui: add ENABLE_SETUP_WIZARD to "
+            "psxrecomp_add_game_runtime(...), and/or:\n"
             "  set(PSX_SETUP_WIZARD ON CACHE BOOL \"…\" FORCE)\n"
             "before include(runtime.cmake), and/or pass -DPSX_SETUP_WIZARD=ON\n"
-            "on the cmake command line (setup-release CI does this).")
+            "on the cmake command line (setup-release CI does this).\n"
+            "Without recomp-ui: pass -DPSX_SETUP_HOST=ON and call\n"
+            "psxrecomp_codegen_host_generate_and_build() from your first-run path.")
     endif()
 
     if(NOT PSXG_GEN_MARKER)
@@ -1746,11 +1763,14 @@ function(psxrecomp_add_game_runtime target)
     endif()
 
     set(_psxg_extras ${PSXG_CODEGEN_SETUP_SOURCES})
-    # psxrecomp_codegen_host.h includes recomp_launcher.h, which only exists in
-    # the recomp-ui submodule (see the header's own note). Compiling it with
-    # PSX_RECOMP_UI=OFF is a hard include failure, so gate it on the same
-    # condition the launcher itself uses. The setup host is launcher-only.
-    if(PSX_RECOMP_UI AND NOT PSXRT_ORACLE)
+    # psxrecomp_codegen_host.c is compiled for either surface: the recomp-ui
+    # wizard, or a title driving its own first run with PSX_SETUP_HOST. It used
+    # to be launcher-only because its header includes recomp_launcher.h, which
+    # exists only in the recomp-ui submodule -- a hard include failure with
+    # PSX_RECOMP_UI=OFF. PSX_HAS_RECOMP_LAUNCHER now says which is available;
+    # without it the header takes psxrecomp_launcher_compat.h instead and the
+    # launcher-facing _apply() compiles out.
+    if((PSX_RECOMP_UI OR PSX_SETUP_HOST) AND NOT PSXRT_ORACLE)
         list(APPEND _psxg_extras
             "${PSXRECOMP_ROOT}/host/psxrecomp_codegen_host.c")
     endif()
@@ -1819,6 +1839,11 @@ function(psxrecomp_add_game_runtime target)
     endif()
     if(RECOMP_UI_ROOT)
         list(APPEND _psxg_inc "${RECOMP_UI_ROOT}/src")
+        # The real recomp_launcher.h is reachable, so the codegen host takes it
+        # and keeps its launcher-facing _apply(). Without this it falls back to
+        # psxrecomp_launcher_compat.h, which declares only the progress typedef
+        # and the relaunch query -- the whole of what the engine actually uses.
+        target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_LAUNCHER=1)
     endif()
     target_include_directories(${target} PRIVATE ${_psxg_inc})
 endfunction()
