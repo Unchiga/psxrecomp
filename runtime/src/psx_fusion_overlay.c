@@ -78,7 +78,7 @@ static const char k_charset[0x80] = {
  * mostly-transparent canvas covers both rather than two composite passes. */
 #define FO_Y        52
 #define FO_TEXT_X   16
-#define FO_TEXT_Y   0     /* the line's top within the canvas */
+#define FO_TEXT_Y   4     /* the line's top within the canvas */
 #define FO_CARD_X   22    /* left edge of hand card 0 */
 #define FO_CARD_DX  58    /* card pitch */
 /* The badge sits INSIDE each card's top-right corner, where it reads as part
