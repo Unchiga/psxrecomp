@@ -188,3 +188,52 @@ verified step). `cmake --build build-dbg -j` (debug + TCP on 4370),
   finally provide one; glance at `rank_meter_state` while you're there).
 - Bug #1 duel soft-lock (slot 11), bug #4 results-screen zoom
   (unreproduced). See `ISSUES.md`.
+
+---
+
+## STATUS after 2026-08-18 session 2 — the data half is DONE and verified
+
+Committed as `psx_fusion_db.c` + `psx_fusion_assist.c` (+ headers, +
+`runtime.cmake`, + four debug commands). **main.cpp untouched.**
+
+**The game's rule, traced, not guessed.** `func_8001A280` makes three attempts
+and takes the first that answers: fusion table `0x8017C2D8`, then equip table
+`0x8017A1D8` in each argument order, else no fusion and the second card is
+summoned as itself. Packing and record layout are in the `psx_fusion_db.c`
+header comment.
+
+**Both tables are duel data streamed from disc** — zeros outside a duel. So the
+assistant can only answer inside a duel, which is where it is wanted anyway.
+
+**Verified against the game itself**, by writing card ids into the live hand
+records and summoning: 5/5 pairs matched, including two the GameFAQs fusion
+list gets wrong and one fusion it invents. Do not treat that FAQ as an oracle.
+
+Read-backs: `fusion_db`, `fusion_hand`, `fusion_list`, `fusion_try a= b=`.
+Both standing oracles still pass (boot log byte-identical, card drops 28/39
+with page 3 active).
+
+### The one open defect — read this before building UI
+
+`psx_fusion_assist_hand()` is **right on the opening turn and wrong after it**.
+Fusing slots 0 and 1 reused slot 0 for the result and cleared its live flag, but
+left slot 1 — equally consumed — reading `0x8000`. The flag is about the record,
+not hand membership. The authoritative list is almost certainly whatever drives
+the hand's sprite pass: `func_800170C8` is called once per displayed hand card
+with `a0 = 0x801A7AE4 - 12 + slot*28`, descending. Find that loop's driver.
+`fusion_hand` already dumps whole 28-byte records for 12 slots — the evidence is
+in that output.
+
+### Also still missing
+
+- **Per-card stats table not located.** The hand records carry the stats of the
+  card *in hand*, not of the card a fusion would *produce*, so "best fusion
+  available (atk N)" — UX slice (d) — cannot be ranked yet. `fusion_list` is
+  deliberately in hand order rather than a plausible-looking wrong order.
+- UX shape still unchosen; that was always the user's call.
+
+### Hazard
+
+Navigating into a duel over TCP: wait ~5 s after Cross on Simon before pressing
+Circle. Rushing it leaves the presses inside the DECK BUILDER, editing the deck.
+Back up `saves/card*.mcd` first.
