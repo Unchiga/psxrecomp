@@ -12033,6 +12033,27 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
      * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    /* ...and DirectInput, which SDL enables by default on Windows, is then
+     * pure cost. Every backend this block actually relies on is HIDAPI:
+     * Xbox pads just above, DualSense by HIDAPI's own default, Steam's
+     * virtual pad by the HIDAPI preference two hints up. RAWINPUT is
+     * already off. Nothing here needs DirectInput to find a controller.
+     *
+     * What it costs is the whole startup. DirectInput enumerates by asking
+     * every HID device on the machine for its product string, on the main
+     * thread, before the window opens -- and one device that answers slowly
+     * stalls the lot. Measured here at over fifty seconds on an i7-13700K,
+     * blocked in ZwDeviceIoControlFile under HidD_GetProductString, with the
+     * guest at frame 0 and zero instructions dispatched. It also tripped the
+     * freeze heartbeat, so every launch littered the install folder with
+     * psx_freeze_dump_*.json.
+     *
+     * A DEFAULT, not a decree: an SDL_JOYSTICK_DIRECTINPUT already in the
+     * environment wins, so anyone whose pad genuinely needs DirectInput can
+     * turn it back on without a rebuild. SDL_SetHint would otherwise
+     * override the environment rather than defer to it. */
+    if (!SDL_getenv(SDL_HINT_JOYSTICK_DIRECTINPUT))
+        SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
