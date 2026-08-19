@@ -4745,11 +4745,7 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
             std::snprintf(msg, sizeof(msg), "Music volume: %d%%", s->vol_music);
         } else if (s->vol_sound != prev.vol_sound) {
             std::snprintf(msg, sizeof(msg), "Sound volume: %d%%", s->vol_sound);
-        } else if (s->rank_meter != prev.rank_meter) {
-            std::snprintf(msg, sizeof(msg), "Duel rank: %s",
-                          s->rank_meter == PSX_VM_RANK_TEXT         ? "overlay text"
-                        : s->rank_meter == PSX_VM_RANK_INGAME_SCORE ? "in game + score"
-                        : s->rank_meter == PSX_VM_RANK_INGAME       ? "in game" : "off");
+        } else if (0) {
         }
         if (msg[0]) host_osd_push(msg, 900);
         prev = *s;
@@ -4799,9 +4795,6 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
     g_free_spending = s->free_spending ? 1 : 0;
     if (!g_free_spending) s_sc_tracking = 0;
 
-    psx_rank_logic_set_mode(s->rank_meter);
-    psx_fusion_overlay_set_mode(s->fusion_hint);
-    psx_fusion_assist_set_rank(s->fusion_by_def);
 
     /* ALL CARDS.
      *
@@ -12761,12 +12754,13 @@ CPUState cpu;
          * costs nothing when no duel is running (psx_rank_meter_tick returns
          * immediately). menu_settings.ini still wins, so anyone who turned it
          * off stays off. */
-        vms.rank_meter  = PSX_VM_RANK_INGAME;
 
         /* Rows this title owns, registered BEFORE the settings file is read:
          * a stored value for a registered row has nowhere to land until the
          * row exists. */
         psx_card_drops_register_menu();
+        psx_rank_logic_register_menu();
+        psx_fusion_overlay_register_menu();
 
         /* Stored settings override the defaults above, so the player's choices
          * survive a restart. Resolved beside the exe like keybinds.ini. */
@@ -12838,9 +12832,6 @@ CPUState cpu;
         /* Same reason as FAST LOADING above: psx_apply_video_menu_state only
          * fires on a CHANGE, so a stored rank-meter choice needs seeding here
          * or it would stay off until the player toggled the row. */
-        psx_rank_logic_set_mode(vms.rank_meter);
-        psx_fusion_overlay_set_mode(vms.fusion_hint);
-        psx_fusion_assist_set_rank(vms.fusion_by_def);
         /* Same reason as the rows above: apply_video_menu_state only fires on a
          * CHANGE, so a stored CARD DROPS value needs seeding here. The mod
          * registers its own hooks; they cost nothing at 1 (every callback

@@ -34,11 +34,7 @@ enum { PSX_VM_VSYNC_OFF = 0, PSX_VM_VSYNC_ON = 1, PSX_VM_VSYNC_ADAPTIVE = 2 };
  * still means IN GAME, so existing settings files keep their meaning. */
 /* VIEW > FUSION HINT — mirrors PSX_FUSION_HINT_* in psx_fusion_overlay.h.
  * Declared here too so the menu does not have to include the feature. */
-enum { PSX_VM_FUSION_HINT_OFF = 0, PSX_VM_FUSION_HINT_NUMBERS = 1,
-       PSX_VM_FUSION_HINT_FULL = 2 };
 
-enum { PSX_VM_RANK_OFF = 0, PSX_VM_RANK_INGAME = 1,
-       PSX_VM_RANK_INGAME_SCORE = 2, PSX_VM_RANK_TEXT = 3 };
 
 typedef struct PsxVideoMenuState {
     int scaling;         /* PSX_VM_SCALING_*  — present rect snapping */
@@ -80,14 +76,6 @@ typedef struct PsxVideoMenuState {
     int vol_master;
     int vol_music;
     int vol_sound;
-    /* PSX_VM_RANK_* — live duel-rank meter drawn as the OSD status line. */
-    int rank_meter;
-    /* PSX_VM_FUSION_HINT_* — the in-duel fusion assistant, and whether it
-     * suggests the best attack or the best defence. Two rows rather than one
-     * combined list: the display choice and the ranking choice are independent,
-     * and folding them together would make six states where two suffice. */
-    int fusion_hint;
-    int fusion_by_def;
 } PsxVideoMenuState;
 
 #define PSX_VM_LIFE_POINTS_DEFAULT 8000
@@ -238,6 +226,11 @@ int psx_video_menu_add_action(int menu, const char *label, const char *hint,
 /* Read back / drive a registered row by its handle. Setting a value fires the
  * row's on_change, so a caller that changed the underlying thing itself
  * should not call this. */
+/* Optional per-choice hints for an option row: hints[value] is shown instead
+ * of the row's single hint. The array must hold choice_count entries and
+ * outlive the process. Without it the row keeps one fixed hint. */
+void psx_video_menu_set_row_hints(int row_handle, const char *const *hints);
+
 int  psx_video_menu_get_row(int row_handle);
 void psx_video_menu_set_row(int row_handle, int value);
 

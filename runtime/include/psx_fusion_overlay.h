@@ -53,7 +53,16 @@ void psx_fusion_overlay_tune_cards_get(int *card_x, int *card_dx, int *badge_dy,
                                        int *badge_dx, int *text_y);
 
 /* Menu handoff; takes effect immediately. */
+/* Fusion-assistant display modes. Owned here for the same reason as the rank
+ * modes: they describe this game's duel, not the framework's menu. */
+enum { PSX_VM_FUSION_HINT_OFF = 0, PSX_VM_FUSION_HINT_NUMBERS = 1,
+       PSX_VM_FUSION_HINT_FULL = 2 };
+
 void psx_fusion_overlay_set_mode(int mode);
+
+/* Adds VIEW > FUSION HINT and VIEW > SUGGEST FUSION BY. Both rows belong to
+ * one feature, so one call registers the pair. */
+void psx_fusion_overlay_register_menu(void);
 
 /* What the line currently says, for `fusion_overlay`. The tab in it separates
  * the part set in the alphabet from the part set in the small digits. */

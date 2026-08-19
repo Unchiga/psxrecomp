@@ -100,6 +100,7 @@ typedef struct VmRegRow {
     const char *label;
     const char *hint;
     const char *const *choices;
+    const char *const *choice_hints;   /* optional; NULL = use ->hint */
     int   choice_count;
     int   lo, hi;
     int   slider;
@@ -156,11 +157,6 @@ static const char *const LOADS_LABELS[]   = { "OFF (AUTHENTIC)", "FAST", "INSTAN
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
 static const char *const ALLCARDS_LABELS[] = { "OFF", "1 OF EACH", "2 OF EACH",
                                                "3 OF EACH" };
-static const char *const FUSION_HINT_LABELS[] = { "OFF", "NUMBERS",
-                                                  "NUMBERS + INFO" };
-static const char *const RANK_LABELS[]    = { "OFF", "IN GAME",
-                                              "IN GAME + SCORE",
-                                              "OVERLAY TEXT" };
 
 static int s_visible;    /* bar drawn; does not capture input */
 static int s_expanded;   /* dropdown open; DOES capture input */
@@ -205,9 +201,6 @@ static PsxVideoMenuState s_state = {
     .vol_master     = 100,
     .vol_music      = 100,
     .vol_sound      = 100,
-    .rank_meter     = PSX_VM_RANK_OFF,
-    .fusion_hint    = PSX_VM_FUSION_HINT_OFF,
-    .fusion_by_def  = 0,
 };
 
 /* Inline numeric entry. Active only while the player is typing into a row. */
@@ -296,7 +289,7 @@ static const char *menu_title(int m) {
 
 static int builtin_rows(int m) {
     if (m == MENU_FILE) return 3;
-    if (m == MENU_VIEW) return 4;
+    if (m == MENU_VIEW) return 1;
     if (m == MENU_VIDEO) return 6;
     if (m == MENU_AUDIO) return 3;
     if (m == MENU_CHEATS) return 4;
@@ -327,7 +320,7 @@ static int row_kind(int m, int row) {
      * ordinary cycling option. Returning IT_ACTION for the whole menu, as this
      * did while VIEW had a single row, would make picking the new row hide the
      * bar instead of changing it. */
-    if (m == MENU_VIEW) return (row == 0) ? IT_ACTION : IT_OPTION;
+    if (m == MENU_VIEW) return IT_ACTION;   /* MENU BAR; the rest are registered */
     /* GAME's only ACTION row: it hands off to the save-state overlay rather
      * than changing a setting. It has to be named explicitly — the rows above
      * it are a number and an option, so unlike FILE this menu has no
@@ -423,13 +416,7 @@ static const char *row_label(int m, int row) {
         return (row == 0) ? "CLOSE MENU"
              : (row == 1) ? "CHANGE GAME DISC"
                           : "QUIT";
-    if (m == MENU_VIEW)
-        return (row == 0) ? "MENU BAR"
-             : (row == 1) ? "DUEL RANK"
-             : (row == 2) ? "FUSION HINT"
-             /* Named to read as a continuation of the row above it: on its own
-              * "SUGGEST BY" gives no clue which feature it belongs to. */
-                          : "SUGGEST FUSION BY";
+    if (m == MENU_VIEW) return "MENU BAR";
     if (m == MENU_CHEATS)
         return (row == 0) ? "LIFE POINTS"
              : (row == 1) ? "STARCHIPS"
@@ -500,17 +487,7 @@ static const char *row_value(int m, int row) {
         }
         return lp_text(num_get(m, row));
     }
-    if (m == MENU_VIEW) {
-        if (row == 0) return "VISIBLE   F10";
-        if (row == 1)
-            return RANK_LABELS[(s_state.rank_meter >= 0 &&
-                                s_state.rank_meter <= 3) ? s_state.rank_meter : 0];
-        if (row == 2)
-            return FUSION_HINT_LABELS[(s_state.fusion_hint >= 0 &&
-                                       s_state.fusion_hint <= 2)
-                                          ? s_state.fusion_hint : 0];
-        return s_state.fusion_by_def ? "DEFENSE" : "ATTACK";
-    }
+    if (m == MENU_VIEW) return "VISIBLE   F10";
     if (m == MENU_CHEATS && row == 2)
         return s_state.free_spending ? "ON" : "OFF";
     if (m == MENU_CHEATS && row == 3)
@@ -538,8 +515,13 @@ static const char *row_hint(int m, int row) {
     int lo, hi;
     {
         VmRegRow *r = row_reg(m, row);
-        if (r && !(s_editing && m == s_menu && row == s_item[s_menu]))
+        if (r && !(s_editing && m == s_menu && row == s_item[s_menu])) {
+            if (r->choice_hints && r->kind == PSX_VM_ROW_OPTION &&
+                r->value >= 0 && r->value < r->choice_count &&
+                r->choice_hints[r->value])
+                return r->choice_hints[r->value];
             return r->hint ? r->hint : "";
+        }
     }
     if (s_editing && m == s_menu && row == s_item[s_menu])
         return "TYPE DIGITS  ENTER APPLY  ESC CANCEL";
@@ -547,26 +529,7 @@ static const char *row_hint(int m, int row) {
         return (row == 0) ? "CLOSE THIS MENU"
              : (row == 1) ? "PICK YOUR DISC AGAIN IF IT MOVED  (APPLIES ON RESTART)"
                           : "EXIT THE GAME";
-    if (m == MENU_VIEW && row == 2)
-        return (s_state.fusion_hint == PSX_VM_FUSION_HINT_OFF)
-                   ? "SHOW WHAT YOUR HAND CAN FUSE INTO"
-             : (s_state.fusion_hint == PSX_VM_FUSION_HINT_NUMBERS)
-                   ? "PICK ORDER ON THE CARDS ONLY"
-                   : "PICK ORDER PLUS THE CARD IT MAKES";
-    if (m == MENU_VIEW && row == 3)
-        return s_state.fusion_by_def
-                   ? "SUGGEST THE BEST DEFENSE"
-                   : "SUGGEST THE BEST ATTACK";
-    if (m == MENU_VIEW)
-        return (row == 0)
-                   ? "PRESS F10 ANY TIME TO SHOW OR HIDE"
-             : (s_state.rank_meter == PSX_VM_RANK_OFF)
-                   ? "SHOW LIVE RANK IN DUEL"
-             : (s_state.rank_meter == PSX_VM_RANK_INGAME)
-                   ? "GAME SPRITES BESIDE THE FIELD BOX"
-             : (s_state.rank_meter == PSX_VM_RANK_INGAME_SCORE)
-                   ? "SPRITES PLUS THE 0-99 SCORE"
-                   : "TEXT IN THE CORNER - NEVER COVERED";
+    if (m == MENU_VIEW) return "PRESS F10 ANY TIME TO SHOW OR HIDE";
     if (m == MENU_CHEATS && row == 2)
         return s_state.free_spending
                    ? "PURCHASES REFUNDED - EARNINGS STILL COUNT"
@@ -652,36 +615,6 @@ static void cycle_row(int m, int row, int delta) {
             }
             return;
         }
-    }
-    if (m == MENU_VIEW && row == 2) {
-        int v = s_state.fusion_hint + delta;
-        while (v < 0) v += 3;
-        while (v > 2) v -= 3;
-        s_state.fusion_hint = v;
-        /* s_changed is what psx_video_menu_take_change reports to the host;
-         * s_dirty only re-rasterises this menu. Setting just the latter cycles
-         * the label on screen while the feature never hears about it. */
-        s_changed = 1;
-        s_dirty = 1;
-        return;
-    }
-    if (m == MENU_VIEW && row == 3) {
-        /* Attack and defence are one row, not two toggles: choosing one has
-         * to unchoose the other, and a single cycling row makes that
-         * structural instead of something two handlers have to agree on. */
-        s_state.fusion_by_def = !s_state.fusion_by_def;
-        s_changed = 1;
-        s_dirty = 1;
-        return;
-    }
-    if (m == MENU_VIEW && row == 1) {
-        int v = s_state.rank_meter + delta;
-        while (v < 0) v += 4;
-        while (v > 3) v -= 4;
-        s_state.rank_meter = v;
-        s_changed = 1;
-        s_dirty = 1;
-        return;
     }
     if (m == MENU_CHEATS && row == 2) {
         s_state.free_spending = s_state.free_spending ? 0 : 1;
@@ -1477,6 +1410,12 @@ int psx_video_menu_add_action(int menu, const char *label, const char *hint,
     return h;
 }
 
+void psx_video_menu_set_row_hints(int row_handle, const char *const *hints) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return;
+    s_reg[row_handle].choice_hints = hints;
+    s_dirty = 1;
+}
+
 int psx_video_menu_get_row(int row_handle) {
     if (row_handle < 0 || row_handle >= s_reg_count) return 0;
     return s_reg[row_handle].value;
@@ -1560,9 +1499,6 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "vol_master")) out->vol_master = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_sound"))  out->vol_sound  = (v >= 0 && v <= 100) ? v : 100;
-        else if (!strcmp(key, "rank_meter")) out->rank_meter = (v >= 0 && v <= 3) ? v : 0;
-        else if (!strcmp(key, "fusion_hint")) out->fusion_hint = (v >= 0 && v <= 2) ? v : 0;
-        else if (!strcmp(key, "fusion_by_def")) out->fusion_by_def = v ? 1 : 0;
         else {
             /* Rows a title registered. Clamped to the row's own bounds so a
              * hand-edited file cannot push a value past what the row accepts. */
@@ -1602,10 +1538,7 @@ int psx_video_menu_settings_save(const char *path) {
         "fast_loads=%d      # 0 authentic, 1 fast, 2 instant disc loads\n"
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
-        "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n"
-        "rank_meter=%d      # 0 off, 1 live duel rank, 2 rank + worst term\n"
-        "fusion_hint=%d     # 0 off, 1 pick-order numbers, 2 numbers + card\n"
-        "fusion_by_def=%d   # 0 suggest best attack, 1 best defense\n",
+        "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n",
         s_state.scaling ? 1 : 0,
         s_state.filter ? 1 : 0,
         s_state.texture_filter ? 1 : 0,
@@ -1620,11 +1553,7 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.fast_loads >= 0 && s_state.fast_loads <= 2) ? s_state.fast_loads : 0,
         (s_state.vol_master >= 0 && s_state.vol_master <= 100) ? s_state.vol_master : 100,
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,
-        (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
-        (s_state.rank_meter >= 0 && s_state.rank_meter <= 3) ? s_state.rank_meter : 0,
-        (s_state.fusion_hint >= 0 && s_state.fusion_hint <= 2)
-            ? s_state.fusion_hint : 0,
-        s_state.fusion_by_def ? 1 : 0);
+        (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100);
     /* Rows a title registered, in registration order. A row with no key is
      * deliberately not written: a live cheat re-applied at startup would
      * overwrite the player's real save. */

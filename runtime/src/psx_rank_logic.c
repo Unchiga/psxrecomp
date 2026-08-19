@@ -510,6 +510,29 @@ void psx_rank_logic_tick(void) {
  * the status line it owns or the last rank stays on screen for the rest of the
  * session, and changing shape (RANK <-> DETAIL) has to forget the cached text
  * or the tick would call the new line "unchanged" until the score next moved. */
+/* VIEW > DUEL RANK. The hint changes with the selection, so each choice
+ * carries its own -- a single hint could only describe one of four states. */
+static const char *const RANK_LABELS[] = {
+    "OFF", "IN GAME", "IN GAME + SCORE", "OVERLAY TEXT"
+};
+static const char *const RANK_HINTS[] = {
+    "SHOW LIVE RANK IN DUEL",
+    "GAME SPRITES BESIDE THE FIELD BOX",
+    "SPRITES PLUS THE 0-99 SCORE",
+    "TEXT IN THE CORNER - NEVER COVERED"
+};
+
+static void rank_row_changed(int value) {
+    psx_rank_logic_set_mode(value);
+}
+
+void psx_rank_logic_register_menu(void) {
+    const int h = psx_video_menu_add_option(
+        PSX_VM_MENU_VIEW, "DUEL RANK", RANK_HINTS[0],
+        RANK_LABELS, 4, "rank_meter", PSX_VM_RANK_INGAME, rank_row_changed);
+    psx_video_menu_set_row_hints(h, RANK_HINTS);
+}
+
 void psx_rank_logic_set_mode(int mode) {
     g_rank_meter = (mode >= 0 && mode <= 3) ? mode : PSX_VM_RANK_OFF;
     if (g_rank_meter == PSX_VM_RANK_OFF && s_rank_active) rank_meter_clear();

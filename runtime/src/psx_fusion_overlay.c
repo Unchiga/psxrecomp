@@ -50,6 +50,7 @@
 #include "psx_fusion_db.h"
 #include "psx_fusion_font.h"
 #include "psx_rank_sprites.h"
+#include "psx_video_menu.h"
 
 #define PSX_FUSION_NAME_PTRS 0x801D5800u
 #define PSX_FUSION_NAME_BASE 0x801D0000u
@@ -464,6 +465,48 @@ int psx_fusion_overlay_badges(uint8_t *out, int cap)
         if (s_badges[i]) n++;
     }
     return n;
+}
+
+/* VIEW > FUSION HINT and VIEW > SUGGEST FUSION BY.
+ *
+ * Two rows rather than one combined list: the display choice and the ranking
+ * choice are independent, and folding them together would make six states
+ * where two suffice. SUGGEST FUSION BY is named to read as a continuation of
+ * the row above -- on its own "SUGGEST BY" gives no clue which feature it
+ * belongs to. */
+static const char *const FUSION_HINT_LABELS[] = {
+    "OFF", "NUMBERS", "NUMBERS + INFO"
+};
+static const char *const FUSION_HINT_HINTS[] = {
+    "SHOW WHAT YOUR HAND CAN FUSE INTO",
+    "PICK ORDER ON THE CARDS ONLY",
+    "PICK ORDER PLUS THE CARD IT MAKES"
+};
+static const char *const FUSION_BY_LABELS[] = { "ATTACK", "DEFENSE" };
+static const char *const FUSION_BY_HINTS[]  = {
+    "SUGGEST THE BEST ATTACK",
+    "SUGGEST THE BEST DEFENSE"
+};
+
+static void fusion_hint_changed(int value) {
+    psx_fusion_overlay_set_mode(value);
+}
+
+static void fusion_by_changed(int value) {
+    psx_fusion_assist_set_rank(value);
+}
+
+void psx_fusion_overlay_register_menu(void) {
+    int h = psx_video_menu_add_option(
+        PSX_VM_MENU_VIEW, "FUSION HINT", FUSION_HINT_HINTS[0],
+        FUSION_HINT_LABELS, 3, "fusion_hint",
+        PSX_VM_FUSION_HINT_OFF, fusion_hint_changed);
+    psx_video_menu_set_row_hints(h, FUSION_HINT_HINTS);
+
+    h = psx_video_menu_add_option(
+        PSX_VM_MENU_VIEW, "SUGGEST FUSION BY", FUSION_BY_HINTS[0],
+        FUSION_BY_LABELS, 2, "fusion_by_def", 0, fusion_by_changed);
+    psx_video_menu_set_row_hints(h, FUSION_BY_HINTS);
 }
 
 void psx_fusion_overlay_set_mode(int mode)

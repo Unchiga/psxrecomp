@@ -19,7 +19,15 @@ void psx_rank_logic_tick(void);
 
 /* Apply a menu choice (PSX_VM_RANK_*). Out-of-range values mean OFF. Handles
  * the teardown when switching off, so callers need only pass the new value. */
+/* Duel-rank meter modes. Owned here rather than by the shared menu: no other
+ * title has a duel rank. */
+enum { PSX_VM_RANK_OFF = 0, PSX_VM_RANK_INGAME = 1,
+       PSX_VM_RANK_INGAME_SCORE = 2, PSX_VM_RANK_TEXT = 3 };
+
 void psx_rank_logic_set_mode(int mode);
+
+/* Adds VIEW > DUEL RANK to the overlay menu. */
+void psx_rank_logic_register_menu(void);
 
 /* Arm the GPU sprite watch the meter anchors to. Call once, after the renderer
  * exists. Harmless when the meter is off -- it costs two compares per textured
