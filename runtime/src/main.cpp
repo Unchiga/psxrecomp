@@ -4462,6 +4462,8 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
     if (!g_free_spending) s_sc_tracking = 0;
 
     psx_rank_logic_set_mode(s->rank_meter);
+    psx_fusion_overlay_set_mode(s->fusion_hint);
+    psx_fusion_assist_set_rank(s->fusion_by_def);
 
     /* ALL CARDS.
      *

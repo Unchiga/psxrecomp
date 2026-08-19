@@ -546,6 +546,10 @@ static void cycle_row(int m, int row, int delta) {
         while (v < 0) v += 3;
         while (v > 2) v -= 3;
         s_state.fusion_hint = v;
+        /* s_changed is what psx_video_menu_take_change reports to the host;
+         * s_dirty only re-rasterises this menu. Setting just the latter cycles
+         * the label on screen while the feature never hears about it. */
+        s_changed = 1;
         s_dirty = 1;
         return;
     }
@@ -554,6 +558,7 @@ static void cycle_row(int m, int row, int delta) {
          * to unchoose the other, and a single cycling row makes that
          * structural instead of something two handlers have to agree on. */
         s_state.fusion_by_def = !s_state.fusion_by_def;
+        s_changed = 1;
         s_dirty = 1;
         return;
     }
