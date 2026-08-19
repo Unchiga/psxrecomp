@@ -292,22 +292,12 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/savestate.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_host.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_game_hooks.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_input_config.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_host_audio.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_post_load_probe.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_perf.cpp
-    ${PSXRECOMP_ROOT}/runtime/src/psx_rank_logic.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_rank_meter.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_rank_sprites.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_cd_overlay.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_cd_sprites.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_card_drops.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_ygo_cheats.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_db.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_assist.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_font.c
-    ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_overlay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c

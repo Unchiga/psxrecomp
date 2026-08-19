@@ -7,7 +7,6 @@
 
 #include "cpu_state.h"
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
-#include "psx_rank_logic.h"
 #include "psx_savestate_host.h"
 #include "psx_runtime_perf.h"
 #include "psx_post_load_probe.h"
@@ -29,13 +28,8 @@
 #include "savestate.h"
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
+#include "psx_game_hooks.h"
 #include "psx_video_menu.h"
-#include "psx_rank_meter.h"
-#include "psx_cd_overlay.h"
-#include "psx_card_drops.h"
-#include "psx_ygo_cheats.h"
-#include "psx_fusion_assist.h"
-#include "psx_fusion_overlay.h"
 #include "host_osd.h"
 #include "psx_host_input.h"   /* our own exports: injection, pad mask, lag ring */
 #include "host_keymap.h"
@@ -5515,10 +5509,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 }
             }
         }
-        psx_ygo_cheats_tick();
-        psx_rank_logic_tick();
-        psx_card_drops_tick();
-        psx_fusion_overlay_tick();
+        /* Whatever this title registered for itself. */
+        psx_game_run_frame_hooks();
         /* Drives the menu's hover-to-open dwell; the module keeps no clock. */
         psx_video_menu_tick((unsigned int)SDL_GetTicks());
         {
@@ -12641,10 +12633,6 @@ CPUState cpu;
         /* Rows this title owns, registered BEFORE the settings file is read:
          * a stored value for a registered row has nowhere to land until the
          * row exists. */
-        psx_card_drops_register_menu();
-        psx_ygo_cheats_register_menu();
-        psx_rank_logic_register_menu();
-        psx_fusion_overlay_register_menu();
 
         /* Stored settings override the defaults above, so the player's choices
          * survive a restart. Resolved beside the exe like keybinds.ini. */
@@ -12721,8 +12709,7 @@ CPUState cpu;
          * registers its own hooks; they cost nothing at 1 (every callback
          * returns immediately) so registration is unconditional, which also
          * avoids a second path for a player who raises the value later. */
-        psx_card_drops_register_hooks();
-        psx_rank_logic_arm_sprite_watch();
+        psx_game_run_start_hooks();
         gl_renderer_set_integer_scale(vms.scaling == PSX_VM_SCALING_INTEGER);
     }
 
