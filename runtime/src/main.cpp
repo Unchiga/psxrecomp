@@ -105,6 +105,11 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
 extern "C" int  psx_game_codegen_setup_init(void);
+extern "C" int  psx_game_codegen_update_check(char* local, unsigned long lcap,
+                                              char* remote, unsigned long rcap,
+                                              int force);
+extern "C" int  psx_game_codegen_update_apply(char* helper, unsigned long hcap,
+                                              char* err, unsigned long ecap);
 extern "C" int  psx_game_codegen_generate_and_build(const char* disc_path,
                                                     char* out_exe,
                                                     unsigned long out_cap,
@@ -1532,6 +1537,21 @@ static void launcher_info(const char* title, const std::string& msg) {
     if (!g_headless)
         MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
                     widen_utf8(title).c_str(), MB_OK | MB_ICONINFORMATION);
+#endif
+}
+
+/* Yes/no companion to the two above. Returns false without asking in a
+ * headless run — same rule, and the safe answer for anything this gates is
+ * "don't", since every caller is offering to do something optional. */
+static bool launcher_confirm(const char* title, const std::string& msg) {
+    std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
+#ifdef _WIN32
+    if (g_headless) return false;
+    return MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
+                       widen_utf8(title).c_str(),
+                       MB_YESNO | MB_ICONQUESTION) == IDYES;
+#else
+    return false;
 #endif
 }
 
@@ -12298,10 +12318,43 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
  * different one.
  */
 static int run_setup_host_first_run(int argc, char** argv, PsxBootConfig& boot) {
+    /* Init BEFORE forwarding, because the update check needs a resolved project
+     * root and the whole point is to offer the update on a working install --
+     * i.e. exactly the case where forwarding would otherwise have left already.
+     * A failure here is not fatal yet: a built product should still launch even
+     * if setup could not bring itself up, so the status is judged after. */
+    const int status = psx_game_codegen_setup_init();
+
+    if (status == 1) {
+        char local[64] = {0}, remote[64] = {0};
+        if (psx_game_codegen_update_check(local, (unsigned long)sizeof(local),
+                                          remote, (unsigned long)sizeof(remote),
+                                          /*force*/0)) {
+            std::string msg = std::string("You have ") + local +
+                              ". Version " + remote + " is available.\n\n"
+                              "Installing it downloads the new sources, "
+                              "rebuilds, and restarts the game. Your save "
+                              "data, settings and disc are untouched.\n\n"
+                              "Update now?";
+            if (launcher_confirm("Update available", msg)) {
+                char helper[1100] = {0}, err[1024] = {0};
+                if (psx_game_codegen_update_apply(
+                        helper, (unsigned long)sizeof(helper),
+                        err, (unsigned long)sizeof(err))) {
+                    psx_game_codegen_relaunch_or_exit(nullptr);
+                    return 0;   /* not reached */
+                }
+                launcher_warning("Update failed",
+                                 err[0] ? err : "The update could not be "
+                                 "downloaded. Your install is unchanged.");
+                /* Fall through and play the version already installed. */
+            }
+        }
+    }
+
     psx_game_codegen_forward_if_built(argc, argv);
     /* Reached only when there is no product build to forward to. */
 
-    const int status = psx_game_codegen_setup_init();
     if (status != 1) {
         const char* why =
             status == 0  ? "The project folder could not be found. Keep this "

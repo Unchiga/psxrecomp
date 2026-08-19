@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>   /* update stamp age */
+#include <time.h>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -3012,7 +3014,7 @@ static int parse_github_release_tag(const char* text, char* out, size_t cap) {
 }
 
 /* Query GitHub for the latest cmake-clang-v1 release tag (short timeout). */
-static int host_remote_toolchain_version(char* out, size_t cap) {
+static int host_remote_latest_tag(const char* repo, char* out, size_t cap) {
     char url[320], tmp[1400], buf[8192];
     FILE* f;
     size_t n;
@@ -3021,7 +3023,8 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
         return 0;
     out[0] = '\0';
     snprintf(url, sizeof(url),
-             "https://api.github.com/repos/%s/releases/latest", k_tc_repo);
+             "https://api.github.com/repos/%s/releases/latest",
+             repo ? repo : k_tc_repo);
 #if defined(_WIN32)
     {
         char tdir[512];
@@ -3053,7 +3056,7 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
                      "--max-time 15 -A psxrecomp-codegen -o NUL "
                      "-w %%{url_effective} "
                      "https://github.com/%s/releases/latest > \"%s\"\"",
-                     k_tc_repo, tmp);
+                     repo ? repo : k_tc_repo, tmp);
             if (!run_cmdline_wait(cmd, &code) || code != 0 || !path_is_file(tmp))
                 return 0;
         }
@@ -3073,7 +3076,7 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
                      "curl -fsSIL --connect-timeout 5 --max-time 15 "
                      "-A psxrecomp-codegen -o /dev/null -w '%%{url_effective}' "
                      "'https://github.com/%s/releases/latest' > '%s'",
-                     k_tc_repo, tmp);
+                     repo ? repo : k_tc_repo, tmp);
             if (system(cmd) != 0 || !path_is_file(tmp))
                 return 0;
         }
@@ -3116,7 +3119,7 @@ static int host_toolchain_update_available(char* local_ver, size_t local_cap,
         return 0;
     migrate_legacy_psxrecomp_toolchain();
     (void)host_local_toolchain_version(local_ver, local_cap);
-    if (!host_remote_toolchain_version(remote_ver, remote_cap))
+    if (!host_remote_latest_tag(k_tc_repo, remote_ver, remote_cap))
         return 0;
     if (!local_ver || !local_ver[0])
         return 0; /* missing install → page 0 is "install", not "update" */
@@ -3831,6 +3834,302 @@ void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
         exit(1);
     }
 #endif
+}
+
+/* ---- Updates -------------------------------------------------------------
+ *
+ * A setup-host zip is SOURCE ONLY. Installing one over an existing tree
+ * therefore replaces exactly the files that should be replaced and cannot
+ * reach generated/, the disc, saves, settings or the build tree, because none
+ * of those are in the zip. That property is what makes this safe to do without
+ * an exclusion list to keep in sync; see the note on update_repo in the header.
+ */
+
+/* The VERSION file at the project root, trimmed. */
+static int host_local_game_version(char* out, size_t cap) {
+    char path[1400];
+    FILE* f;
+    size_t n;
+    if (!out || cap < 2)
+        return 0;
+    out[0] = '\0';
+    if (!g_project_root[0])
+        return 0;
+    if (!join_path(path, sizeof(path), g_project_root, "VERSION"))
+        return 0;
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r' ||
+                 out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+    return out[0] != '\0';
+}
+
+/* Where the once-a-day answer is remembered: beside the executable, so a
+ * per-install answer travels with the install rather than the user profile. */
+static int host_update_stamp_path(char* out, size_t cap) {
+    char exe[1100];
+    char* cut;
+    char* alt;
+    if (!host_self_exe_path(exe, sizeof(exe)))
+        return 0;
+    cut = strrchr(exe, '\\');
+    alt = strrchr(exe, '/');
+    if (alt && (!cut || alt > cut))
+        cut = alt;
+    if (!cut)
+        return 0;
+    *cut = '\0';
+    return join_path(out, cap, exe, "update_check.txt");
+}
+
+/* Seconds since the last check, or a very large number if there wasn't one. */
+static long host_update_stamp_age(void) {
+    char path[1400];
+    struct stat st;
+    double age;
+    if (!host_update_stamp_path(path, sizeof(path)))
+        return 1L << 30;
+    if (stat(path, &st) != 0)
+        return 1L << 30;
+    age = difftime(time(NULL), st.st_mtime);
+    if (age < 0)
+        return 1L << 30;   /* clock moved back; treat as due */
+    return (long)age;
+}
+
+static void host_update_stamp_touch(const char* remote) {
+    char path[1400];
+    FILE* f;
+    if (!host_update_stamp_path(path, sizeof(path)))
+        return;
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "%s\n", remote ? remote : "");
+    fclose(f);
+}
+
+/* "<PREFIX>_SKIP_UPDATE", where PREFIX is whatever the title put in front of
+ * its force-setup variable. YGOFM_FORCE_SETUP therefore yields
+ * YGOFM_SKIP_UPDATE rather than the YGOFM_FORCE_SETUP_SKIP_UPDATE a naive
+ * concatenation would produce. */
+static void host_update_skip_var(char* out, size_t cap) {
+    const char* env = cfg_or(g_cfg ? g_cfg->force_setup_env : NULL,
+                             "PSXRECOMP_FORCE_SETUP");
+    const char* tail = strstr(env, "_FORCE_SETUP");
+    size_t n = tail ? (size_t)(tail - env) : strlen(env);
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(out, env, n);
+    out[n] = '\0';
+    snprintf(out + n, cap - n, "_SKIP_UPDATE");
+}
+
+int psxrecomp_codegen_host_update_check(char* local_ver, size_t local_cap,
+                                        char* remote_ver, size_t remote_cap,
+                                        int force) {
+    char local[64], remote[64], skip_var[128];
+    const char* skip;
+
+    if (local_ver && local_cap) local_ver[0] = '\0';
+    if (remote_ver && remote_cap) remote_ver[0] = '\0';
+    if (!g_ready || !g_cfg || !g_cfg->update_repo || !g_cfg->update_repo[0])
+        return 0;
+
+    host_update_skip_var(skip_var, sizeof(skip_var));
+    skip = getenv(skip_var);
+    if (skip && skip[0] && skip[0] != '0')
+        return 0;
+
+    if (!host_local_game_version(local, sizeof(local)))
+        return 0;
+    if (local_ver && local_cap)
+        snprintf(local_ver, local_cap, "%s", local);
+
+    /* A check on every launch is a cost on every launch. Releases move at most
+     * weekly, and startup latency here was hard-won. Once a day. */
+    if (!force && host_update_stamp_age() < 24L * 60L * 60L)
+        return 0;
+
+    if (!host_remote_latest_tag(g_cfg->update_repo, remote, sizeof(remote)))
+        return 0;   /* offline is an unknown, not a failure */
+    host_update_stamp_touch(remote);
+    if (remote_ver && remote_cap)
+        snprintf(remote_ver, remote_cap, "%s", remote);
+    return version_cmp(local, remote) < 0;
+}
+
+/* Write the helper that installs an update after this process exits.
+ *
+ * Same shape as the deferred rebuild helper, and for the same reason twice
+ * over: the update replaces the running executable, and the rebuild relinks it.
+ * Neither is possible while it is running, so both happen in a console that
+ * outlives us. Unpack, regenerate, rebuild, relaunch.
+ *
+ * The regenerate is not optional. An update can carry recompiler changes, and
+ * `generate` is cheap when its output already matches -- it reports every shard
+ * unchanged and moves on. */
+static int host_write_update_helper(const char* zip_path, char* err_msg,
+                                    size_t err_cap) {
+    FILE* f;
+    char exe_dir[1400];
+#if defined(_WIN32)
+    if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
+                   "recomp_update.cmd")) {
+        snprintf(err_msg, err_cap, "Could not place the update helper.");
+        return 0;
+    }
+    snprintf(exe_dir, sizeof(exe_dir), "%s", g_exe_path);
+    f = fopen(g_helper_path, "wb");
+    if (!f) {
+        snprintf(err_msg, err_cap, "Could not write %s.", g_helper_path);
+        return 0;
+    }
+    fprintf(f, "@echo off\r\n");
+    fprintf(f, "setlocal EnableExtensions\r\n");
+    fprintf(f, "title %s - updating\r\n", g_display);
+    fprintf(f, "set \"PARENT_PID=%lu\"\r\n",
+            (unsigned long)GetCurrentProcessId());
+    fprintf(f, "set \"ROOT=%s\"\r\n", g_project_root);
+    fprintf(f, "set \"ZIP=%s\"\r\n", zip_path);
+    fprintf(f, "set \"PYTHON=%s\"\r\n", g_python);
+    fprintf(f, "set \"CLI=%s\"\r\n", g_cli_path);
+    fprintf(f, "set \"CONFIG=%s\"\r\n", g_game_toml);
+    fprintf(f, "set \"BUILD_DIR=%s\"\r\n", g_build_dir);
+    fprintf(f, "set \"TARGET=%s\"\r\n", g_cmake_target);
+    fprintf(f, "set \"EXE_BASE=%s\"\r\n", g_exe_basename);
+    fprintf(f, "set \"EXE=%s\"\r\n", exe_dir);
+    if (g_toolchain_bin[0])
+        fprintf(f, "set \"PATH=%s;%%PATH%%\"\r\n", g_toolchain_bin);
+    fprintf(f, "echo Waiting for %s to exit...\r\n", g_display);
+    fprintf(f, ":waitloop\r\n");
+    fprintf(f, "tasklist /FI \"PID eq %%PARENT_PID%%\" 2>NUL | "
+               "findstr /I \"%%PARENT_PID%%\" >NUL\r\n");
+    fprintf(f, "if not errorlevel 1 (\r\n");
+    fprintf(f, "  ping -n 2 127.0.0.1 >NUL\r\n");
+    fprintf(f, "  goto waitloop\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "cd /d \"%%ROOT%%\"\r\n");
+    fprintf(f, "echo Installing update...\r\n");
+    /* tar ships with Windows 10+ and is what the toolchain unpack already
+     * uses. Unpacking over the tree is safe: the zip is source only. */
+    fprintf(f, "tar -xf \"%%ZIP%%\" -C \"%%ROOT%%\"\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Could not unpack the update. Your install is unchanged.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "del \"%%ZIP%%\" >NUL 2>&1\r\n");
+    fprintf(f, "echo Regenerating...\r\n");
+    fprintf(f, "\"%%PYTHON%%\" \"%%CLI%%\" generate --config \"%%CONFIG%%\" "
+               "--project-root \"%%ROOT%%\"\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Generate failed. Fix the errors above, then rebuild.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "echo Building...\r\n");
+    fprintf(f, "\"%%PYTHON%%\" \"%%CLI%%\" rebuild --project-root \"%%ROOT%%\" "
+               "--config \"%%CONFIG%%\" --build-dir \"%%BUILD_DIR%%\" "
+               "--target \"%%TARGET%%\" --exe-basename \"%%EXE_BASE%%\" "
+               "--no-pgo\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Build failed. Fix the errors above, then rebuild manually.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "echo Starting %s...\r\n", g_display);
+    fprintf(f, "start \"\" /D \"%%ROOT%%\" \"%%EXE%%\"\r\n");
+    fprintf(f, "endlocal\r\n");
+    fclose(f);
+    return 1;
+#else
+    (void)exe_dir;
+    if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
+                   "recomp_update.sh")) {
+        snprintf(err_msg, err_cap, "Could not place the update helper.");
+        return 0;
+    }
+    f = fopen(g_helper_path, "wb");
+    if (!f) {
+        snprintf(err_msg, err_cap, "Could not write %s.", g_helper_path);
+        return 0;
+    }
+    fprintf(f, "#!/bin/sh\nset -e\n");
+    fprintf(f, "cd '%s'\n", g_project_root);
+    fprintf(f, "tar -xf '%s' -C '%s'\n", zip_path, g_project_root);
+    fprintf(f, "rm -f '%s'\n", zip_path);
+    fprintf(f, "'%s' '%s' generate --config '%s' --project-root '%s'\n",
+            g_python, g_cli_path, g_game_toml, g_project_root);
+    fprintf(f, "'%s' '%s' rebuild --project-root '%s' --config '%s' "
+               "--build-dir '%s' --target '%s' --exe-basename '%s' --no-pgo\n",
+            g_python, g_cli_path, g_project_root, g_game_toml, g_build_dir,
+            g_cmake_target, g_exe_basename);
+    fprintf(f, "exec '%s'\n", g_exe_path);
+    fclose(f);
+    chmod(g_helper_path, 0755);
+    return 1;
+#endif
+}
+
+int psxrecomp_codegen_host_update_apply(
+    char* out_helper, size_t helper_cap, char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx) {
+    char remote[64], asset[256], url[512], zip_path[1400];
+
+    if (out_helper && helper_cap) out_helper[0] = '\0';
+    if (!g_ready || !g_cfg || !g_cfg->update_repo || !g_cfg->update_repo[0] ||
+        !g_cfg->update_asset_format || !g_cfg->update_asset_format[0]) {
+        snprintf(err_msg, err_cap, "This build has no update source configured.");
+        return 0;
+    }
+    if (!host_remote_latest_tag(g_cfg->update_repo, remote, sizeof(remote))) {
+        snprintf(err_msg, err_cap,
+                 "Could not reach GitHub to fetch the update.");
+        return 0;
+    }
+    /* Assets are named with the bare version; tags usually carry a leading v. */
+    {
+        const char* v = remote;
+        if ((v[0] == 'v' || v[0] == 'V') && v[1] >= '0' && v[1] <= '9')
+            v++;
+        snprintf(asset, sizeof(asset), g_cfg->update_asset_format, v);
+    }
+    snprintf(url, sizeof(url), "https://github.com/%s/releases/download/%s/%s",
+             g_cfg->update_repo, remote, asset);
+
+    if (!resolve_build_paths()) {
+        snprintf(err_msg, err_cap, "Could not work out where to build.");
+        return 0;
+    }
+    if (!join_path(zip_path, sizeof(zip_path), g_build_dir, asset)) {
+        snprintf(err_msg, err_cap, "Could not place the download.");
+        return 0;
+    }
+    if (on_progress)
+        on_progress(progress_ctx, 0.15f, "Downloading update\xE2\x80\xA6");
+    if (!host_download_url_to_file(url, zip_path, err_msg, err_cap))
+        return 0;   /* the downloader already explained itself */
+
+    if (on_progress)
+        on_progress(progress_ctx, 0.6f, "Scheduling install\xE2\x80\xA6");
+    if (!host_write_update_helper(zip_path, err_msg, err_cap))
+        return 0;
+
+    g_relaunch_is_helper = 1;
+    if (out_helper && helper_cap)
+        snprintf(out_helper, helper_cap, "%s", g_helper_path);
+    if (on_progress)
+        on_progress(progress_ctx, 1.0f, "Exiting to install the update\xE2\x80\xA6");
+    return 1;
 }
 
 /* Everything _apply used to do before it started filling in GameInfo. Split

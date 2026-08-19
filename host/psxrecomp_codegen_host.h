@@ -46,6 +46,24 @@ typedef struct PsxrecompCodegenHostConfig {
     const char* cmake_target;  /* e.g. psx-runtime */
     const char* exe_basename;  /* no .exe */
 
+    /* Updates (optional; NULL update_repo disables the whole feature).
+     *
+     * update_repo is "owner/name" on GitHub. The newest release there is
+     * compared against the local VERSION file, and its asset whose name ends
+     * with update_asset_suffix is what gets installed.
+     *
+     * This works because a setup-host zip carries SOURCE ONLY: no generated/,
+     * no disc, no saves, no settings, no build tree. Unpacking one over an
+     * existing install therefore replaces exactly the files that should be
+     * replaced and cannot touch anything the player produced. A title whose
+     * zip does not have that property must not set these. */
+    const char* update_repo;   /* e.g. "owner/MyGameRecomp" */
+    /* printf format for the release asset, given the version with no leading
+     * "v" -- e.g. "mygame-%s-win-x64.zip". A format rather than a suffix so the
+     * download URL can be built from the tag alone, with no second request to
+     * list a release's assets. Rename an asset and update this together. */
+    const char* update_asset_format;
+
     /* Optional UI copy overrides (NULL → generic defaults). */
     const char* prepare_note;
     const char* prepare_note_windows;
@@ -78,6 +96,38 @@ int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg);
 int psxrecomp_codegen_host_generate_and_build(
     const char* disc_path, char* out_exe, size_t out_cap,
     char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx);
+
+/* Is there a newer release than this install?
+ *
+ *   1  yes -- local and remote are filled with the two versions
+ *   0  no, or unknown: no update_repo, no VERSION file, offline, or the
+ *      answer was cached as "up to date" less than 24h ago
+ *
+ * Answers from a cache written beside the executable, refreshed at most once
+ * a day, so this costs nothing on a normal launch -- startup latency is not
+ * something to spend on a check that changes at most weekly. `force` skips
+ * the cache. Set <FORCE_SETUP_ENV-prefix>_SKIP_UPDATE=1 to disable entirely.
+ *
+ * Requires psxrecomp_codegen_host_init() to have succeeded. */
+int psxrecomp_codegen_host_update_check(char* local_ver, size_t local_cap,
+                                        char* remote_ver, size_t remote_cap,
+                                        int force);
+
+/* Download the newest release and install it over this tree.
+ *
+ * Returns 1 having SCHEDULED the work, not having finished it: the update
+ * replaces the running executable, which Windows will not permit in place, so
+ * a helper does the unpack, the regenerate, the rebuild and the relaunch after
+ * this process exits. Hand out_helper to
+ * psxrecomp_codegen_host_relaunch_or_exit() and quit. On failure fills err_msg
+ * and returns 0, having changed nothing.
+ *
+ * The regenerate is not optional: an update can change the recompiler, and
+ * generate is cheap when its output already matches. It needs the disc, which
+ * the player already chose. */
+int psxrecomp_codegen_host_update_apply(
+    char* out_helper, size_t helper_cap, char* err_msg, size_t err_cap,
     RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx);
 
 #if defined(PSX_HAS_RECOMP_LAUNCHER)
