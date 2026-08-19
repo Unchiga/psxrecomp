@@ -22,19 +22,6 @@ enum { PSX_VM_SCREEN_WINDOWED = 0, PSX_VM_SCREEN_BORDERLESS = 1,
 /* Cycle order, deliberately worst-lag first. Mapped to an SDL swap interval by
  * the host: OFF -> 0, ON -> 1, ADAPTIVE -> -1. */
 enum { PSX_VM_VSYNC_OFF = 0, PSX_VM_VSYNC_ON = 1, PSX_VM_VSYNC_ADAPTIVE = 2 };
-/* Live duel-rank readout.
- *   IN GAME        — the game's own DUEL SKILL badge and rank letter, drawn
- *                    beside the FIELD box and riding its tween. Just the band,
- *                    which is what actually picks the drop table.
- *   IN GAME+SCORE  — the same, plus the 0-99 number in the card-stat font, for
- *                    seeing progress WITHIN a band.
- *   OVERLAY TEXT   — host text at the window corner: always legible, never
- *                    hidden by a card view, unaffected by HUD tracking.
- * Ordered so the two in-game variants sit together in the cycle; a stored 1
- * still means IN GAME, so existing settings files keep their meaning. */
-/* VIEW > FUSION HINT — mirrors PSX_FUSION_HINT_* in psx_fusion_overlay.h.
- * Declared here too so the menu does not have to include the feature. */
-
 
 typedef struct PsxVideoMenuState {
     int scaling;         /* PSX_VM_SCALING_*  — present rect snapping */
@@ -53,7 +40,6 @@ typedef struct PsxVideoMenuState {
      * row's hint says out loud, because a control that silently does nothing
      * until restart is worse than no control. */
     int supersampling;
-    int life_points;     /* starting duel LP; 8000 is stock */
     int speed;           /* emulation speed multiplier, 1..16 (1 = normal) */
     /* PSX_VM_LOADS_* — how hard to accelerate disc loads. Drives the emulated
      * drive's sector delay ONLY, never host pacing: host pacing speeds the
@@ -61,15 +47,6 @@ typedef struct PsxVideoMenuState {
      * driver, and this title's music tempo rides on that. Shortening the
      * sector delay instead leaves the game running at normal speed. */
     int fast_loads;
-    /* StarChips is a LIVE save value, not a preference: setting it writes to
-     * guest RAM immediately and is never re-applied at startup (that would
-     * clobber the player's actual save). Not persisted for the same reason. */
-    int starchips;
-    int free_spending;   /* 1 = refund any StarChip decrease */
-    /* 0 = off, else set EVERY card in the trunk to this many copies. Like
-     * starchips this is a write-only cheat applied on change and never
-     * restored at startup — re-applying it would clobber a real collection. */
-    int all_cards;
     /* Audio buses, 0..100. MASTER scales everything the SPU emits; MUSIC and
      * SOUND are the split buses (see spu_set_bus_gains). 100/100/100 leaves
      * the mix bit-for-bit unchanged. */
@@ -78,7 +55,6 @@ typedef struct PsxVideoMenuState {
     int vol_sound;
 } PsxVideoMenuState;
 
-#define PSX_VM_LIFE_POINTS_DEFAULT 8000
 #define PSX_VM_SPEED_DEFAULT 1
 #define PSX_VM_SPEED_MAX 16
 /* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
@@ -202,7 +178,8 @@ int  psx_video_menu_take_pick_disc(void);
 enum { PSX_VM_ROW_OPTION = 0, PSX_VM_ROW_NUMBER = 1, PSX_VM_ROW_ACTION = 2 };
 
 /* Built-in menus a title may add rows to. */
-enum { PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_GAME = 4, PSX_VM_MENU_MODS = 6 };
+enum { PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_GAME = 4,
+       PSX_VM_MENU_CHEATS = 5, PSX_VM_MENU_MODS = 6 };
 
 /* A new top-level menu. Returns its id, or -1 when full. */
 int psx_video_menu_add_menu(const char *title);
@@ -230,6 +207,10 @@ int psx_video_menu_add_action(int menu, const char *label, const char *hint,
  * of the row's single hint. The array must hold choice_count entries and
  * outlive the process. Without it the row keeps one fixed hint. */
 void psx_video_menu_set_row_hints(int row_handle, const char *const *hints);
+
+/* Optional notch on a slider row's track, at `value`. Use it to mark a stock
+ * value so it stays findable by eye after dragging. -1 (the default) = none. */
+void psx_video_menu_set_row_mark(int row_handle, int value);
 
 int  psx_video_menu_get_row(int row_handle);
 void psx_video_menu_set_row(int row_handle, int value);

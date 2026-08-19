@@ -104,6 +104,7 @@ typedef struct VmRegRow {
     int   choice_count;
     int   lo, hi;
     int   slider;
+    int   mark;              /* notch on the track, or -1 */
     const char *key;         /* menu_settings.ini name; NULL = not persisted */
     int   value;
     void (*on_change)(int);
@@ -155,8 +156,6 @@ static const char *const VSYNC_LABELS[]   = { "OFF (LOWEST LAG)", "ON (TEAR-FREE
 static const char *const SSAA_LABELS[]    = { "NATIVE (1X)", "2X", "3X", "4X" };
 static const char *const LOADS_LABELS[]   = { "OFF (AUTHENTIC)", "FAST", "INSTANT" };
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
-static const char *const ALLCARDS_LABELS[] = { "OFF", "1 OF EACH", "2 OF EACH",
-                                               "3 OF EACH" };
 
 static int s_visible;    /* bar drawn; does not capture input */
 static int s_expanded;   /* dropdown open; DOES capture input */
@@ -194,10 +193,7 @@ static PsxVideoMenuState s_state = {
     .vsync          = PSX_VM_VSYNC_ON,
     .supersampling  = 1,
     .fast_loads     = PSX_VM_LOADS_OFF,
-    .life_points    = PSX_VM_LIFE_POINTS_DEFAULT,
     .speed          = PSX_VM_SPEED_DEFAULT,
-    .starchips      = 0,   /* write-only, never restored */
-    .free_spending  = 0,
     .vol_master     = 100,
     .vol_music      = 100,
     .vol_sound      = 100,
@@ -224,16 +220,6 @@ static int num_range(int m, int row, int *lo, int *hi) {
             *lo = r->lo; *hi = r->hi; return 1;
         }
     }
-    if (m == MENU_CHEATS && row == 0) {
-        /* The patched instruction is `addiu`, whose sign-extended immediate
-         * would allow up to 32767 — but the game's LP display is four digits,
-         * so the useful range stops at 9999 and that is what the slider spans. */
-        *lo = 1; *hi = 9999; return 1;
-    }
-    if (m == MENU_CHEATS && row == 1) {
-        /* 32-bit field, but the entry box holds 5 digits. */
-        *lo = 0; *hi = 99999; return 1;
-    }
     if (m == MENU_GAME && row == 0) {
         *lo = 1; *hi = PSX_VM_SPEED_MAX; return 1;
     }
@@ -243,8 +229,6 @@ static int num_range(int m, int row, int *lo, int *hi) {
 
 static int num_get(int m, int row) {
     { VmRegRow *r = row_reg(m, row); if (r) return r->value; }
-    if (m == MENU_CHEATS && row == 0) return s_state.life_points;
-    if (m == MENU_CHEATS && row == 1) return s_state.starchips;
     if (m == MENU_GAME && row == 0) return s_state.speed;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER) return s_state.vol_master;
@@ -264,8 +248,6 @@ static void num_set(int m, int row, int v) {
             return;
         }
     }
-    if (m == MENU_CHEATS && row == 0) s_state.life_points = v;
-    if (m == MENU_CHEATS && row == 1) s_state.starchips = v;
     if (m == MENU_GAME && row == 0) s_state.speed = v;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER)     s_state.vol_master = v;
@@ -292,7 +274,7 @@ static int builtin_rows(int m) {
     if (m == MENU_VIEW) return 1;
     if (m == MENU_VIDEO) return 6;
     if (m == MENU_AUDIO) return 3;
-    if (m == MENU_CHEATS) return 4;
+    if (m == MENU_CHEATS) return 0;   /* titles fill this; empty until they do */
     if (m == MENU_GAME) return 4;
     if (m == MENU_MODS) return 0;   /* mods fill this; empty until they do */
     return 1;
@@ -417,11 +399,6 @@ static const char *row_label(int m, int row) {
              : (row == 1) ? "CHANGE GAME DISC"
                           : "QUIT";
     if (m == MENU_VIEW) return "MENU BAR";
-    if (m == MENU_CHEATS)
-        return (row == 0) ? "LIFE POINTS"
-             : (row == 1) ? "STARCHIPS"
-             : (row == 2) ? "FREE SPENDING"
-                          : "ALL CARDS";
     if (m == MENU_GAME)
         return (row == 0) ? "SPEED"
              : (row == 1) ? "FAST LOADING"
@@ -488,11 +465,6 @@ static const char *row_value(int m, int row) {
         return lp_text(num_get(m, row));
     }
     if (m == MENU_VIEW) return "VISIBLE   F10";
-    if (m == MENU_CHEATS && row == 2)
-        return s_state.free_spending ? "ON" : "OFF";
-    if (m == MENU_CHEATS && row == 3)
-        return ALLCARDS_LABELS[(s_state.all_cards >= 0 && s_state.all_cards <= 3)
-                                   ? s_state.all_cards : 0];
     if (m == MENU_GAME && row == 1)
         return LOADS_LABELS[(s_state.fast_loads >= 0 && s_state.fast_loads <= 2)
                                 ? s_state.fast_loads : 0];
@@ -530,14 +502,6 @@ static const char *row_hint(int m, int row) {
              : (row == 1) ? "PICK YOUR DISC AGAIN IF IT MOVED  (APPLIES ON RESTART)"
                           : "EXIT THE GAME";
     if (m == MENU_VIEW) return "PRESS F10 ANY TIME TO SHOW OR HIDE";
-    if (m == MENU_CHEATS && row == 2)
-        return s_state.free_spending
-                   ? "PURCHASES REFUNDED - EARNINGS STILL COUNT"
-                   : "SPENDING DEDUCTS NORMALLY";
-    if (m == MENU_CHEATS && row == 3)
-        return s_state.all_cards == 0
-                   ? "FILLS THE TRUNK - CLOSE THE CHEST FIRST"
-                   : "APPLIES NOW - PERMANENT ONCE YOU SAVE";
     if (m == MENU_GAME && row == 1)
         return s_state.fast_loads == PSX_VM_LOADS_OFF
                    ? "REAL DRIVE TIMING"
@@ -559,12 +523,6 @@ static const char *row_hint(int m, int row) {
                    ? "BGM AND CD AUDIO - ENTER TO TYPE"
                    : "SOUND EFFECTS ONLY - ENTER TO TYPE";
     if (num_range(m, row, &lo, &hi)) {
-        if (m == MENU_CHEATS && row == 0)
-            return (s_state.life_points == PSX_VM_LIFE_POINTS_DEFAULT)
-                       ? "8000 IS STOCK. ENTER TO TYPE"
-                       : "MODDED. APPLIES ON NEXT DUEL";
-        if (m == MENU_CHEATS && row == 1)
-            return "WRITES TO THE LIVE SAVE IMMEDIATELY";
         if (m == MENU_GAME && row == 0)
             return (s_state.speed <= 1)
                        ? "1X IS NORMAL SPEED. 1 TO 16"
@@ -615,21 +573,6 @@ static void cycle_row(int m, int row, int delta) {
             }
             return;
         }
-    }
-    if (m == MENU_CHEATS && row == 2) {
-        s_state.free_spending = s_state.free_spending ? 0 : 1;
-        s_changed = 1;
-        s_dirty = 1;
-        return;
-    }
-    if (m == MENU_CHEATS && row == 3) {
-        int v = s_state.all_cards + delta;
-        while (v < 0) v += 4;
-        while (v > 3) v -= 4;
-        s_state.all_cards = v;
-        s_changed = 1;
-        s_dirty = 1;
-        return;
     }
     if (m == MENU_GAME && row == 1) {
         int v = s_state.fast_loads + delta;
@@ -740,15 +683,13 @@ static int row_is_slider(int m, int row) {
     if (!num_range(m, row, &lo, &hi)) return 0;
     if (m == MENU_AUDIO) return 1;
     if (m == MENU_GAME) return 1;                 /* SPEED 1..16 */
-    if (m == MENU_CHEATS && row == 0) return 1;   /* LIFE POINTS 1..9999 */
-    return 0;                                     /* STARCHIPS stays type-only */
+    return 0;   /* built-in number rows are type-only unless listed above */
 }
 
-/* A value worth marking on the track, or -1. LIFE POINTS gets a notch at the
- * stock 8000 so the original value is findable by eye after dragging. */
+/* A value worth marking on the track, or -1. Only registered rows carry one
+ * (see psx_video_menu_set_row_mark); no built-in row asks for a notch. */
 static int slider_mark(int m, int row) {
-    if (row_reg(m, row)) return -1;
-    if (m == MENU_CHEATS && row == 0) return PSX_VM_LIFE_POINTS_DEFAULT;
+    { VmRegRow *r = row_reg(m, row); if (r) return r->mark; }
     return -1;
 }
 
@@ -1364,6 +1305,7 @@ static int vm_add(int menu, int kind, const char *label, const char *hint) {
     if (menu < 0 || menu >= s_menu_total) return -1;
     VmRegRow *r = &s_reg[s_reg_count];
     memset(r, 0, sizeof(*r));
+    r->mark = -1;
     r->menu = menu;
     r->kind = kind;
     r->label = label;
@@ -1413,6 +1355,12 @@ int psx_video_menu_add_action(int menu, const char *label, const char *hint,
 void psx_video_menu_set_row_hints(int row_handle, const char *const *hints) {
     if (row_handle < 0 || row_handle >= s_reg_count) return;
     s_reg[row_handle].choice_hints = hints;
+    s_dirty = 1;
+}
+
+void psx_video_menu_set_row_mark(int row_handle, int value) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return;
+    s_reg[row_handle].mark = value;
     s_dirty = 1;
 }
 
@@ -1488,13 +1436,9 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "supersampling")) {
             if (v >= 1 && v <= PSX_VM_SUPERSAMPLING_MAX) out->supersampling = v;
         }
-        else if (!strcmp(key, "life_points")) {
-            if (v >= 1 && v <= 32767) out->life_points = v;
-        }
         else if (!strcmp(key, "speed")) {
             if (v >= 1 && v <= PSX_VM_SPEED_MAX) out->speed = v;
         }
-        else if (!strcmp(key, "free_spending")) out->free_spending = v ? 1 : 0;
         else if (!strcmp(key, "fast_loads")) out->fast_loads = (v >= 0 && v <= 2) ? v : 0;
         else if (!strcmp(key, "vol_master")) out->vol_master = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
@@ -1532,9 +1476,7 @@ int psx_video_menu_settings_save(const char *path) {
         "screen=%d          # 0 windowed, 1 borderless, 2 exclusive\n"
         "vsync=%d           # 0 off (lowest lag, tearing), 1 on, 2 adaptive\n"
         "supersampling=%d   # internal render scale 1..4; applies on next launch\n"
-        "life_points=%d     # starting duel LP; 8000 is stock\n"
         "speed=%d           # emulation speed multiplier, 1..16 (1 = normal)\n"
-        "free_spending=%d   # 1 = refund any StarChip decrease\n"
         "fast_loads=%d      # 0 authentic, 1 fast, 2 instant disc loads\n"
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
@@ -1546,10 +1488,8 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.vsync >= 0 && s_state.vsync <= 2) ? s_state.vsync : PSX_VM_VSYNC_ON,
         (s_state.supersampling >= 1 &&
          s_state.supersampling <= PSX_VM_SUPERSAMPLING_MAX) ? s_state.supersampling : 1,
-        s_state.life_points,
         (s_state.speed >= 1 && s_state.speed <= PSX_VM_SPEED_MAX)
             ? s_state.speed : PSX_VM_SPEED_DEFAULT,
-        s_state.free_spending ? 1 : 0,
         (s_state.fast_loads >= 0 && s_state.fast_loads <= 2) ? s_state.fast_loads : 0,
         (s_state.vol_master >= 0 && s_state.vol_master <= 100) ? s_state.vol_master : 100,
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,

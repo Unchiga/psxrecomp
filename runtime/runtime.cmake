@@ -303,6 +303,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_cd_overlay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_cd_sprites.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_card_drops.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ygo_cheats.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_db.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_assist.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fusion_font.c

@@ -33,6 +33,7 @@
 #include "psx_rank_meter.h"
 #include "psx_cd_overlay.h"
 #include "psx_card_drops.h"
+#include "psx_ygo_cheats.h"
 #include "psx_fusion_assist.h"
 #include "psx_fusion_overlay.h"
 #include "host_osd.h"
@@ -4463,36 +4464,6 @@ static int hotkey_pad_binding_down(int binding) {
  * startup; saving is skipped while empty so nothing lands in the cwd. */
 static std::string g_menu_settings_path;
 
-/* --- Free spending -------------------------------------------------------
- * The StarChip total is a read-modify-write: `$v0 = $v0 + $v1` at 0x80021EE0
- * then `sw $v0, 0x5E0($a0)`. A single patched instruction cannot express
- * "ignore negative deltas but keep positive ones" — freezing the add would
- * block earnings too. So this watches the live field once per frame and puts
- * back any DECREASE, while letting increases through. The purchase itself
- * still succeeds (the game has already granted the item); only the deduction
- * is undone. */
-static const uint32_t PSX_STARCHIPS_ADDR = 0x801D07E0u;
-static int      g_free_spending = 0;
-static uint32_t s_sc_last = 0;
-static int      s_sc_tracking = 0;
-
-static void psx_free_spending_tick(void) {
-    if (!g_free_spending || !psx_mod_game_started()) {
-        s_sc_tracking = 0;
-        return;
-    }
-    uint32_t cur = psx_mod_read_word(PSX_STARCHIPS_ADDR);
-    /* Ignore obvious garbage: the field is small in practice, and a wild value
-     * means we are mid-load or looking at an uninitialised buffer. */
-    if (cur > 9999999u) { s_sc_tracking = 0; return; }
-    if (!s_sc_tracking) { s_sc_last = cur; s_sc_tracking = 1; return; }
-    if (cur < s_sc_last)
-        psx_mod_write_word(PSX_STARCHIPS_ADDR, s_sc_last);   /* refund */
-    else
-        s_sc_last = cur;                                     /* keep earnings */
-}
-
-
 /* What SDL actually sees, and what each player slot did with it. Controller
  * bring-up otherwise has no observable: "my pad does nothing" could be SDL not
  * enumerating the device, SDL enumerating it as a joystick with no gamepad
@@ -4732,13 +4703,8 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
              * "Resolution: 2x" would be a lie for the rest of the session. */
             std::snprintf(msg, sizeof(msg), "Resolution: %dx on restart",
                           s->supersampling);
-        } else if (s->free_spending != prev.free_spending) {
-            std::snprintf(msg, sizeof(msg), "Free spending: %s",
-                          s->free_spending ? "on" : "off");
         } else if (s->speed != prev.speed) {
             std::snprintf(msg, sizeof(msg), "Speed: %dx", s->speed);
-        } else if (s->life_points != prev.life_points) {
-            std::snprintf(msg, sizeof(msg), "Life points: %d", s->life_points);
         } else if (s->vol_master != prev.vol_master) {
             std::snprintf(msg, sizeof(msg), "Master volume: %d%%", s->vol_master);
         } else if (s->vol_music != prev.vol_music) {
@@ -4749,85 +4715,6 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
         }
         if (msg[0]) host_osd_push(msg, 900);
         prev = *s;
-    }
-
-    /* Starting duel life points.
-     *
-     * The stock EXE loads the constant with `addiu $v0, $zero, 0x1F40` (8000)
-     * at two sites: 0x800175D0 stores it as a halfword pair on the stack (both
-     * duellists), 0x8002DC70 stores it to the global at 0x8009B236. Rewriting
-     * the whole instruction as `addiu $v0, $zero, <lp>` covers both.
-     *
-     * psx_mod_write_code_word (not write_word) routes the address through the
-     * executable-RAM path, so the text guard revokes the statically recompiled
-     * block and the interpreter picks up the new immediate - and a restored
-     * save state cannot leave a stale compiled instruction behind.
-     *
-     * addiu sign-extends its 16-bit immediate, so keep values under 32768. */
-    if (psx_mod_game_started()) {
-        int lp = s->life_points;
-        if (lp < 1) lp = 1;
-        if (lp > 32767) lp = 32767;
-        psx_mod_write_code_word(0x800175D0u, 0x24020000u | (uint32_t)lp);
-        psx_mod_write_code_word(0x8002DC70u, 0x24020000u | (uint32_t)lp);
-    }
-
-    /* StarChips.
-     *
-     * Located by RAM scan + write trace: a 32-bit field at offset 0x5E0 in a
-     * 0x680-byte game-state struct, live copy at 0x801D0200 => 0x801D07E0. The
-     * award/spend routine at 0x80021EE0 does `$v0 = $v0 + $v1` then
-     * `sw $v0, 0x5E0($a0)`, which is what confirmed the offset.
-     *
-     * Two mirrors exist (0x801D37E0, 0x801D3E60) but they are memcpy'd FROM the
-     * live block, so writing the live copy is what propagates — writing a mirror
-     * would display correctly and then be overwritten.
-     *
-     * Unlike life points (a code constant) this is live save data, so it is a
-     * one-shot write applied only when the player changes it: never re-applied
-     * at startup and never persisted, or it would clobber a real save. */
-    if (psx_mod_game_started() && s->starchips > 0) {
-        psx_mod_write_word(PSX_STARCHIPS_ADDR, (uint32_t)s->starchips);
-        s_sc_tracking = 0;   /* re-baseline so the guard does not refund this */
-        host_osd_push("StarChips set", 1200);
-    }
-
-    g_free_spending = s->free_spending ? 1 : 0;
-    if (!g_free_spending) s_sc_tracking = 0;
-
-
-    /* ALL CARDS.
-     *
-     * The trunk is a 722-byte array of per-card counts, card N at +(N-1),
-     * at save-struct +0x50. Located 2026-08-16 by known-value search against
-     * three counts the player read off the chest screen (Horn Imp #25 = 1,
-     * Griffore #46 = 1, Aqua Snake #446 = 0). Exactly three regions in RAM
-     * match the signature and ALL THREE must be written:
-     *
-     *   0x801D0250  live save struct (+0x50)
-     *   0x801D3250  the known mirror (+0x3000)
-     *   0x80105D98  third copy — the chest UI's working buffer
-     *
-     * Writing only the live copy does NOT stick: the chest screen rebuilds
-     * from its own buffer and puts the old values straight back (measured —
-     * the first attempt was reverted in full). Apply with the chest CLOSED,
-     * which is what the row's hint tells the player.
-     *
-     * Write-only and applied on change only: this is live save data, so
-     * re-applying it at startup would clobber a real collection. */
-    if (psx_mod_game_started() && s->all_cards > 0) {
-        static int s_all_cards_last = -1;
-        if (s->all_cards != s_all_cards_last) {
-            static const uint32_t kTrunkBases[] = {
-                0x801D0250u, 0x801D3250u, 0x80105D98u
-            };
-            const uint8_t n = (uint8_t)(s->all_cards > 3 ? 3 : s->all_cards);
-            for (size_t b = 0; b < sizeof(kTrunkBases) / sizeof(kTrunkBases[0]); b++)
-                for (uint32_t i = 0; i < 722u; i++)
-                    psx_mod_write_byte(kTrunkBases[b] + i, n);
-            host_osd_push("All cards granted", 1500);
-            s_all_cards_last = s->all_cards;
-        }
     }
 
     /* Emulation speed. The wall-clock pacer targets g_frame_period_ms, so a
@@ -5628,7 +5515,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 }
             }
         }
-        psx_free_spending_tick();
+        psx_ygo_cheats_tick();
         psx_rank_logic_tick();
         psx_card_drops_tick();
         psx_fusion_overlay_tick();
@@ -12737,14 +12624,10 @@ CPUState cpu;
             if (eff > PSX_VM_SUPERSAMPLING_MAX) eff = PSX_VM_SUPERSAMPLING_MAX;
             vms.supersampling = eff;
         }
-        vms.life_points = PSX_VM_LIFE_POINTS_DEFAULT;
         vms.speed       = PSX_VM_SPEED_DEFAULT;
         /* Authentic drive timing unless the player asks otherwise, matching the
          * built-in CD Speed mod's default-off stance. */
         vms.fast_loads  = PSX_VM_LOADS_OFF;
-        vms.starchips   = 0;   /* write-only cheat; never restored from file */
-        vms.free_spending = 0;
-        vms.all_cards   = 0;   /* write-only cheat; never restored from file */
         vms.vol_master  = 100;
         vms.vol_music   = 100;
         vms.vol_sound   = 100;
@@ -12759,6 +12642,7 @@ CPUState cpu;
          * a stored value for a registered row has nowhere to land until the
          * row exists. */
         psx_card_drops_register_menu();
+        psx_ygo_cheats_register_menu();
         psx_rank_logic_register_menu();
         psx_fusion_overlay_register_menu();
 
