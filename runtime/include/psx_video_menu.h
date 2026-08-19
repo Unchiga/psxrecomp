@@ -32,6 +32,11 @@ enum { PSX_VM_VSYNC_OFF = 0, PSX_VM_VSYNC_ON = 1, PSX_VM_VSYNC_ADAPTIVE = 2 };
  *                    hidden by a card view, unaffected by HUD tracking.
  * Ordered so the two in-game variants sit together in the cycle; a stored 1
  * still means IN GAME, so existing settings files keep their meaning. */
+/* VIEW > FUSION HINT — mirrors PSX_FUSION_HINT_* in psx_fusion_overlay.h.
+ * Declared here too so the menu does not have to include the feature. */
+enum { PSX_VM_FUSION_HINT_OFF = 0, PSX_VM_FUSION_HINT_NUMBERS = 1,
+       PSX_VM_FUSION_HINT_FULL = 2 };
+
 enum { PSX_VM_RANK_OFF = 0, PSX_VM_RANK_INGAME = 1,
        PSX_VM_RANK_INGAME_SCORE = 2, PSX_VM_RANK_TEXT = 3 };
 
@@ -77,6 +82,12 @@ typedef struct PsxVideoMenuState {
     int vol_sound;
     /* PSX_VM_RANK_* — live duel-rank meter drawn as the OSD status line. */
     int rank_meter;
+    /* PSX_VM_FUSION_HINT_* — the in-duel fusion assistant, and whether it
+     * suggests the best attack or the best defence. Two rows rather than one
+     * combined list: the display choice and the ranking choice are independent,
+     * and folding them together would make six states where two suffice. */
+    int fusion_hint;
+    int fusion_by_def;
     /* MODS > CARD DROPS: how many cards a won duel awards, 1..99. 1 is stock.
      * Unlike the CHEATS rows this is a PREFERENCE, not a live save write — it
      * changes what the next duel awards and is persisted like any other

@@ -12294,15 +12294,42 @@ static void handle_fusion_overlay(int id, const char *json)
     int x = json_get_int(json, "x", PSX_FUSION_OVERLAY_KEEP);
     int y = json_get_int(json, "y", PSX_FUSION_OVERLAY_KEEP);
     int tx = json_get_int(json, "text_x", PSX_FUSION_OVERLAY_KEEP);
-    int en = json_get_int(json, "enabled", PSX_FUSION_OVERLAY_KEEP);
+    int en = json_get_int(json, "mode", PSX_FUSION_OVERLAY_KEEP);
     if (x != PSX_FUSION_OVERLAY_KEEP || y != PSX_FUSION_OVERLAY_KEEP ||
         tx != PSX_FUSION_OVERLAY_KEEP || en != PSX_FUSION_OVERLAY_KEEP)
         psx_fusion_overlay_tune(x, y, tx, en);
+    int cx = json_get_int(json, "card_x", PSX_FUSION_OVERLAY_KEEP);
+    int cdx = json_get_int(json, "card_dx", PSX_FUSION_OVERLAY_KEEP);
+    int bdy = json_get_int(json, "badge_dy", PSX_FUSION_OVERLAY_KEEP);
+    int bdx = json_get_int(json, "badge_dx", PSX_FUSION_OVERLAY_KEEP);
+    int ty = json_get_int(json, "text_y", PSX_FUSION_OVERLAY_KEEP);
+    if (cx != PSX_FUSION_OVERLAY_KEEP || cdx != PSX_FUSION_OVERLAY_KEEP ||
+        bdy != PSX_FUSION_OVERLAY_KEEP || bdx != PSX_FUSION_OVERLAY_KEEP ||
+        ty != PSX_FUSION_OVERLAY_KEEP)
+        psx_fusion_overlay_tune_cards(cx, cdx, bdy, bdx, ty);
     psx_fusion_overlay_tune_get(&x, &y, &tx, &en);
+    psx_fusion_overlay_tune_cards_get(&cx, &cdx, &bdy, &bdx, &ty);
+    uint8_t badge[8] = {0};
+    psx_fusion_overlay_badges(badge, 5);
+    /* The line carries a TAB as its internal seam between the alphabet-set
+     * name and the digit-set stats. A raw control character inside a JSON
+     * string is invalid JSON and made every reader throw, so show it as a
+     * space here — the seam is an implementation detail, not something a
+     * read-back needs to reproduce. */
+    char shown[80];
+    const char *src = psx_fusion_overlay_text();
+    size_t si = 0;
+    for (; si + 1 < sizeof shown && src[si]; si++)
+        shown[si] = (src[si] == '	') ? ' ' : src[si];
+    shown[si] = 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"text_x\":%d,"
-             "\"enabled\":%d,\"on_screen\":%d,\"text\":\"%s\"}",
-             id, x, y, tx, en, psx_fusion_overlay_needs_present(),
-             psx_fusion_overlay_text());
+             "\"card_x\":%d,\"card_dx\":%d,\"badge_dy\":%d,\"badge_dx\":%d,\"text_y\":%d,"
+             "\"mode\":%d,\"on_screen\":%d,"
+             "\"badges\":[%u,%u,%u,%u,%u],\"text\":\"%s\"}",
+             id, x, y, tx, cx, cdx, bdy, bdx, ty, en,
+             psx_fusion_overlay_needs_present(),
+             badge[0], badge[1], badge[2], badge[3], badge[4],
+             shown);
 }
 
 static void handle_fusion_best(int id, const char *json)

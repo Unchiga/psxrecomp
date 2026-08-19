@@ -33,6 +33,7 @@
 #include "psx_rank_meter.h"
 #include "psx_cd_overlay.h"
 #include "psx_card_drops.h"
+#include "psx_fusion_assist.h"
 #include "psx_fusion_overlay.h"
 #include "host_osd.h"
 #include "psx_host_input.h"   /* our own exports: injection, pad mask, lag ring */
@@ -12485,6 +12486,8 @@ CPUState cpu;
          * fires on a CHANGE, so a stored rank-meter choice needs seeding here
          * or it would stay off until the player toggled the row. */
         psx_rank_logic_set_mode(vms.rank_meter);
+        psx_fusion_overlay_set_mode(vms.fusion_hint);
+        psx_fusion_assist_set_rank(vms.fusion_by_def);
         /* Same reason as the rows above: apply_video_menu_state only fires on a
          * CHANGE, so a stored CARD DROPS value needs seeding here. The mod
          * registers its own hooks; they cost nothing at 1 (every callback

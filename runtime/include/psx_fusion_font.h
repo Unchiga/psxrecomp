@@ -16,6 +16,8 @@
 
 #include <stdint.h>
 
+#include "psx_rank_sprites.h"   /* PsxSprite */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,6 +28,11 @@ typedef struct PsxFusionFont {
 } PsxFusionFont;
 
 extern const PsxFusionFont psx_fusion_font;
+
+/* The stat icons the game prints beside a card's attack and defence, from
+ * the same sheet as the small digits. Real two-tone art, so ARGB. */
+extern const PsxSprite psx_fusion_icon_atk;
+extern const PsxSprite psx_fusion_icon_def;
 
 #define PSX_FUSION_FONT_CELLS 96
 

@@ -346,12 +346,27 @@ typedef struct {
     uint8_t  slot[PSX_FUSION_HAND_MAX];
 } BestLine;
 
+/* Which stat the search maximises. Attack by default -- the usual question is
+ * "what is the biggest thing I can put down" -- but a defensive turn wants the
+ * other one, and the two disagree often enough to be worth a switch. The
+ * loser stat stays as the last tie-break either way. */
+static int s_rank_by_def;
+
+void psx_fusion_assist_set_rank(int by_defence)
+{
+    s_rank_by_def = by_defence ? 1 : 0;
+}
+
+int psx_fusion_assist_get_rank(void) { return s_rank_by_def; }
+
 static int line_better(const BestLine *a, const BestLine *b)
 {
     if (!b->len) return 1;
-    if (a->atk != b->atk) return a->atk > b->atk;
+    const int ap = s_rank_by_def ? a->def : a->atk;
+    const int bp = s_rank_by_def ? b->def : b->atk;
+    if (ap != bp) return ap > bp;
     if (a->len != b->len) return a->len < b->len;
-    return a->def > b->def;
+    return (s_rank_by_def ? a->atk : a->def) > (s_rank_by_def ? b->atk : b->def);
 }
 
 static void best_search(const PsxFusionCard *hand, int n, uint8_t used,

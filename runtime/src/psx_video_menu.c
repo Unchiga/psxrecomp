@@ -105,6 +105,8 @@ static const char *const LOADS_LABELS[]   = { "OFF (AUTHENTIC)", "FAST", "INSTAN
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
 static const char *const ALLCARDS_LABELS[] = { "OFF", "1 OF EACH", "2 OF EACH",
                                                "3 OF EACH" };
+static const char *const FUSION_HINT_LABELS[] = { "OFF", "NUMBERS",
+                                                  "NUMBERS + INFO" };
 static const char *const RANK_LABELS[]    = { "OFF", "IN GAME",
                                               "IN GAME + SCORE",
                                               "OVERLAY TEXT" };
@@ -152,6 +154,8 @@ static PsxVideoMenuState s_state = {
     .vol_music      = 100,
     .vol_sound      = 100,
     .rank_meter     = PSX_VM_RANK_OFF,
+    .fusion_hint    = PSX_VM_FUSION_HINT_OFF,
+    .fusion_by_def  = 0,
     .card_drops     = PSX_VM_CARD_DROPS_DEFAULT,
 };
 
@@ -226,7 +230,7 @@ static const char *menu_title(int m) {
 
 static int menu_rows(int m) {
     if (m == MENU_FILE) return 2;
-    if (m == MENU_VIEW) return 2;
+    if (m == MENU_VIEW) return 4;
     if (m == MENU_VIDEO) return 6;
     if (m == MENU_AUDIO) return 3;
     if (m == MENU_CHEATS) return 4;
@@ -336,7 +340,10 @@ static const char *row_label(int m, int row) {
     if (m == MENU_FILE)
         return (row == 0) ? "CLOSE MENU" : "QUIT";
     if (m == MENU_VIEW)
-        return (row == 0) ? "MENU BAR" : "DUEL RANK";
+        return (row == 0) ? "MENU BAR"
+             : (row == 1) ? "DUEL RANK"
+             : (row == 2) ? "FUSION HINT"
+                          : "SUGGEST BY";
     if (m == MENU_CHEATS)
         return (row == 0) ? "LIFE POINTS"
              : (row == 1) ? "STARCHIPS"
@@ -398,11 +405,17 @@ static const char *row_value(int m, int row) {
         }
         return lp_text(num_get(m, row));
     }
-    if (m == MENU_VIEW)
-        return (row == 0)
-                   ? "VISIBLE   F10"
-                   : RANK_LABELS[(s_state.rank_meter >= 0 &&
-                                  s_state.rank_meter <= 3) ? s_state.rank_meter : 0];
+    if (m == MENU_VIEW) {
+        if (row == 0) return "VISIBLE   F10";
+        if (row == 1)
+            return RANK_LABELS[(s_state.rank_meter >= 0 &&
+                                s_state.rank_meter <= 3) ? s_state.rank_meter : 0];
+        if (row == 2)
+            return FUSION_HINT_LABELS[(s_state.fusion_hint >= 0 &&
+                                       s_state.fusion_hint <= 2)
+                                          ? s_state.fusion_hint : 0];
+        return s_state.fusion_by_def ? "DEFENSE" : "ATTACK";
+    }
     if (m == MENU_CHEATS && row == 2)
         return s_state.free_spending ? "ON" : "OFF";
     if (m == MENU_CHEATS && row == 3)
@@ -432,6 +445,16 @@ static const char *row_hint(int m, int row) {
         return "TYPE DIGITS  ENTER APPLY  ESC CANCEL";
     if (m == MENU_FILE)
         return (row == 0) ? "CLOSE THIS MENU" : "EXIT THE GAME";
+    if (m == MENU_VIEW && row == 2)
+        return (s_state.fusion_hint == PSX_VM_FUSION_HINT_OFF)
+                   ? "SHOW WHAT YOUR HAND CAN FUSE INTO"
+             : (s_state.fusion_hint == PSX_VM_FUSION_HINT_NUMBERS)
+                   ? "PICK ORDER ON THE CARDS ONLY"
+                   : "PICK ORDER PLUS THE CARD IT MAKES";
+    if (m == MENU_VIEW && row == 3)
+        return s_state.fusion_by_def
+                   ? "SUGGEST THE BEST DEFENSE"
+                   : "SUGGEST THE BEST ATTACK";
     if (m == MENU_VIEW)
         return (row == 0)
                    ? "PRESS F10 ANY TIME TO SHOW OR HIDE"
@@ -516,6 +539,22 @@ static const char *row_hint(int m, int row) {
 }
 
 static void cycle_row(int m, int row, int delta) {
+    if (m == MENU_VIEW && row == 2) {
+        int v = s_state.fusion_hint + delta;
+        while (v < 0) v += 3;
+        while (v > 2) v -= 3;
+        s_state.fusion_hint = v;
+        s_dirty = 1;
+        return;
+    }
+    if (m == MENU_VIEW && row == 3) {
+        /* Attack and defence are one row, not two toggles: choosing one has
+         * to unchoose the other, and a single cycling row makes that
+         * structural instead of something two handlers have to agree on. */
+        s_state.fusion_by_def = !s_state.fusion_by_def;
+        s_dirty = 1;
+        return;
+    }
     if (m == MENU_VIEW && row == 1) {
         int v = s_state.rank_meter + delta;
         while (v < 0) v += 4;
@@ -1303,6 +1342,8 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_sound"))  out->vol_sound  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "rank_meter")) out->rank_meter = (v >= 0 && v <= 3) ? v : 0;
+        else if (!strcmp(key, "fusion_hint")) out->fusion_hint = (v >= 0 && v <= 2) ? v : 0;
+        else if (!strcmp(key, "fusion_by_def")) out->fusion_by_def = v ? 1 : 0;
         else if (!strcmp(key, "card_drops")) {
             if (v >= 1 && v <= PSX_VM_CARD_DROPS_MAX) out->card_drops = v;
         }
@@ -1333,7 +1374,9 @@ int psx_video_menu_settings_save(const char *path) {
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
         "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n"
         "rank_meter=%d      # 0 off, 1 live duel rank, 2 rank + worst term\n"
-        "card_drops=%d      # cards awarded per duel won, 1..99 (1 = stock)\n",
+        "card_drops=%d      # cards awarded per duel won, 1..99 (1 = stock)\n"
+        "fusion_hint=%d     # 0 off, 1 pick-order numbers, 2 numbers + card\n"
+        "fusion_by_def=%d   # 0 suggest best attack, 1 best defense\n",
         s_state.scaling ? 1 : 0,
         s_state.filter ? 1 : 0,
         s_state.texture_filter ? 1 : 0,
@@ -1351,7 +1394,10 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
         (s_state.rank_meter >= 0 && s_state.rank_meter <= 3) ? s_state.rank_meter : 0,
         (s_state.card_drops >= 1 && s_state.card_drops <= PSX_VM_CARD_DROPS_MAX)
-            ? s_state.card_drops : PSX_VM_CARD_DROPS_DEFAULT);
+            ? s_state.card_drops : PSX_VM_CARD_DROPS_DEFAULT,
+        (s_state.fusion_hint >= 0 && s_state.fusion_hint <= 2)
+            ? s_state.fusion_hint : 0,
+        s_state.fusion_by_def ? 1 : 0);
     fclose(f);
     return 1;
 }

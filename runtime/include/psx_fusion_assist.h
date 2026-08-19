@@ -58,7 +58,11 @@ int psx_fusion_assist_chain(PsxFusionCard *steps, int cap, uint16_t *out_result)
 /* `fusion_chain`: the above as JSON, with the running result after each pick. */
 int psx_fusion_assist_chain_json(char *out, unsigned cap);
 
-/* The highest-attack monster this hand can make, using as few cards as
+/* Rank the best line by defence instead of attack. */
+void psx_fusion_assist_set_rank(int by_defence);
+int  psx_fusion_assist_get_rank(void);
+
+/* The best monster this hand can make, using as few cards as
  * possible. Writes the slots to pick, in the order to pick them, and returns
  * how many. 0 means the hand makes nothing. Any pointer may be NULL. */
 int psx_fusion_assist_best(uint16_t *result, int *atk, int *def, int *cards,

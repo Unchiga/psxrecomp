@@ -21,6 +21,11 @@
 extern "C" {
 #endif
 
+/* VIEW > FUSION HINT. Off, the pick-order numbers on their own, or those plus
+ * the card the line would make. */
+enum { PSX_FUSION_HINT_OFF = 0, PSX_FUSION_HINT_NUMBERS = 1,
+       PSX_FUSION_HINT_FULL = 2 };
+
 /* Once a frame: re-reads the duel through psx_fusion_assist and re-rasterises
  * only when the line actually changes. Cheap to call always. */
 void psx_fusion_overlay_tick(void);
@@ -38,11 +43,25 @@ int  psx_fusion_overlay_needs_present(void);
  * own art is a by-eye job and a rebuild per nudge costs the player their duel.
  * ABSOLUTE values; PSX_FUSION_OVERLAY_KEEP leaves a field alone. */
 #define PSX_FUSION_OVERLAY_KEEP (-100000)
-void psx_fusion_overlay_tune(int x, int y, int text_x, int enabled);
-void psx_fusion_overlay_tune_get(int *x, int *y, int *text_x, int *enabled);
+void psx_fusion_overlay_tune(int x, int y, int text_x, int mode);
+void psx_fusion_overlay_tune_get(int *x, int *y, int *text_x, int *mode);
 
-/* What the line currently says, for `fusion_overlay`. Returns the text. */
+/* Hand-card geometry the order badges ride on. Same KEEP convention. */
+void psx_fusion_overlay_tune_cards(int card_x, int card_dx, int badge_dy,
+                                   int badge_dx, int text_y);
+void psx_fusion_overlay_tune_cards_get(int *card_x, int *card_dx, int *badge_dy,
+                                       int *badge_dx, int *text_y);
+
+/* Menu handoff; takes effect immediately. */
+void psx_fusion_overlay_set_mode(int mode);
+
+/* What the line currently says, for `fusion_overlay`. The tab in it separates
+ * the part set in the alphabet from the part set in the small digits. */
 const char *psx_fusion_overlay_text(void);
+
+/* The recommended pick order per hand slot, 1..5, 0 where there is none.
+ * Returns how many slots carry a badge. */
+int psx_fusion_overlay_badges(uint8_t *out, int cap);
 
 #ifdef __cplusplus
 }
