@@ -16,6 +16,7 @@
 #else
 #include <sys/stat.h>   /* mkdir for the diagnostics directory */
 #include <sys/types.h>
+#include <unistd.h>     /* readlink, to anchor diagnostics beside the exe */
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -96,18 +97,65 @@ static int    s_sym_initialized = 0;
  * 42-second startup freeze from a stack trace instead of guesswork. So keep it
  * findable and uploadable, just not underfoot -- and put the freeze dumps
  * beside it for the same reason. */
-#define HB_DIR         "diagnostics"
-#define HB_FILE        HB_DIR "/psx_freeze_heartbeat.json"
+#define HB_DIR_NAME    "diagnostics"
+
+/* Resolved once at startup and anchored to the EXECUTABLE, not the working
+ * directory. A relative path followed the cwd, so launching through a shortcut
+ * with a different start-in folder scattered diagnostics somewhere unrelated --
+ * and the one place they are actually wanted is next to the install they came
+ * from. Falls back to the plain relative name if the executable cannot be
+ * located, which is the old behaviour and still better than not writing. */
+static char s_hb_dir[1024];
+static char s_hb_path[1100];
+static char s_hb_tmp[1120];
+
+static void hb_resolve_paths(void) {
+    char exe[1024];
+    size_t n = 0;
+    exe[0] = '\0';
+#ifdef _WIN32
+    {
+        DWORD got = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+        if (got == 0 || got >= sizeof(exe)) exe[0] = '\0';
+    }
+#else
+    {
+        ssize_t got = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (got > 0) exe[(size_t)got] = '\0'; else exe[0] = '\0';
+    }
+#endif
+    if (exe[0]) {
+        char *cut = strrchr(exe, '/');
+#ifdef _WIN32
+        char *alt = strrchr(exe, '\\');
+        if (alt && (!cut || alt > cut)) cut = alt;
+#endif
+        if (cut) { *cut = '\0'; n = strlen(exe); }
+    }
+    if (n && n + sizeof(HB_DIR_NAME) + 2 < sizeof(s_hb_dir))
+        snprintf(s_hb_dir, sizeof(s_hb_dir), "%s/%s", exe, HB_DIR_NAME);
+    else
+        snprintf(s_hb_dir, sizeof(s_hb_dir), "%s", HB_DIR_NAME);
+
+    snprintf(s_hb_path, sizeof(s_hb_path), "%s/psx_freeze_heartbeat.json",
+             s_hb_dir);
+    snprintf(s_hb_tmp, sizeof(s_hb_tmp), "%s.tmp", s_hb_path);
+}
 #define HB_INTERVAL_MS 100u
+
+/* Ticks between FILE writes while nothing is wrong. Sampling and wedge
+ * detection still run every tick; see the note at the write site. 50 ticks at
+ * 100 ms = one write every 5 seconds. */
+#define HB_WRITE_EVERY_TICKS 50u
 
 /* Best-effort; a failure just means the writes below fail too, which is
  * already handled everywhere they happen. Called before each write rather
  * than once at startup so a deleted directory heals on its own. */
 static void hb_ensure_dir(void) {
 #ifdef _WIN32
-    CreateDirectoryA(HB_DIR, NULL);
+    CreateDirectoryA(s_hb_dir, NULL);
 #else
-    mkdir(HB_DIR, 0755);
+    mkdir(s_hb_dir, 0755);
 #endif
 }
 
@@ -509,7 +557,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     char path[160];
     hb_ensure_dir();
     snprintf(path, sizeof(path),
-             HB_DIR "/psx_freeze_dump_%s_%lld.json", s_backend, wall);
+             "%s/psx_freeze_dump_%s_%lld.json", s_hb_dir, s_backend, wall);
 
     FILE *f = fopen(path, "wb");
     if (!f) { freeze_dump_unlock(); return; }
@@ -1057,23 +1105,46 @@ static void heartbeat_write(void) {
     m = snprintf(buf + n, sizeof(buf) - (size_t)n, "\n}\n");
     if (m > 0) n += m;
 
+    /* Everything above is sampling and detection and stays at the full tick
+     * rate. Only the FILE WRITE is throttled, and only while nothing is wrong.
+     *
+     * The snapshot is ~21 KB. Written every tick that was ~221 KB/s, about
+     * 19.5 GB across a day of play, on every player's disk forever. The
+     * rationale above this function still claimed "~1 KB/sec" -- true when it
+     * was written, before the snapshot grew CPU registers, the scratchpad and
+     * RAM peeks.
+     *
+     * What the continuous write actually buys is one thing: state on disk if
+     * the process is force-closed while healthy, since a kill runs no handler.
+     * Five seconds of resolution is ample for that. The moment any detector
+     * trips, this drops back to writing every tick, so an actual freeze is
+     * still captured at full rate -- which is the case the file exists for.
+     *
+     * Cost of the trade: a force-close during a healthy run can lose up to
+     * five seconds of context. Cost avoided: ~50x the disk churn. */
+    {
+        static unsigned s_write_tick = 0;
+        const int urgent = (s_last_wedge_kind != 0) || g_psx_fatal_reason != 0;
+        const int due = (s_write_tick % HB_WRITE_EVERY_TICKS) == 0;
+        s_write_tick++;
+        if (!urgent && !due) return;
+    }
+
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
      * mid-write file and parsing partial JSON. Cheap on Windows
      * (MoveFileEx with REPLACE_EXISTING). */
-    char tmp_path[96];
     hb_ensure_dir();
-    snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
 
-    FILE *f = fopen(tmp_path, "wb");
+    FILE *f = fopen(s_hb_tmp, "wb");
     if (!f) return;
     fwrite(buf, 1, (size_t)n, f);
     fclose(f);
 
 #ifdef _WIN32
-    MoveFileExA(tmp_path, HB_FILE,
+    MoveFileExA(s_hb_tmp, s_hb_path,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 #else
-    rename(tmp_path, HB_FILE);
+    rename(s_hb_tmp, s_hb_path);
 #endif
 }
 
@@ -1095,6 +1166,8 @@ void freeze_heartbeat_start(const char *backend_label) {
      * one extra thread — small enough to keep in production builds for
      * crash forensics. */
     if (s_started) return;
+    /* Before the thread exists, so it never races a half-built path. */
+    hb_resolve_paths();
     if (backend_label && backend_label[0]) {
         size_t n = strlen(backend_label);
         if (n >= sizeof(s_backend)) n = sizeof(s_backend) - 1;
