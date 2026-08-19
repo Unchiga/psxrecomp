@@ -31,6 +31,8 @@
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
 #include "psx_video_menu.h"   /* menu_state: is the dropdown actually open? */
+#include "psx_fusion_db.h"     /* fusion_db/fusion_try: the game's fusion data */
+#include "psx_fusion_assist.h" /* fusion_hand/fusion_list: the live duel hand */
 #include "psx_host_input.h"   /* menu_click/menu_key: drive the overlay UI */
 #include "host_osd.h"         /* osd_toast: exercise the host OSD */
 #include "load_transition_ring.h"
@@ -12213,6 +12215,54 @@ static void handle_card_drops_sim(int id, const char *json)
 }
 
 /* card_drops_state — why MODS > CARD DROPS did or did not add cards. */
+/* fusion_db / fusion_hand / fusion_list / fusion_try — the in-duel fusion
+ * assistant's read-backs. The whole feature is checkable from here before it
+ * draws anything: `fusion_db` says the game's tables were found and how big
+ * they are, `fusion_hand` shows the raw card records the hand is read from,
+ * `fusion_list` says what that hand can make, and `fusion_try` answers for any
+ * two card ids at all. */
+static void handle_fusion_db(int id, const char *json)
+{
+    (void)json;
+    int ready = 0, cards = 0, pairs = 0, groups = 0, members = 0;
+    uint32_t pair_base = 0, equip_base = 0;
+    psx_fusion_db_debug(&ready, &pair_base, &equip_base, &cards, &pairs,
+                        &groups, &members);
+    send_fmt("{\"id\":%d,\"ok\":true,\"ready\":%d,"
+             "\"pair_base\":\"0x%08X\",\"equip_base\":\"0x%08X\","
+             "\"cards_with_fusions\":%d,\"pairs\":%d,"
+             "\"equip_groups\":%d,\"equip_members\":%d}",
+             id, ready, pair_base, equip_base, cards, pairs, groups, members);
+}
+
+static void handle_fusion_hand(int id, const char *json)
+{
+    (void)json;
+    char body[2048];
+    body[0] = 0;
+    psx_fusion_assist_hand_json(body, sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+static void handle_fusion_list(int id, const char *json)
+{
+    (void)json;
+    char body[2048];
+    body[0] = 0;
+    psx_fusion_assist_list_json(body, sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+static void handle_fusion_try(int id, const char *json)
+{
+    const int a = json_get_int(json, "a", 0);
+    const int b = json_get_int(json, "b", 0);
+    char body[256];
+    body[0] = 0;
+    psx_fusion_assist_try_json(body, sizeof body, a, b);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 static void handle_card_drops_state(int id, const char *json)
 {
     (void)json;
@@ -12452,6 +12502,10 @@ static const CmdEntry s_commands[] = {
     { "savestate_menu_state", handle_savestate_menu_state },
     { "rewind_state",      handle_rewind_state },
     { "card_drops_state",  handle_card_drops_state },
+    { "fusion_db",         handle_fusion_db },
+    { "fusion_hand",       handle_fusion_hand },
+    { "fusion_list",       handle_fusion_list },
+    { "fusion_try",        handle_fusion_try },
     { "card_drops_list",   handle_card_drops_list },
     { "frame_pacing",      handle_frame_pacing },
     { "card_drops_p3",     handle_card_drops_p3 },
