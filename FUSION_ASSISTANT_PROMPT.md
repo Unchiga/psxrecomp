@@ -281,3 +281,39 @@ that was plainly on screen and finding it absent. Use `screenshot_present`
   over the bright field it is readable but not as crisp as the game's own bar.
 - Guardian stars are bits 18..25 of the card word, unread and unmeasured.
 - Nothing persists the overlay's on/off state; there is no MODS menu row yet.
+
+---
+
+## DONE — 2026-08-18 session 4. The feature is finished.
+
+Everything above is built, on screen and verified in-game. What landed after
+the overlay first drew:
+
+- **Card table 0x801D4244** (u32 per card by `id-1`: atk, def, type) — so the
+  suggestion can be ranked by what it actually makes.
+- **`fusion_best`**: highest attack, fewest cards, defence breaking ties, and
+  only over lines containing a REAL fusion. A hand that makes nothing says
+  "No fusions in hand" rather than dressing up its biggest card.
+- **Turn gate at 0x8009B1D5** (0 player, 1 opponent). The selection table alone
+  was never enough: through the opponent's turn the game keeps the hand's
+  objects allocated and its records populated and simply draws the cards face
+  DOWN, so every "is the hand pickable" test stayed true. Found by recording a
+  full turn cycle — 49 whole-RAM snapshots each paired with a
+  `screenshot_present`, so samples could be labelled by what was on screen —
+  then keeping bytes constant across all 44 player-turn samples and different
+  across all five opponent-turn ones. Two earlier guesses were counters that
+  differed on a single sample. **Validate a candidate flag across a whole
+  cycle, never one before/after pair.**
+- **Green/red on the name** by whether the picks would summon the suggested
+  card — a RESULT test, not a pick-order test. The order test was wrong and the
+  user found the case: the suggestion is the SHORTEST line, not the only one,
+  and reaching the same card the long way is still reaching it.
+- **VIEW rows** FUSION HINT and SUGGEST FUSION BY, both persisted. They belong
+  in VIEW, not MODS: they only show information, where CARD DROPS changes what
+  the game does.
+- **Rank meter flicker**: hiding is immediate, showing waits twelve steady
+  frames, so a fusion hides it for the duration instead of strobing.
+- **`screenshot_present`**, because `screenshot` and `screenshot_hires` both
+  resolve before the overlay pass and can see none of this.
+
+Next work is packaging for other people — see `SHARE_BUILD_PROMPT.md`.
