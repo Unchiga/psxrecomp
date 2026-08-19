@@ -69,10 +69,12 @@ int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg);
  * On success fills out_exe with the product binary. On failure fills err_msg
  * and returns 0. `on_progress` may be NULL.
  *
- * On Windows the build half schedules a helper and asks the caller to exit --
- * the running .exe cannot be relinked while it holds its own file. That is
- * reported through out_exe being empty on an otherwise successful return, the
- * same signal the launcher acts on. */
+ * On Windows the build half does not build: the running .exe holds its own file
+ * and cannot be relinked, so it writes a helper .cmd and asks the caller to
+ * exit. It reports that by returning THE HELPER'S PATH in out_exe, not the
+ * product binary. Hand that to psxrecomp_codegen_host_relaunch_or_exit(), which
+ * starts the helper in its own console; the helper waits for this process to
+ * die, builds, and launches the product itself. */
 int psxrecomp_codegen_host_generate_and_build(
     const char* disc_path, char* out_exe, size_t out_cap,
     char* err_msg, size_t err_cap,

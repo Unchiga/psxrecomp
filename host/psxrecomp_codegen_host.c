@@ -3755,13 +3755,27 @@ void psxrecomp_codegen_host_forward_if_built(
 }
 
 #if !defined(PSX_HAS_RECOMP_LAUNCHER)
-/* No launcher to ask which binary to restart, so answer with this process's
- * own image. relaunch_or_exit prefers the freshly built product exe over this
- * whenever it resolved one, so this is the fallback, not the usual answer. */
+/* Which binary to restart, with no launcher to ask.
+ *
+ * On Windows a rebuild cannot happen in this process -- the running .exe holds
+ * its own file and cannot be relinked -- so host_rebuild_game_ex writes a helper
+ * .cmd, sets g_relaunch_is_helper and RETURNS THE HELPER'S PATH as out_exe. A
+ * launcher feeds that back here.
+ *
+ * Answering with this process's own image instead relaunches the SETUP exe,
+ * which re-enters first run, finds the work already done and fails further
+ * along -- seen as a toolchain error raised by a second setup process while the
+ * helper never ran at all and build-release/ stayed empty.
+ *
+ * So: the helper when one is armed, this image otherwise. */
 int recomp_launcher_relaunch_exe(char* out, size_t out_sz) {
     if (!out || out_sz < 2)
         return 0;
     out[0] = '\0';
+    if (g_relaunch_is_helper && g_helper_path[0]) {
+        snprintf(out, out_sz, "%s", g_helper_path);
+        return 1;
+    }
     return host_self_exe_path(out, out_sz);
 }
 #endif
