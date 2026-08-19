@@ -48,6 +48,15 @@ int psx_fusion_assist_list_json(char *out, unsigned cap);
  * the hand. The direct read-back for psx_fusion_db. */
 int psx_fusion_assist_try_json(char *out, unsigned cap, int a, int b);
 
+/* The cards the player has picked so far, in PICK order (which is the order
+ * the game folds them in), and what would stand if they summoned now. Writes
+ * up to `cap` steps and returns how many; `out_result` is the standing card,
+ * 0 when nothing is picked. This is the chain preview's whole logic half. */
+int psx_fusion_assist_chain(PsxFusionCard *steps, int cap, uint16_t *out_result);
+
+/* `fusion_chain`: the above as JSON, with the running result after each pick. */
+int psx_fusion_assist_chain_json(char *out, unsigned cap);
+
 #ifdef __cplusplus
 }
 #endif

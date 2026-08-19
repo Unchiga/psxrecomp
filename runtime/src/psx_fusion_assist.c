@@ -51,6 +51,35 @@
 #include "mod_plugins.h"
 #include "psx_fusion_db.h"
 
+/* ---- the selection the player is building ---------------------------------
+ *
+ * Picking cards with Up does NOT touch the card records — nothing in the whole
+ * 28-byte array moves — so the selection lives elsewhere: a parallel table of
+ * five 12-byte entries at 0x800EA030, one per hand slot.
+ *
+ *     +0  the slot's card object, always present
+ *     +4  the selection marker object; ZERO while the card is unpicked
+ *     +9  the 1-based order in which this card was picked
+ *
+ * with the number picked mirrored in a byte at 0x800E9F25. Measured by picking
+ * slots 4, 1 and 3 in that order and watching entries appear with ordinals
+ * 1, 2, 3. Pressing Up on an already-picked card is a no-op, not a toggle.
+ *
+ * ---- and the order the chain folds in --------------------------------------
+ *
+ * SELECTION order, not left-to-right hand order. Picking slot 4, then 1, then
+ * 3 (Maiden of the Moonlight, Ganigumo, Beaked Snake — no fusion among them)
+ * summoned Beaked Snake, the last card PICKED. Folding by hand position would
+ * have ended on Maiden of the Moonlight, so the two hypotheses are cleanly
+ * separated and this is the one that happened. That also pins the fold's base
+ * case: when a step does not fuse, the incoming card is what stands.
+ */
+#define PSX_FUSION_SELECT     0x800EA030u
+#define PSX_FUSION_SEL_STRIDE 12u
+#define PSX_FUSION_SEL_MARK   4u    /* u32; nonzero => picked */
+#define PSX_FUSION_SEL_ORDER  9u    /* byte; 1-based pick order */
+#define PSX_FUSION_SEL_COUNT  0x800E9F25u
+
 #define PSX_FUSION_RECORDS    0x801A7AE4u
 #define PSX_FUSION_STRIDE     28u
 #define PSX_FUSION_OFF_FLAGS  10u
@@ -176,6 +205,83 @@ int psx_fusion_assist_list_json(char *out, unsigned cap)
                                 hand[hits[k].i].id, hand[hits[k].j].id,
                                 hand[hits[k].i].slot, hand[hits[k].j].slot,
                                 hits[k].result, hits[k].kind);
+    }
+    p += (unsigned)snprintf(out + p, cap - p, "]");
+    return (int)p;
+}
+
+/* One step of the fold: what stands after putting `next` onto `carry`. A step
+ * that does not fuse leaves the incoming card standing, which is what the game
+ * does — so this never returns 0 for a real card. */
+static uint16_t chain_step(uint16_t carry, uint16_t next, int *out_kind)
+{
+    const uint16_t r = psx_fusion_db_result(carry, next, out_kind);
+    return r ? r : next;
+}
+
+int psx_fusion_assist_chain(PsxFusionCard *steps, int cap, uint16_t *out_result)
+{
+    if (out_result) *out_result = 0;
+    if (!steps || cap <= 0) return 0;
+
+    /* Gather the picked slots, ordered by the pick ordinal rather than by slot,
+     * because that is the order the fold runs in. */
+    PsxFusionCard picked[PSX_FUSION_HAND_MAX];
+    uint8_t order[PSX_FUSION_HAND_MAX];
+    int n = 0;
+    for (int slot = 0; slot < PSX_FUSION_HAND_MAX; slot++) {
+        const uint32_t e = PSX_FUSION_SELECT + (uint32_t)slot * PSX_FUSION_SEL_STRIDE;
+        if (!psx_mod_read_word(e + PSX_FUSION_SEL_MARK)) continue;
+        PsxFusionCard c;
+        read_record(slot, &c);
+        if (c.id < 1 || c.id > PSX_FUSION_CARD_ID_MAX) continue;
+        picked[n] = c;
+        order[n] = psx_mod_read_byte(e + PSX_FUSION_SEL_ORDER);
+        n++;
+    }
+    for (int a = 1; a < n; a++) {
+        PsxFusionCard c = picked[a];
+        const uint8_t o = order[a];
+        int b = a - 1;
+        for (; b >= 0 && order[b] > o; b--) {
+            picked[b + 1] = picked[b];
+            order[b + 1] = order[b];
+        }
+        picked[b + 1] = c;
+        order[b + 1] = o;
+    }
+
+    uint16_t carry = n ? picked[0].id : 0;
+    for (int i = 0; i < n && i < cap; i++) steps[i] = picked[i];
+    for (int i = 1; i < n; i++) carry = chain_step(carry, picked[i].id, NULL);
+    if (out_result) *out_result = carry;
+    return n < cap ? n : cap;
+}
+
+int psx_fusion_assist_chain_json(char *out, unsigned cap)
+{
+    if (!out || cap < 192u) return 0;
+    PsxFusionCard steps[PSX_FUSION_HAND_MAX];
+    uint16_t result = 0;
+    const int n = psx_fusion_assist_chain(steps, PSX_FUSION_HAND_MAX, &result);
+
+    unsigned p = 0;
+    p += (unsigned)snprintf(out + p, cap - p,
+                            "\"ready\":%d,\"picked\":%d,\"guest_count\":%u,"
+                            "\"result\":%u,\"steps\":[",
+                            psx_fusion_db_ready(), n,
+                            psx_mod_read_byte(PSX_FUSION_SEL_COUNT), result);
+    /* Replay the fold so each step reports the card standing after it — that
+     * running value IS what the preview shows as the player picks. */
+    uint16_t carry = n ? steps[0].id : 0;
+    for (int i = 0; i < n && p + 160u < cap; i++) {
+        int kind = PSX_FUSION_NONE;
+        if (i) carry = chain_step(carry, steps[i].id, &kind);
+        p += (unsigned)snprintf(out + p, cap - p,
+                                "%s{\"slot\":%u,\"id\":%u,\"carry\":%u,"
+                                "\"kind\":%d}",
+                                i ? "," : "", steps[i].slot, steps[i].id,
+                                carry, kind);
     }
     p += (unsigned)snprintf(out + p, cap - p, "]");
     return (int)p;

@@ -12253,7 +12253,17 @@ static void handle_fusion_list(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
 }
 
+static void handle_fusion_chain(int id, const char *json)
+{
+    (void)json;
+    char body[1024];
+    body[0] = 0;
+    psx_fusion_assist_chain_json(body, sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
 static void handle_fusion_try(int id, const char *json)
+
 {
     const int a = json_get_int(json, "a", 0);
     const int b = json_get_int(json, "b", 0);
@@ -12506,6 +12516,7 @@ static const CmdEntry s_commands[] = {
     { "fusion_hand",       handle_fusion_hand },
     { "fusion_list",       handle_fusion_list },
     { "fusion_try",        handle_fusion_try },
+    { "fusion_chain",      handle_fusion_chain },
     { "card_drops_list",   handle_card_drops_list },
     { "frame_pacing",      handle_frame_pacing },
     { "card_drops_p3",     handle_card_drops_p3 },
