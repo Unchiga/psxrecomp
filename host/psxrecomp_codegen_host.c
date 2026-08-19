@@ -4198,6 +4198,23 @@ int psxrecomp_codegen_host_generate_and_build(
     char gen_out[512];
     if (out_exe && out_cap)
         out_exe[0] = '\0';
+
+    /* Toolchain FIRST, before generate -- not just before the build.
+     *
+     * Generate runs the psxrecomp CLI, which is Python. find_python looks in
+     * the portable toolchain before it looks on PATH, and the cmake-clang-v1
+     * pack ships a CPython, so a player with no system Python is fine once the
+     * pack is installed. Installing it after generate meant they were not:
+     * generate ran first, found no interpreter anywhere, and cmd returned 9009
+     * -- "not recognized as an internal or external command" -- reported as
+     * "psxrecomp generate failed (exit 9009)".
+     *
+     * Ensuring it here also means the download happens before the long step
+     * rather than after it, so a machine that cannot reach the toolchain finds
+     * out in seconds instead of after several minutes of recompilation. */
+    if (!host_ensure_toolchain(on_progress, progress_ctx, err_msg, err_cap))
+        return 0;
+
     if (!host_prepare_generate(disc_path, gen_out, sizeof(gen_out), err_msg,
                                err_cap, on_progress, progress_ctx))
         return 0;

@@ -339,11 +339,11 @@ BIOS dumps, pre-generated game C, or a portable cmake/clang pack. Emitters
 (psxrecomp-game / psxrecomp-bios) and the CLI are inside psxrecomp/.
 
 Standalone:
-1. Install Python 3.
-2. Run ${EXE_BASENAME}.
-3. Provide ${DISC_HINT} (and optional retail SCPH-1001 BIOS; otherwise
+1. Run ${EXE_BASENAME}. Nothing needs installing first -- the setup brings
+   its own compiler and its own Python, and uses yours if you have them.
+2. Provide ${DISC_HINT} (and optional retail SCPH-1001 BIOS; otherwise
    OpenBIOS is regenerated locally).
-4. ${STEP4}
+3. ${STEP4}
 
 THE FIRST RUN TAKES A WHILE - LET IT FINISH.
 
