@@ -1,0 +1,190 @@
+# Next session — in-duel Fusion Assistant
+
+Paste this into a fresh session. It is self-contained; facts below marked
+"verified" were measured this session, not assumed.
+
+---
+
+## THE JOB
+
+Build an **in-duel fusion assistant**: the player opens their hand, and the
+feature tells them what they can fuse. Forbidden Memories has hundreds of
+fusions driven by hidden type rules, and the game gives the player nothing —
+you either memorize a FAQ or you guess. Fix that, natively.
+
+The user's words on quality: *"we want it to feel as natural as possible, we
+want it to feel like its part of the game like everything we've done so far.
+polished, right at home with yugioh forbidden memories."* That is the bar the
+rank meter and CARD DROPS page set: guest-styled, layout-tunable, and
+indistinguishable from something Konami shipped.
+
+**Read `CLAUDE.md` first.** Rule 3 (no printf — every observable is a TCP
+debug command) and rule 4 (never edit `generated/`) are absolute.
+
+## ARCHITECTURE — DECIDED, NOT OPTIONAL
+
+The decomposition campaign (see `DECOMPOSE_MAIN_PROMPT.md`) exists because
+main.cpp grew to 15k lines. **This feature contributes ~3 lines to main.cpp**:
+a hook registration, a tick in the frame loop, a menu-setting handoff. The
+user asked for this explicitly: *"make sure that we try to not have to keep
+the bulk of it in main.cpp."*
+
+Model it on the proven trio:
+
+- **`psx_card_drops.c`** — the template. Owns its guest addresses, its own
+  hook registration (`psx_card_drops_register_hooks`), its debug surface, and
+  its menu setting. main.cpp registers, ticks, and hands it the menu value.
+- **`psx_rank_logic.c` / `psx_rank_meter.c`** — logic vs compositor split:
+  one file reads guest RAM and decides, the other rasterizes a canvas.
+- **`psx_cd_overlay.c` / `psx_cd_sprites.c`** — host-drawn sprites composited
+  over the game. The compositor in `gpu_gl_renderer.c` calls
+  `*_needs_present()` / `*_image()` / `*_origin()`; a new overlay adds one
+  such block there, not a renderer rewrite.
+
+Suggested shape: `psx_fusion_db.c` (the fusion table + queries, no UI),
+`psx_fusion_assist.c` (duel-state reading, hand tracking, what-can-fuse
+logic, debug surface), `psx_fusion_overlay.c` (canvas). Headers in
+`runtime/include`, sources registered in `runtime/runtime.cmake`.
+
+Menu integration: a MODS-menu row via the same one-shot pattern as
+GAME > REWIND (`psx_video_menu_take_rewind` — added 2026-08-18, copy its
+shape) or a cycling option row like CARD DROPS. Persist via the existing
+menu_settings.ini machinery. Layout live-tunable over TCP like
+`card_drops_layout` — **never rebuild to nudge a pixel** (user preference,
+long-standing).
+
+## GROUND TRUTH (verified this session)
+
+- **Savestate: TCP slot 0 = the harness.** The user saved "state 1" in the F7
+  menu, which displays slots 1-based; the file is `slot00`, and loading TCP
+  `{"cmd":"savestate","op":"load","slot":0}` shows the FREE DUEL screen with
+  **Simon Muran** highlighted (WIN 10 LOSS 0) — verified by screenshot. The
+  user stocked the deck with almost every kind of monster on purpose. Press
+  through Simon to get a real duel with a fat, varied hand.
+- **Fusion guides are in the game repo**: `docs/_txt/Fusion FAQ.txt` (10,019
+  lines) and `docs/_txt/Fusion Guide.txt` (4,536 lines), plus the HTML
+  originals one level up. Read the Guide's early sections first — it explains
+  the MODEL: fusions are mostly **general type rules** ([Female] + [Fish] =
+  Amazon of the Seas), layered with specific named pairs, a conflict/
+  precedence system when several rules match, and the property that the
+  result almost always has strictly more attack than both materials (the
+  ~14 exceptions are listed). Equips "fuse" onto monsters by type lists
+  (Dragon Treasure + any dragon + 36 named non-dragons) — that is the
+  "spells fusing" weirdness the user remembers.
+- **The guides are the model, NOT the implementation source.** The game has
+  its own fusion data (it evaluates fusions at runtime), and the assistant
+  must read THAT so it is right by construction. The FAQ is for orientation
+  and for sanity-checking the extracted table.
+
+## RESEARCH PATH (the actual first work)
+
+1. **Find the hand in guest RAM.** Load slot 0, enter the duel. The debug
+   server has `read_ram` / `mem_words` / `watch` / wtrace rings. Card IDs are
+   u16s 1..722; a hand is 5 of them somewhere stable. Cheap trick: save two
+   states that differ by one known card and diff the RAM (`read_ram` the full
+   2MB is one request). The card-name stream (memory note: name = 0x801D0000
+   + u16[0x801D5800 + id*2]) converts IDs to names for eyeballing.
+2. **Find the fusion evaluation.** Perform a known fusion in-duel (guide page
+   ~100 lists cheap pairs, e.g. Zanki + Warrior Elimination = Armored Zombie)
+   with `fntrace` armed; the routine that runs at the moment of fusion leads
+   to the table it reads. Alternatively search RAM/disc for the pair→result
+   pattern using known IDs. The card database loads from disc — the table may
+   be per-card lists in that blob.
+3. **Extract or mirror the table into `psx_fusion_db.c`** — either read it
+   live from guest RAM each boot (preferred: right for any rom revision) or
+   bake it (only if the live read proves impractical; document why).
+4. **Debug surface BEFORE UI** (rule 3, and it de-risks everything): a
+   `fusion_hand` command reporting the hand IDs+names, and `fusion_list`
+   reporting every fusable pair/chain and its result. That alone is a
+   demoable milestone, verifiable against the guides — and the user can
+   confirm in-game by performing a listed fusion.
+5. Only then build the overlay.
+
+Guest-call discipline if any hook ends up calling game code: the **$ra rule**
+(see the card-drop memory / `psx_card_drops.c` comments), and **never poke
+code into a hooked function**.
+
+## UX — DECIDE WITH THE USER, EARLY
+
+The user floated several shapes and explicitly said *"i really dont know"*.
+They are available to test in-game — prototype cheap, show, iterate. Their
+ideas, with what this session can add:
+
+- **Free buttons exist**: while navigating the hand with no card selected,
+  Circle, L1 and R1 do nothing. Any of them can open/toggle the assistant
+  without colliding with the game. (Verify in-duel before relying on it.)
+- **(a) Overlay browser**: L1/R1/Circle opens a panel listing everything the
+  current hand can make. Most complete; model the panel on the rewind
+  filmstrip / savestate menu (canvas + pause-free overlay, mouse optional).
+- **(b) Hover highlight**: hovering a card marks the other hand cards it can
+  fuse with (host-drawn markers over the hand, like the "New!" sprites), and
+  maybe names the result. Natural, but the user spotted the limit
+  themselves: it only shows one step, not what to do with the RESULT.
+- **(c) Chain preview**: the game already fuses multi-selected cards left to
+  right, two at a time. Mirror that: as the player selects cards (their
+  native Up-press selection), show the running result of the chain so far.
+  This answers the "what about the card it makes" problem exactly, because
+  the chain preview IS iterated fusion. Likely the most "part of the game"
+  feeling of the three, and it composes with (a).
+- **(d) Best-by-attack**: a one-line "best fusion available: X (atk N)"
+  readout, like the rank meter's status line. Cheap once fusion_list exists.
+
+A sane arc: fusion_list debug command → (d) as the first visible slice →
+then (a) or (c) per the user's taste after they play with it. Note fusions
+can also target monsters already ON the field — guides cover it; keep scope
+hand-only first and say so.
+
+## VERIFICATION
+
+- The two standing oracles must stay identical: boot log (19 lines,
+  `--no-launcher`, byte-stable) and the card-drops snapshot (slot 2 → 40
+  drops → distinct 28 / total 39 → page 3 active). Recipes in
+  `DECOMPOSE_MAIN_PROMPT.md` §HOW TO VERIFY.
+- The feature's own oracle: `fusion_list` output vs the guide's pair lists
+  (sample, don't transcribe), and the decisive check — perform a predicted
+  fusion in-game and the result card matches. The user will play; ask.
+- Every new state gets a TCP readback the same commit it lands (the
+  `savestate_menu_state` / `rewind_state` precedent — both exist because a
+  refactor could otherwise break silently).
+
+## PROJECT / BUILD (unchanged facts, hard-won)
+
+Root `C:\dev\memories\YuGiOhForbiddenMemoriesRecomp`; `psxrecomp/` is a
+junction to `C:\dev\memories\psxrecomp-master` (git repo; commit per
+verified step). `cmake --build build-dbg -j` (debug + TCP on 4370),
+`cmake --build build -j` (release). Both builds have `PSX_REWIND=ON` now.
+
+- `C:\msys64\mingw64\bin` FIRST on PATH or compiles fail silently; from Bash
+  also `export USERPROFILE` or ccache aborts.
+- **Kill the exe before building** ("Permission denied" at link = code was
+  fine). Launch with `SDL_JOYSTICK_DIRECTINPUT=0`, detached.
+- The tree is CRLF (`psx_video_menu.c` is bare-LF): read with `newline=''`,
+  detect the terminator, translate needles into it; `open(newline='\r\n')`
+  on CRLF content makes `\r\r\n` which still compiles. Heredocs through Bash
+  mangle backslashes — write scripts with the file-writing tool.
+- Grep a candidate file for `std::`/`nullptr`/`class` before choosing C vs
+  C++ for a new module; C is house style where it fits cleanly.
+- The launcher (`recomp-ui`) is not buildable in this checkout; netplay is
+  not needed (user said so) and `lib/recomp-net` is an empty submodule.
+- `menu_key` pushes SDL events — it cannot fake `SDL_GetKeyboardState`
+  polling. Guest-side button reads are immune to that limitation.
+
+## SAVESTATE SLOTS (TCP numbering; F7 UI shows +1)
+
+| TCP | contents |
+|---|---|
+| 0 | **FREE DUEL over Simon Muran — the fusion harness** (verified) |
+| 2 | results screen (card-drops harness) |
+| 5/6 | chest |
+| 7 | 2182-card collection |
+| 10 | **user's current spot — DO NOT CLOBBER** |
+| 11 | frozen duel repro (bug #1; guest parked in BIOS VSync spin) |
+
+**Check a slot before writing it.** One was overwritten once by not looking.
+
+## STILL OPEN (not this task; don't regress)
+
+- Rank meter scoring path unverified (needs a live duel — this task will
+  finally provide one; glance at `rank_meter_state` while you're there).
+- Bug #1 duel soft-lock (slot 11), bug #4 results-screen zoom
+  (unreproduced). See `ISSUES.md`.
