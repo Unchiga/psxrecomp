@@ -214,15 +214,23 @@ if [[ "${EXE_BASENAME}" == *.exe ]]; then
   shopt -u nullglob
 fi
 
-if [[ ! -d "${EXE_DIR}/assets/fonts" || ! -d "${EXE_DIR}/assets/img" ]]; then
+# assets/{fonts,img} belong to the recomp-ui launcher. A project built with
+# PSX_RECOMP_UI=OFF has no launcher and therefore none of them — that is a
+# supported product shape, not a broken build: the runtime asks for the BIOS
+# and the disc itself on first run. Only a project that HAS recomp-ui can be
+# missing them by mistake, so that is the only case that still fails.
+if [[ -d "${EXE_DIR}/assets/fonts" && -d "${EXE_DIR}/assets/img" ]]; then
+  mkdir -p "${STAGE}/assets"
+  cp -a "${EXE_DIR}/assets/fonts" "${STAGE}/assets/"
+  cp -a "${EXE_DIR}/assets/img" "${STAGE}/assets/"
+  if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/boxart.tga" ]]; then
+    cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
+  fi
+elif [[ -d "${ROOT}/recomp-ui" ]]; then
   echo "error: ${EXE_DIR}/assets/{fonts,img} missing — rebuild psx-runtime" >&2
   exit 1
-fi
-mkdir -p "${STAGE}/assets"
-cp -a "${EXE_DIR}/assets/fonts" "${STAGE}/assets/"
-cp -a "${EXE_DIR}/assets/img" "${STAGE}/assets/"
-if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/boxart.tga" ]]; then
-  cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
+else
+  echo "no recomp-ui in this project — staging a launcher-less host"
 fi
 
 copy_proj() {
@@ -255,17 +263,18 @@ copy_tree_filtered() {
     find "${dest}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     find "${dest}" -type d \( -name 'build' -o -name 'build-*' \) -prune -exec rm -rf {} + 2>/dev/null || true
   fi
+  # Memory-card images are somebody's saves. Working trees accumulate them
+  # (test fixtures, a developer's own card), and a release must carry none.
+  # Done here, after BOTH branches, on purpose: the no-rsync fallback above
+  # ignores every --exclude it is handed, so a filter argument alone would
+  # quietly ship these on any machine without rsync.
+  find "${dest}" -type f \( -name '*.mcd' -o -name '*.mcr' \) -delete 2>/dev/null || true
 }
 
 if [[ ! -d "${ROOT}/psxrecomp" ]]; then
   echo "error: ${ROOT}/psxrecomp missing (expected framework submodule)" >&2
   exit 1
 fi
-if [[ ! -d "${ROOT}/recomp-ui" ]]; then
-  echo "error: ${ROOT}/recomp-ui missing (expected UI submodule)" >&2
-  exit 1
-fi
-
 copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude '.git' \
   --exclude 'recompiler/build' \
@@ -274,10 +283,12 @@ copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude 'build' \
   --exclude 'build-*'
 
-copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
-  --exclude '.git' \
-  --exclude 'build' \
-  --exclude '__pycache__'
+if [[ -d "${ROOT}/recomp-ui" ]]; then
+  copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
+    --exclude '.git' \
+    --exclude 'build' \
+    --exclude '__pycache__'
+fi
 
 # Never ship game generated C or common disc working trees.
 rm -rf "${STAGE}/generated" "${STAGE}/bpe" "${STAGE}/motk" "${STAGE}/disc"
@@ -339,8 +350,19 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
   cd "${STAGE}"
   if command -v zip >/dev/null 2>&1; then
     zip -r -q "${DIST}/${ZIP_NAME}" .
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -bso0 -bsp0 "${DIST}/${ZIP_NAME}" . >/dev/null
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    # The release target is Windows, where `zip` is not standard — MSYS ships
+    # it only if selected, so requiring it made the last step of a release fail
+    # on an otherwise complete stage. Compress-Archive is always present.
+    # -Force overwrites a stale archive from a previous run of the same tag.
+    rm -f "${DIST}/${ZIP_NAME}"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "Compress-Archive -Path '.\\*' -DestinationPath '$(cygpath -w "${DIST}/${ZIP_NAME}" 2>/dev/null || echo "${DIST}/${ZIP_NAME}")' -Force" \
+      || { echo "error: Compress-Archive failed" >&2; exit 1; }
   else
-    echo "error: zip not found" >&2
+    echo "error: no zip, 7z, or powershell.exe available to build the archive" >&2
     exit 1
   fi
 )

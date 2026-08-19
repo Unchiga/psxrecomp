@@ -1471,25 +1471,63 @@ static void write_cached_path(const char* argv0, const char* filename,
     if (f.is_open()) f << path.string() << "\n";
 }
 
+#ifdef _WIN32
+/* These prompts are UTF-8 in source, and they interpolate paths the player
+ * chose, which carry whatever their filesystem holds. MessageBoxA would read
+ * those bytes back in the system ANSI codepage: an em dash (E2 80 94) reaches
+ * a Western desktop as "â€”", and a non-Latin path is mangled outright.
+ * The first thing a new player sees must not look broken, so convert once and
+ * use the wide entry point. */
+static std::wstring widen_utf8(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+#endif
+
 static void launcher_warning(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
     // Headless (--headless / PSX_HEADLESS): NEVER pop a blocking modal — it would
     // hang an unattended/CI/scripted run forever waiting for a click.
-    if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
+    if (!g_headless)
+        MessageBoxW(NULL, widen_utf8(msg).c_str(), widen_utf8(title).c_str(),
+                    MB_OK | MB_ICONWARNING);
 #endif
 }
 
 static void launcher_info(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
-    if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+    if (!g_headless)
+        MessageBoxW(NULL, widen_utf8(msg).c_str(), widen_utf8(title).c_str(),
+                    MB_OK | MB_ICONINFORMATION);
 #endif
 }
 
 /* Game display name for picker dialogs ("Tomba!"); set after the game
  * config loads, before any interactive file resolution. */
 static std::string s_picker_game_name = "PSXRecomp";
+
+/* The dump this build was recompiled from, as published by the title in
+ * [game] disc_crc (a CRC32 over the data track). Set beside s_picker_game_name
+ * and on the same contract: after the config loads, before any interactive
+ * file resolution can consult it.
+ *
+ * A title that publishes this turns the launch-time disc check from advice
+ * into a gate (see validate_disc_for_launch). A title that does not keeps the
+ * historical advisory behaviour, because there is then nothing to check a
+ * candidate dump against. */
+static bool     s_expected_disc_crc_set = false;
+static uint32_t s_expected_disc_crc     = 0;
+
+/* Whether the player was actually asked for a BIOS this launch. A build that
+ * ships its own redistributable BIOS resolves it silently, and then labelling
+ * the disc prompt "Step 2 of 2" points at a step that never happened. */
+static bool s_bios_picker_shown = false;
 
 static bool pick_runtime_file(const char* title, const char* filter,
                               std::filesystem::path& out, const char* cli_flag) {
@@ -1503,21 +1541,38 @@ static bool pick_runtime_file(const char* title, const char* filter,
         return false;
     }
 #ifdef _WIN32
-    char path_buf[4096];
-    std::memset(path_buf, 0, sizeof(path_buf));
+    // Wide throughout, for the same reason the message boxes are: the ANSI
+    // dialog cannot round-trip a path the system codepage does not cover, so a
+    // player whose dump sits under a non-Latin user name could not pick it.
+    // The filter is a double-NUL-terminated run of NUL-separated pairs, so its
+    // length has to be measured rather than strlen'd.
+    size_t filter_len = 0;
+    if (filter) {
+        while (filter[filter_len] != '\0' || filter[filter_len + 1] != '\0')
+            filter_len++;
+        filter_len += 2;  // both terminators
+    }
+    std::wstring wfilter;
+    wfilter.reserve(filter_len);
+    for (size_t i = 0; i < filter_len; i++)
+        wfilter.push_back((wchar_t)(unsigned char)filter[i]);  // filters are ASCII
 
-    OPENFILENAMEA ofn;
+    const std::wstring wtitle = widen_utf8(title ? title : "");
+
+    std::vector<wchar_t> path_buf(4096, L'\0');
+
+    OPENFILENAMEW ofn;
     std::memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = NULL;
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile = path_buf;
-    ofn.nMaxFile = (DWORD)sizeof(path_buf);
-    ofn.lpstrTitle = title;
+    ofn.lpstrFilter = wfilter.empty() ? NULL : wfilter.c_str();
+    ofn.lpstrFile = path_buf.data();
+    ofn.nMaxFile = (DWORD)path_buf.size();
+    ofn.lpstrTitle = wtitle.c_str();
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
 
-    if (!GetOpenFileNameA(&ofn)) return false;
-    out = path_buf;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    out = std::filesystem::path(path_buf.data());
     return true;
 #else
     (void)filter;
@@ -1570,23 +1625,33 @@ struct DiscValidation {
     bool opened = false;
     bool has_header = false;
     bool id_matches = false;
+    bool crc_checked = false;   // the content hash actually ran this launch
+    bool crc_matches = false;
+    uint32_t crc = 0;
+    std::string detected_serial;
     std::string detail;
 };
 
 static DiscValidation validate_disc_image(const std::filesystem::path& selected_path,
-                                          const std::string& game_id) {
+                                          const std::string& game_id,
+                                          bool check_content) {
     // Delegate to the shared disc-identity module so the launch-time check and
-    // the launcher badge can never drift apart. No CRC here — the launch check
-    // only cares about openability / header / serial; the launcher does the
-    // (slower) CRC pass when an expected CRC is configured.
+    // the launcher badge can never drift apart. The content hash is a full pass
+    // over the data track (~500 MB for a PS1 disc), so it runs only when the
+    // caller asks — see disc_content_already_verified().
+    const bool want_crc = check_content && s_expected_disc_crc_set;
     const PSXRecompV4::DiscIdentity id =
-        PSXRecompV4::identify_disc(selected_path, game_id, /*expected_crc*/0,
-                                   /*has_expected_crc*/false, /*compute_crc*/false);
+        PSXRecompV4::identify_disc(selected_path, game_id, s_expected_disc_crc,
+                                   s_expected_disc_crc_set, want_crc);
     DiscValidation v;
-    v.opened     = id.opened;
-    v.has_header = id.has_header;
-    v.id_matches = game_id.empty() ? true : id.serial_matches;
-    v.detail     = id.detail;
+    v.opened          = id.opened;
+    v.has_header      = id.has_header;
+    v.id_matches      = game_id.empty() ? true : id.serial_matches;
+    v.crc_checked     = id.crc_computed;
+    v.crc_matches     = id.crc_matches;
+    v.crc             = id.crc;
+    v.detected_serial = id.detected_serial;
+    v.detail          = id.detail;
     if (id.opened && id.has_header && !v.id_matches && v.detail.empty()) {
         v.detail = "The disc header is readable, but it does not contain the expected game ID " +
                    uppercase_ascii(game_id) + " in the early disc metadata.";
@@ -1594,12 +1659,99 @@ static DiscValidation validate_disc_image(const std::filesystem::path& selected_
     return v;
 }
 
+/* Describe a refused dump in terms a player can act on: what this build needs,
+ * what they actually handed it, and what to go and find. "Wrong disc" sends
+ * people to a forum; naming the release and both fingerprints does not. */
+static std::string disc_mismatch_message(const std::filesystem::path& path,
+                                         const std::string& game_id,
+                                         const DiscValidation& v) {
+    const std::string want_id  = uppercase_ascii(game_id);
+    const std::string want_reg = region_label_from_serial(game_id);
+    const std::string got_id   = v.detected_serial.empty()
+                                     ? std::string("(no serial found)")
+                                     : v.detected_serial;
+    const std::string got_reg  = region_label_from_serial(v.detected_serial);
+
+    char want_crc[24] = "(not published)";
+    if (s_expected_disc_crc_set)
+        std::snprintf(want_crc, sizeof(want_crc), "%08X", s_expected_disc_crc);
+    char got_crc[24] = "(not read)";
+    if (v.crc_checked) std::snprintf(got_crc, sizeof(got_crc), "%08X", v.crc);
+
+    std::string m;
+    if (!v.has_header) {
+        m = "That file is not a PlayStation disc image.\n\n";
+        if (!v.detail.empty()) m += v.detail + "\n\n";
+        m += "This build needs " + want_id +
+             (want_reg.empty() ? "" : " " + want_reg) +
+             ", dumped from your own disc as .cue + .bin (preferred), or as "
+             ".bin / .img / .iso / .car / .chd.\n\n";
+        m += "Selected file:\n" + path.string();
+        return m;
+    }
+
+    if (!v.id_matches)
+        m = "That disc image is a different release from the one this build "
+            "was made from.\n\n";
+    else
+        m = "That disc image is the right game, but it is not the same dump "
+            "this build was made from.\n\n";
+
+    m += "    Needed:  " + want_id + (want_reg.empty() ? "" : " " + want_reg) +
+         "    data-track CRC32 " + want_crc + "\n";
+    m += "    Found:   " + got_id + (got_reg.empty() ? "" : " " + got_reg) +
+         "    data-track CRC32 " + got_crc + "\n\n";
+
+    if (!v.id_matches)
+        m += "This build was recompiled from " + want_id +
+             ". A disc from another region or another printing is a different "
+             "program — this build does not contain its code, so it cannot run "
+             "here. You need a dump of the " + want_id + " release.\n\n";
+    else
+        m += "Same game, different bytes — usually a re-encoded or truncated "
+             "rip, a different printing, or an image edited after dumping. A "
+             "straight dump of the whole disc is what this build needs.\n\n";
+
+    m += "Selected file:\n" + path.string();
+    return m;
+}
+
+/* Decide whether `path` may be mounted as this title's disc.
+ *
+ * When the title publishes its dump's identity ([game] disc_crc) this is a
+ * GATE, not advice: a mismatched dump is refused and the caller asks again.
+ * Mounting a disc this build was not recompiled from lands the guest in code
+ * that is not there, which reaches the player as an unexplained crash — so the
+ * honest place to stop is here, while there is still a message to show.
+ *
+ * Without a published identity the check stays advisory exactly as before:
+ * there is nothing to compare a candidate against, and refusing on the serial
+ * scan alone would lock players out of legitimate variants.
+ *
+ * `check_content` costs a full pass over the data track; callers skip it when
+ * disc_content_already_verified() says this same file already passed.
+ */
 static bool validate_disc_for_launch(const std::filesystem::path& path,
-                                     const std::string& game_id) {
-    const DiscValidation v = validate_disc_image(path, game_id);
+                                     const std::string& game_id,
+                                     bool check_content,
+                                     uint32_t* out_crc) {
+    const DiscValidation v = validate_disc_image(path, game_id, check_content);
+    if (out_crc) *out_crc = v.crc;
     if (!v.opened) {
         launcher_warning("Disc Image Not Found", v.detail + "\n\nSelected path:\n" + path.string());
         return false;
+    }
+    if (s_expected_disc_crc_set) {
+        // Refuse only on a fact this launch actually established: a serial that
+        // disagrees, or a hash that was computed and disagreed. A hash we chose
+        // not to compute is not evidence of anything.
+        const bool content_bad = v.crc_checked && !v.crc_matches;
+        if (!v.has_header || !v.id_matches || content_bad) {
+            launcher_warning((s_picker_game_name + " — wrong disc image").c_str(),
+                             disc_mismatch_message(path, game_id, v));
+            return false;
+        }
+        return true;
     }
     if (!v.has_header || !v.id_matches) {
         launcher_warning("Disc Image Warning",
@@ -1769,6 +1921,7 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
 
     /* 3. This title requires a retail BIOS: ask for one. */
     const std::string accepted = bios_accepted_images();
+    s_bios_picker_shown = true;
     launcher_info((s_picker_game_name + " — PlayStation BIOS needed").c_str(),
         s_picker_game_name + " requires a PlayStation BIOS.\n\n"
         "Step 1 of 2 — PlayStation BIOS\n\n"
@@ -1795,13 +1948,118 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
     }
 }
 
+/* Sidecar recording the dump that last passed the full content check, so a
+ * verified disc is not re-hashed on every launch — a ~500 MB pass would add
+ * seconds to every boot of a game people launch repeatedly.
+ *
+ * Deliberately NOT folded into disc.cfg: that file is a bare path, written
+ * from several unrelated places, and any of them would silently drop a second
+ * line it did not know about.
+ *
+ * The stat fields are what keep skipping honest — they are how a later launch
+ * notices that the file at this path is no longer the file that was verified.
+ */
+struct DiscVerifyRecord {
+    std::filesystem::path path;
+    uint32_t crc = 0;
+    uint64_t size = 0;
+    int64_t  mtime = 0;
+    bool     valid = false;
+};
+
+static bool disc_stat(const std::filesystem::path& p, uint64_t& size, int64_t& mtime) {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(p, ec);
+    if (ec) return false;
+    const auto tm = std::filesystem::last_write_time(p, ec);
+    if (ec) return false;
+    size  = (uint64_t)sz;
+    mtime = (int64_t)tm.time_since_epoch().count();
+    return true;
+}
+
+static DiscVerifyRecord read_disc_verify_record(const char* argv0) {
+    DiscVerifyRecord r;
+    std::ifstream f(sidecar_cfg_path(argv0, "disc_verified.cfg"));
+    if (!f.is_open()) return r;
+    std::string line;
+    if (!std::getline(f, line)) return r;
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    // An unrecognised format means re-verify, never "assume it passed".
+    if (line != "psxrecomp-disc-verify-v1") return r;
+    std::string path_str;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        if (key == "path")       path_str = val;
+        else if (key == "crc")   r.crc   = (uint32_t)std::strtoul(val.c_str(), nullptr, 16);
+        else if (key == "size")  r.size  = (uint64_t)std::strtoull(val.c_str(), nullptr, 10);
+        else if (key == "mtime") r.mtime = (int64_t)std::strtoll(val.c_str(), nullptr, 10);
+    }
+    if (path_str.empty()) return r;
+    r.path  = path_str;
+    r.valid = true;
+    return r;
+}
+
+static void write_disc_verify_record(const char* argv0,
+                                     const std::filesystem::path& path,
+                                     uint32_t crc) {
+    uint64_t size = 0; int64_t mtime = 0;
+    if (!disc_stat(path, size, mtime)) return;
+    std::ofstream f(sidecar_cfg_path(argv0, "disc_verified.cfg"), std::ios::trunc);
+    if (!f.is_open()) return;
+    char crc_hex[16];
+    std::snprintf(crc_hex, sizeof(crc_hex), "%08X", crc);
+    f << "psxrecomp-disc-verify-v1\n"
+      << "path="  << path.string() << "\n"
+      << "crc="   << crc_hex       << "\n"
+      << "size="  << size          << "\n"
+      << "mtime=" << mtime         << "\n";
+}
+
+/* True when this exact file already passed the content check against the
+ * identity this build expects. Any disagreement — different file, different
+ * size, touched since, or a record written when a DIFFERENT crc was expected
+ * (i.e. a rebuilt title) — falls back to hashing rather than trusting it. */
+static bool disc_content_already_verified(const std::filesystem::path& path,
+                                          const char* argv0) {
+    if (!s_expected_disc_crc_set) return true;   // nothing to verify against
+    const DiscVerifyRecord r = read_disc_verify_record(argv0);
+    if (!r.valid) return false;
+    if (r.crc != s_expected_disc_crc) return false;
+    std::error_code ec;
+    if (!std::filesystem::equivalent(r.path, path, ec) || ec) return false;
+    uint64_t size = 0; int64_t mtime = 0;
+    if (!disc_stat(path, size, mtime)) return false;
+    return size == r.size && mtime == r.mtime;
+}
+
+/* One gate for every source a disc can arrive from — --disc, game.toml, the
+ * remembered pick, the picker — so they cannot drift into different standards
+ * of proof. Hash only when this exact file has not already passed; on a pass,
+ * remember it so the next launch does not pay for the hash again. */
+static bool accept_disc_for_launch(const std::filesystem::path& p,
+                                   const std::string& game_id,
+                                   const char* argv0) {
+    const bool check_content = !disc_content_already_verified(p, argv0);
+    uint32_t crc = 0;
+    if (!validate_disc_for_launch(p, game_id, check_content, &crc)) return false;
+    if (check_content && s_expected_disc_crc_set)
+        write_disc_verify_record(argv0, p, crc);
+    return true;
+}
+
 static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::path& config_disc,
                                                       const char* disc_override,
                                                       const std::string& game_id,
                                                       const char* argv0) {
     if (disc_override && disc_override[0]) {
         std::filesystem::path p = normalize_disc_path_for_launch(disc_override);
-        return validate_disc_for_launch(p, game_id) ? p : std::filesystem::path{};
+        return accept_disc_for_launch(p, game_id, argv0) ? p : std::filesystem::path{};
     }
 
     // A relative disc path in game.toml resolves against the exe dir (never cwd);
@@ -1814,7 +2072,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
             if (!r.empty()) cd = r;
         }
         cd = normalize_disc_path_for_launch(cd);
-        if (std::filesystem::exists(cd) && validate_disc_for_launch(cd, game_id)) {
+        if (std::filesystem::exists(cd) && accept_disc_for_launch(cd, game_id, argv0)) {
             return cd;
         }
     }
@@ -1824,20 +2082,32 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         cached = normalize_disc_path_for_launch(cached);
     }
     if (!cached.empty() && std::filesystem::exists(cached) &&
-        validate_disc_for_launch(cached, game_id)) {
+        accept_disc_for_launch(cached, game_id, argv0)) {
         return cached;
     }
 
+    // A build that ships its own BIOS never showed a step 1, so it must not
+    // announce a step 2. Then the disc is the only thing ever asked for, and
+    // saying so up front is what stops it reading like a broken install.
+    const std::string step_head =
+        s_bios_picker_shown ? std::string("Step 2 of 2 — game disc image")
+                            : std::string("Game disc image");
+    const std::string step_tail =
+        s_bios_picker_shown
+            ? std::string("(This is NOT the BIOS — the BIOS was already chosen.)")
+            : std::string("You are asked this once. The answer is remembered, "
+                          "and later launches start straight into the game.");
     launcher_info((s_picker_game_name + " — game disc image needed").c_str(),
-        "Step 2 of 2 — game disc image\n\n"
+        step_head + "\n\n"
         "In the next window, select your " + s_picker_game_name +
         (game_id.empty() ? std::string() : " (" + game_id + ")") +
         " disc image ripped from your own disc.\n\n"
         "Accepted formats: .cue (preferred, with its .bin next to it), "
-        ".bin, .img, .iso, .car (Steam), or .chd.\n\n"
-        "(This is NOT the BIOS — the BIOS was already chosen.)");
+        ".bin, .img, .iso, .car (Steam), or .chd.\n\n" + step_tail);
     std::string disc_title =
-        s_picker_game_name + " — Step 2 of 2: select " + s_picker_game_name +
+        s_picker_game_name +
+        (s_bios_picker_shown ? " — Step 2 of 2: select " : " — select ") +
+        s_picker_game_name +
         " disc image (.cue / .bin / .img / .iso / .car / .chd)";
     for (;;) {
         std::filesystem::path picked;
@@ -1848,7 +2118,7 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
             return {};
         }
         picked = normalize_disc_path_for_launch(picked);
-        if (validate_disc_for_launch(picked, game_id)) {
+        if (accept_disc_for_launch(picked, game_id, argv0)) {
             write_cached_path(argv0, "disc.cfg", picked);
             return picked;
         }
@@ -10166,6 +10436,10 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
 #endif
 
     if (!boot.game_name.empty()) s_picker_game_name = boot.game_name;
+    /* Publish the expected dump identity on the same contract as the picker
+     * name: after the config has loaded, before any disc resolution reads it. */
+    s_expected_disc_crc_set = boot.game_has_disc_crc;
+    s_expected_disc_crc     = boot.game_disc_crc;
 
     /* Layer the launcher-written settings.toml (next to the exe) over the
      * bundled game.toml. Any field present there overrides the config value;
