@@ -34,3 +34,14 @@ mods/state.toml
 *.swp
 Thumbs.db
 .DS_Store
+
+# Artifacts a setup-host run drops into this tree. disc.cfg is the worst of
+# them: it records the LOCAL path to the player's disc image.
+disc.cfg
+bios.cfg
+psx_last_run_report.json
+psx_crash.txt
+psx_freeze_heartbeat.json
+psx_screenshot.bmp
+__pycache__/
+/toolchain

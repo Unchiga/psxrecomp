@@ -3863,6 +3863,14 @@ int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg) {
     g_ready = 1;
     activate_toolchain_path();
     (void)find_python(g_python, sizeof(g_python));
+    /* Where to build, which cmake, which exe. _apply() resolves this
+     * separately to decide whether to offer a rebuild row at all; a
+     * launcher-less caller has no row to offer and just needs it done,
+     * or host_rebuild_game_ex refuses with "CMake build environment is
+     * not available" AFTER generate has already run for several
+     * minutes. Not fatal if it fails: generate alone still works, and
+     * the rebuild reports the real reason. */
+    (void)resolve_build_paths();
     return 1;
 }
 
