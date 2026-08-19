@@ -151,6 +151,9 @@ static const char *const SCALING_LABELS[] = { "FILL WINDOW", "INTEGER" };
 static const char *const FILTER_LABELS[]  = { "NEAREST (SHARP)", "LINEAR (SMOOTH)" };
 static const char *const TEXFILTER_LABELS[] = { "NEAREST (SHARP)", "BILINEAR" };
 static const char *const SCREEN_LABELS[]  = { "WINDOWED", "BORDERLESS", "EXCLUSIVE" };
+/* Windowed zoom, indexed by scale-1. */
+static const char *const WSCALE_LABELS[]  = { "1X", "2X", "3X", "4X",
+                                              "5X", "6X", "7X", "8X" };
 /* Index order is the cycle order, not the SDL swap interval: the host maps
  * 0/1/2 -> swap interval 0/1/-1 (see psx_apply_video_menu_state). */
 static const char *const VSYNC_LABELS[]   = { "OFF (LOWEST LAG)", "ON (TEAR-FREE)",
@@ -193,6 +196,7 @@ static PsxVideoMenuState s_state = {
     .filter         = PSX_VM_FILTER_LINEAR,
     .texture_filter = PSX_VM_FILTER_NEAREST,
     .screen         = PSX_VM_SCREEN_WINDOWED,
+    .windowed_scale = PSX_VM_WINDOWED_SCALE_DEFAULT,
     .vsync          = PSX_VM_VSYNC_ON,
     .supersampling  = 1,
     .fast_loads     = PSX_VM_LOADS_OFF,
@@ -275,7 +279,7 @@ static const char *menu_title(int m) {
 static int builtin_rows(int m) {
     if (m == MENU_FILE) return 3;
     if (m == MENU_VIEW) return 1;
-    if (m == MENU_VIDEO) return 6;
+    if (m == MENU_VIDEO) return 7;
     if (m == MENU_AUDIO) return 3;
     if (m == MENU_CHEATS) return 0;   /* titles fill this; empty until they do */
     if (m == MENU_GAME) return 4;
@@ -416,7 +420,8 @@ static const char *row_label(int m, int row) {
         case 1:  return "PRESENT FILTER";
         case 2:  return "TEXTURE FILTER";
         case 3:  return "SCREEN";
-        case 4:  return "VSYNC";
+        case 4:  return "WINDOWED SCALE";
+        case 5:  return "VSYNC";
         default: return "RESOLUTION";
     }
 }
@@ -478,7 +483,12 @@ static const char *row_value(int m, int row) {
         case 2:  return TEXFILTER_LABELS[s_state.texture_filter ? 1 : 0];
         case 3:  return SCREEN_LABELS[(s_state.screen >= 0 && s_state.screen <= 2)
                                           ? s_state.screen : 0];
-        case 4:  return VSYNC_LABELS[(s_state.vsync >= 0 && s_state.vsync <= 2)
+        case 4:  return WSCALE_LABELS[
+                     (s_state.windowed_scale >= PSX_VM_WINDOWED_SCALE_MIN &&
+                      s_state.windowed_scale <= PSX_VM_WINDOWED_SCALE_MAX)
+                         ? s_state.windowed_scale - 1
+                         : PSX_VM_WINDOWED_SCALE_DEFAULT - 1];
+        case 5:  return VSYNC_LABELS[(s_state.vsync >= 0 && s_state.vsync <= 2)
                                           ? s_state.vsync : 1];
         default: return SSAA_LABELS[(s_state.supersampling >= 1 &&
                                      s_state.supersampling <= PSX_VM_SUPERSAMPLING_MAX)
@@ -547,7 +557,15 @@ static const char *row_hint(int m, int row) {
                 : "RAW TEXELS - ORIGINAL LOOK";
         case 3:
             return "ALT+ENTER ALSO TOGGLES";
+        /* Names the precondition instead of silently doing nothing. A row
+         * that ignores you without saying why reads as broken. */
         case 4:
+            return (s_state.screen != PSX_VM_SCREEN_WINDOWED)
+                ? "NEEDS SCREEN = WINDOWED"
+                : (s_state.scaling != PSX_VM_SCALING_INTEGER
+                       ? "NEEDS SCALING = INTEGER"
+                       : "RESIZES THE WINDOW TO WHOLE PIXELS");
+        case 5:
             return s_state.vsync == PSX_VM_VSYNC_OFF
                 ? "LOWEST INPUT LAG - MAY TEAR"
                 : (s_state.vsync == PSX_VM_VSYNC_ADAPTIVE
@@ -599,6 +617,15 @@ static void cycle_row(int m, int row, int delta) {
                 break;
             }
             case 4: {
+                const int span = PSX_VM_WINDOWED_SCALE_MAX -
+                                 PSX_VM_WINDOWED_SCALE_MIN + 1;
+                int v = s_state.windowed_scale + delta;
+                while (v < PSX_VM_WINDOWED_SCALE_MIN) v += span;
+                while (v > PSX_VM_WINDOWED_SCALE_MAX) v -= span;
+                s_state.windowed_scale = v;
+                break;
+            }
+            case 5: {
                 int v = s_state.vsync + delta;
                 while (v < 0) v += 3;
                 while (v > 2) v -= 3;
@@ -1436,6 +1463,10 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "texture_filter")) out->texture_filter = v ? 1 : 0;
         else if (!strcmp(key, "screen"))         out->screen = (v >= 0 && v <= 2) ? v : 0;
         else if (!strcmp(key, "vsync"))          out->vsync  = (v >= 0 && v <= 2) ? v : PSX_VM_VSYNC_ON;
+        else if (!strcmp(key, "windowed_scale")) {
+            if (v >= PSX_VM_WINDOWED_SCALE_MIN && v <= PSX_VM_WINDOWED_SCALE_MAX)
+                out->windowed_scale = v;
+        }
         else if (!strcmp(key, "supersampling")) {
             if (v >= 1 && v <= PSX_VM_SUPERSAMPLING_MAX) out->supersampling = v;
         }
@@ -1509,6 +1540,7 @@ int psx_video_menu_settings_save(const char *path) {
         "present_filter=%d  # 0 nearest (sharp), 1 linear (smooths whole frame)\n"
         "texture_filter=%d  # 0 nearest (sharp), 1 bilinear (in-game textures)\n"
         "screen=%d          # 0 windowed, 1 borderless, 2 exclusive\n"
+        "windowed_scale=%d  # 1..8 window zoom; needs screen=0 and scaling=1\n"
         "vsync=%d           # 0 off (lowest lag, tearing), 1 on, 2 adaptive\n"
         "supersampling=%d   # internal render scale 1..4; applies on next launch\n"
         "speed=%d           # emulation speed multiplier, 1..16 (1 = normal)\n"
@@ -1520,6 +1552,9 @@ int psx_video_menu_settings_save(const char *path) {
         s_state.filter ? 1 : 0,
         s_state.texture_filter ? 1 : 0,
         (s_state.screen >= 0 && s_state.screen <= 2) ? s_state.screen : 0,
+        (s_state.windowed_scale >= PSX_VM_WINDOWED_SCALE_MIN &&
+         s_state.windowed_scale <= PSX_VM_WINDOWED_SCALE_MAX)
+            ? s_state.windowed_scale : PSX_VM_WINDOWED_SCALE_DEFAULT,
         (s_state.vsync >= 0 && s_state.vsync <= 2) ? s_state.vsync : PSX_VM_VSYNC_ON,
         (s_state.supersampling >= 1 &&
          s_state.supersampling <= PSX_VM_SUPERSAMPLING_MAX) ? s_state.supersampling : 1,

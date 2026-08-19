@@ -88,6 +88,10 @@ void gl_renderer_set_integer_scale(int on);
 /* Current guest display size in native PS1 pixels, BEFORE the internal
  * supersampling factor. Set once per present; only used by integer scaling. */
 void gl_renderer_set_present_native_size(int w, int h);
+/* Reads it back, for sizing the window to a whole multiple of the picture.
+ * Both outputs are left UNTOUCHED when nothing has been presented yet, so
+ * the caller's own fallback stands instead of being overwritten with 0. */
+void gl_renderer_get_present_native_size(int *w, int *h);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);

@@ -155,6 +155,12 @@ extern "C" int  psx_game_codegen_generate_and_build(const char* disc_path,
 #include <iphlpapi.h>
 #include <windows.h>
 #include <commdlg.h>
+/* SHGetKnownFolderPath / FOLDERID_Documents: the player-data directory. Asks
+ * Windows where Documents actually is instead of joining %USERPROFILE%, which
+ * is wrong whenever the folder is redirected (OneDrive, roamed profiles). */
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <objbase.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -1465,8 +1471,95 @@ static std::filesystem::path resolve_existing_runtime_path(const char* requested
     return {};
 }
 
+/* ---- player data directory ------------------------------------------------
+ *
+ * Where the PLAYER's own files live: memory cards, save states, settings, the
+ * remembered disc. Deliberately NOT the install directory.
+ *
+ * Updating this game means "download the new zip and extract it", and players
+ * do that two ways. Extract-over-the-top preserves an in-install saves/ only
+ * by luck - because the release zip happens to carry no saves/ - and one
+ * stray addition to the packaging list would silently start overwriting save
+ * data. Extract-into-a-fresh-folder, which is what a Download button
+ * encourages, strands every save in the old folder with no hint that it
+ * happened. Under Documents both are safe, and it is where a player would
+ * think to look.
+ *
+ * PSX_PORTABLE=1, or a portable.txt beside the exe, keeps everything next to
+ * the binary: USB installs, locked-down profiles, and the dev tree - where a
+ * per-user directory would quietly detach the runtime from the saves/ the
+ * repo already carries and make every savestate slot read empty. */
+/* Reported in the boot banner and used for the one-time "your saves moved"
+ * notice, so the player is told rather than left to discover it. */
+static std::string g_player_data_dir;
+static bool        g_player_data_migrated = false;
+
+static bool psx_portable_install(const char* argv0) {
+    if (const char* env = std::getenv("PSX_PORTABLE"))
+        if (env[0] && env[0] != '0') return true;
+    std::error_code ec;
+    return std::filesystem::exists(exe_dir_from_argv(argv0) / "portable.txt", ec);
+}
+
+/* Documents, honouring redirection (OneDrive / roamed profiles) rather than
+ * assuming %USERPROFILE%\Documents - a hardcoded join writes to a folder that
+ * is not the one Explorer shows the player. */
+static std::filesystem::path psx_documents_dir() {
+#ifdef _WIN32
+    PWSTR wide = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &wide)) && wide) {
+        std::filesystem::path p(wide);
+        CoTaskMemFree(wide);
+        if (!p.empty()) return p;
+    }
+    if (const char* up = std::getenv("USERPROFILE"))
+        if (up[0]) return std::filesystem::path(up) / "Documents";
+#else
+    if (const char* home = std::getenv("HOME"))
+        if (home[0]) return std::filesystem::path(home) / "Documents";
+#endif
+    return {};
+}
+
+static std::filesystem::path psx_user_data_dir(const char* argv0) {
+    static std::filesystem::path cached;
+    static bool resolved = false;
+    if (resolved) return cached;
+    resolved = true;
+    if (psx_portable_install(argv0)) {
+        cached = exe_dir_from_argv(argv0);
+        return cached;
+    }
+    std::filesystem::path docs = psx_documents_dir();
+    if (docs.empty()) {          /* no profile at all - stay portable */
+        cached = exe_dir_from_argv(argv0);
+        return cached;
+    }
+    cached = docs / "My Games" / PSX_WINDOW_TITLE;
+    std::error_code ec;
+    std::filesystem::create_directories(cached, ec);
+    if (ec) {                    /* read-only / denied - do not lose saves */
+        cached = exe_dir_from_argv(argv0);
+    }
+    return cached;
+}
+
+/* Player files resolve to the user data dir, but READ falls back to the
+ * install folder so an install that predates this change keeps working even
+ * if its migration was skipped or declined. Write always goes to the new
+ * location, so the fallback fades out on first save rather than persisting. */
 static std::filesystem::path sidecar_cfg_path(const char* argv0, const char* filename) {
-    return exe_dir_from_argv(argv0) / filename;
+    const std::filesystem::path user = psx_user_data_dir(argv0) / filename;
+    std::error_code ec;
+    if (std::filesystem::exists(user, ec)) return user;
+    const std::filesystem::path legacy = exe_dir_from_argv(argv0) / filename;
+    if (std::filesystem::exists(legacy, ec)) return legacy;
+    return user;                 /* neither exists yet: create in the new home */
+}
+
+/* Where a player file should be WRITTEN, ignoring any legacy copy. */
+static std::filesystem::path player_file_path(const char* argv0, const char* filename) {
+    return psx_user_data_dir(argv0) / filename;
 }
 
 static std::filesystem::path read_cached_path(const char* argv0, const char* filename) {
@@ -2354,10 +2447,74 @@ static bool resolve_match_session_bios_path(
 }
 
 // Fallback memcard directory used when no game config (or its [runtime]
-// block) specifies one: the executable's directory (authoritative, never cwd —
-// see exe_dir_from_argv), so saves always live next to the binary.
+// block) specifies one: the player-data directory (Documents/My Games/<title>,
+// or the exe directory for a portable install). Never cwd — see
+// exe_dir_from_argv.
 static std::filesystem::path default_memcard_dir(const char* argv0) {
-    return exe_dir_from_argv(argv0);
+    return psx_user_data_dir(argv0);
+}
+
+/* One-time move of an existing install's player data into the user-data dir.
+ *
+ * COPY, never move: a migration interrupted half way (disk full, denied, power
+ * cut) must not be able to destroy the only copy of someone's memory card. The
+ * originals stay where they are as a fallback, and the marker stops this from
+ * running again and clobbering newer saves with the stale originals on every
+ * subsequent launch — the same marker pattern savestate.c already uses for its
+ * legacy .pst move.
+ *
+ * Returns true when it actually migrated something, so the caller can tell the
+ * player where their saves went. */
+static bool psx_migrate_player_data(const char* argv0,
+                                    const std::filesystem::path& legacy_dir,
+                                    std::filesystem::path* out_dest) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dest = psx_user_data_dir(argv0);
+    if (out_dest) *out_dest = dest;
+    if (dest.empty() || legacy_dir.empty()) return false;
+    if (fs::equivalent(dest, legacy_dir, ec)) return false;   /* portable */
+
+    const fs::path marker = dest / ".migrated";
+    if (fs::exists(marker, ec)) return false;
+
+    /* Anything worth carrying across? Memory cards and save states are the
+     * data that cannot be recreated; the config files are convenience. */
+    bool found = false;
+    for (const char* name : { "card1.mcd", "card2.mcd" })
+        if (fs::exists(legacy_dir / name, ec)) found = true;
+    for (const char* dir : { "openbios", "scph1001" })
+        if (fs::is_directory(legacy_dir / dir, ec)) found = true;
+
+    int copied = 0;
+    if (found) {
+        fs::copy(legacy_dir, dest,
+                 fs::copy_options::recursive |
+                 fs::copy_options::skip_existing, ec);
+        if (ec) {
+            fprintf(stdout, "psxrecomp: player-data migration failed (%s); "
+                            "keeping saves in %s\n",
+                    ec.message().c_str(), legacy_dir.string().c_str());
+            return false;
+        }
+        copied = 1;
+    }
+
+    /* Player config lives beside the exe, not in the memcard dir, so it is
+     * carried over separately. Best-effort: a missing file is normal. */
+    const fs::path exe_dir = exe_dir_from_argv(argv0);
+    for (const char* name : { "menu_settings.ini", "keybinds.ini", "input.ini",
+                              "disc.cfg", "disc_verified.cfg" }) {
+        std::error_code cec;
+        if (fs::exists(exe_dir / name, cec) && !fs::exists(dest / name, cec)) {
+            fs::copy_file(exe_dir / name, dest / name,
+                          fs::copy_options::skip_existing, cec);
+            if (!cec) copied = 1;
+        }
+    }
+
+    { std::ofstream m(marker); m << "player data migrated by psxrecomp\n"; }
+    return copied != 0;
 }
 
 static void close_controller(void);
@@ -4624,6 +4781,98 @@ extern "C" int psx_host_inject_key(int sdl_keycode) {
 static PsxVideoMenuState g_last_applied_vms;
 static bool              g_last_applied_valid = false;
 
+/* Resize the window so an INTEGER-scaled picture lands at exactly N guest
+ * pixels per whole pixel, fully visible.
+ *
+ * Three things make this more than "multiply by N":
+ *
+ * 1. The letterbox reserves a strip at the top for the menu bar, so the
+ *    drawable must be TALLER than N x native_h by that strip. Size it to
+ *    N x native_h alone and the integer snap drops to N-1 the moment the bar
+ *    is up, which reads as "the scale option is off by one".
+ * 2. The strip's height is itself a function of the drawable height
+ *    (psx_video_menu_ui_scale is drawable_h / 480), so the two are mutually
+ *    dependent. Solve by iterating; the ui scale moves in whole steps, so it
+ *    settles in one or two passes rather than oscillating.
+ * 3. SDL window size is in LOGICAL units while the letterbox works in
+ *    drawable pixels, and this is not 1:1 on a high-DPI display (150% here
+ *    gives a drawable half again the window size). Convert with the ratio the
+ *    window actually reports rather than assuming they match.
+ *
+ * The strip is reserved whether or not the bar is currently VISIBLE, so
+ * pressing F10 never rescales the picture under the player - it only uncovers
+ * or covers the space already set aside for it. */
+static void psx_apply_windowed_scale(const PsxVideoMenuState *s) {
+    if (!s || !sdl_window) return;
+    /* Inert outside the one combination it means something in. */
+    if (s->screen != PSX_VM_SCREEN_WINDOWED) return;
+    if (s->scaling != PSX_VM_SCALING_INTEGER) return;
+    if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) return;
+
+    int n = s->windowed_scale;
+    if (n < PSX_VM_WINDOWED_SCALE_MIN) n = PSX_VM_WINDOWED_SCALE_MIN;
+    if (n > PSX_VM_WINDOWED_SCALE_MAX) n = PSX_VM_WINDOWED_SCALE_MAX;
+
+    /* The guest's CURRENT display size, not a hardcoded 320x240: this title
+     * is 320x240 but the mode can change, and the integer snap follows the
+     * live native size. The getter leaves these alone before the first
+     * present, which is why they are seeded rather than passed as zero. */
+    int nw = 320, nh = 240;
+    if (g_gl_active) gl_renderer_get_present_native_size(&nw, &nh);
+    if (nw <= 0 || nh <= 0) { nw = 320; nh = 240; }
+
+    int want_w = nw * n;
+    int want_h = nh * n;
+    for (int i = 0; i < 4; i++) {
+        const int bar = psx_video_menu_bar_height() *
+                        psx_video_menu_ui_scale(want_w, want_h);
+        const int h = nh * n + bar;
+        if (h == want_h) break;
+        want_h = h;
+    }
+
+    int win_w = 0, win_h = 0, dr_w = 0, dr_h = 0;
+    SDL_GetWindowSize(sdl_window, &win_w, &win_h);
+    if (g_gl_active) SDL_GL_GetDrawableSize(sdl_window, &dr_w, &dr_h);
+    else if (sdl_renderer) SDL_GetRendererOutputSize(sdl_renderer, &dr_w, &dr_h);
+    if (win_w <= 0 || win_h <= 0 || dr_w <= 0 || dr_h <= 0) return;
+
+    int set_w = (int)(((double)want_w * win_w) / dr_w + 0.5);
+    int set_h = (int)(((double)want_h * win_h) / dr_h + 0.5);
+    if (set_w < 1 || set_h < 1) return;
+
+    /* Never grow past what the desktop can actually show. Clamping rather
+     * than refusing keeps the row honest at 8x on a small panel: the integer
+     * scaler then picks the largest whole factor that fits, instead of the
+     * window running off the screen with its bottom rows unreachable. */
+    bool clamped = false;
+    SDL_Rect ub;
+    if (SDL_GetDisplayUsableBounds(SDL_GetWindowDisplayIndex(sdl_window), &ub) == 0 &&
+        ub.w > 0 && ub.h > 0) {
+        if (set_w > ub.w) { set_w = ub.w; clamped = true; }
+        if (set_h > ub.h) { set_h = ub.h; clamped = true; }
+    }
+
+    SDL_SetWindowSize(sdl_window, set_w, set_h);
+
+    /* A window that grew off the bottom-right of the desktop would leave its
+     * own title bar out of reach. Nudge it back inside rather than recentring
+     * unconditionally, so a window the player deliberately placed stays put. */
+    if (ub.w > 0 && ub.h > 0) {
+        int wx = 0, wy = 0;
+        SDL_GetWindowPosition(sdl_window, &wx, &wy);
+        int nx = wx, ny = wy;
+        if (nx + set_w > ub.x + ub.w) nx = ub.x + ub.w - set_w;
+        if (ny + set_h > ub.y + ub.h) ny = ub.y + ub.h - set_h;
+        if (nx < ub.x) nx = ub.x;
+        if (ny < ub.y) ny = ub.y;
+        if (nx != wx || ny != wy) SDL_SetWindowPosition(sdl_window, nx, ny);
+    }
+
+    if (clamped)
+        host_osd_push("Window scale limited by display size", 1400);
+}
+
 /* Apply a change the player made in the F10 video menu. The menu module is
  * pure state + UI; all SDL/GL plumbing lives here. */
 static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
@@ -4690,6 +4939,17 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
         g_fullscreen = s->screen;
     }
 
+    /* Windowed zoom. Gated on the three rows that can change what it should
+     * be, NOT run on every apply: this function fires for any option, and
+     * resizing on (say) a VSync toggle would yank a window the player had
+     * sized by hand back to the menu's idea of it. Must run BEFORE the toast
+     * block below, which is where g_last_applied_vms is overwritten. */
+    if (!g_last_applied_valid ||
+        s->windowed_scale != g_last_applied_vms.windowed_scale ||
+        s->scaling        != g_last_applied_vms.scaling ||
+        s->screen         != g_last_applied_vms.screen)
+        psx_apply_windowed_scale(s);
+
     /* Toast the option that actually CHANGED. This used to push the scaling
      * label on every apply, so changing VSync or Free Spending announced
      * "Integer scaling" — invisible while the OSD was gated off, glaring once
@@ -4717,6 +4977,19 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
                           s->screen == PSX_VM_SCREEN_BORDERLESS ? "Borderless"
                         : s->screen == PSX_VM_SCREEN_EXCLUSIVE  ? "Exclusive fullscreen"
                                                                 : "Windowed");
+        } else if (s->windowed_scale != prev.windowed_scale) {
+            /* Says when it is inert, for the same reason the row's hint does:
+             * a toast reading "Window scale: 4x" while nothing moved would be
+             * a lie the player has no way to diagnose. */
+            if (s->screen != PSX_VM_SCREEN_WINDOWED)
+                std::snprintf(msg, sizeof(msg),
+                              "Window scale: %dx (windowed only)", s->windowed_scale);
+            else if (s->scaling != PSX_VM_SCALING_INTEGER)
+                std::snprintf(msg, sizeof(msg),
+                              "Window scale: %dx (needs integer scaling)",
+                              s->windowed_scale);
+            else
+                std::snprintf(msg, sizeof(msg), "Window scale: %dx", s->windowed_scale);
         } else if (s->vsync != prev.vsync) {
             std::snprintf(msg, sizeof(msg), "VSync: %s",
                           s->vsync == PSX_VM_VSYNC_OFF      ? "off"
@@ -10684,6 +10957,34 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
      * by the runtime below. */
     if (boot.memcard_dir.empty()) boot.memcard_dir = default_memcard_dir(argv[0]);
 
+    /* Take player data out of the install folder.
+     *
+     * Done HERE, after the old resolution has run, so the directory it would
+     * have used becomes the migration SOURCE - whatever it was (a game.toml
+     * memcard_dir, the exe dir, a relative path). Guessing the old location
+     * instead would miss any title that configured its own.
+     *
+     * --memcard-dir is honoured untouched: fleet/test runs pass it precisely
+     * to isolate writable state, and silently redirecting it to a shared
+     * per-user folder would make two isolated instances fight over one card. */
+    if (!boot.cli_memcard_dir && !psx_portable_install(argv[0])) {
+        std::error_code mig_ec;
+        std::filesystem::path legacy = boot.memcard_dir;
+        if (legacy.is_relative())
+            legacy = exe_dir_from_argv(argv[0]) / legacy;
+        legacy = legacy.lexically_normal();
+        std::filesystem::path dest;
+        g_player_data_migrated = psx_migrate_player_data(argv[0], legacy, &dest);
+        if (!dest.empty()) {
+            boot.memcard_dir = dest;
+            std::filesystem::create_directories(boot.memcard_dir, mig_ec);
+        }
+        g_player_data_dir = boot.memcard_dir.string();
+        fprintf(stdout, "psxrecomp: player data in %s%s\n",
+                g_player_data_dir.c_str(),
+                g_player_data_migrated ? " (migrated from the install folder)" : "");
+    }
+
     /* The game's OWN native OPTION settings (game_options.toml, next to
      * game.toml) — persisted across launches, kept separate from game.toml
      * (recomp config) and settings.toml (launcher). Values are saved to
@@ -11782,7 +12083,7 @@ static bool init_runtime_devices(char** argv, PsxBootConfig& boot,
         PsxVideoMenuState stored{};
         stored.supersampling = g_video_scale;
         const std::string ss_path =
-            (exe_dir_from_argv(argv[0]) / "menu_settings.ini").string();
+            sidecar_cfg_path(argv[0], "menu_settings.ini").string();
         if (psx_video_menu_settings_load(ss_path.c_str(), &stored) &&
             stored.supersampling >= 1 &&
             stored.supersampling <= PSX_VM_SUPERSAMPLING_MAX) {
@@ -12080,10 +12381,23 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
             return false;
         }
     }
-    load_input_config(exe_dir_from_argv(argv[0]));
+    /* input.ini is player data: it is WRITTEN with defaults when absent, so
+     * pointing it at the install folder is what put it there in the first
+     * place. Migration copies any existing one across. */
+    load_input_config(psx_user_data_dir(argv[0]));
     /* Keyboard binds live in their own file and their own module; load_input_config
      * used to call this on every one of its exit paths. */
-    psx_keybinds_init(argv[0]);
+    /* keybinds.ini is player data too, and psx_keybinds_init WRITES defaults
+     * when the file is absent. Pass the player-data dir with a trailing
+     * separator: derive_ini_path treats a path whose last component has no
+     * extension as a directory, and a title containing a dot would otherwise
+     * be mistaken for a file name and stripped. */
+    {
+        std::string kb_dir = psx_user_data_dir(argv[0]).string();
+        if (!kb_dir.empty() && kb_dir.back() != '/' && kb_dir.back() != '\\')
+            kb_dir.push_back('/');
+        psx_keybinds_init(kb_dir.c_str());
+    }
     /* The launcher / settings.toml / game.toml deadzone (when set) is the
      * user-facing authority; apply it over the input.ini value here, after
      * load_input_config has read input.ini. */
@@ -12801,11 +13115,20 @@ CPUState cpu;
         {
             namespace fs = std::filesystem;
             g_menu_settings_path =
-                (exe_dir_from_argv(argv[0]) / "menu_settings.ini").string();
+                sidecar_cfg_path(argv[0], "menu_settings.ini").string();
             (void)psx_video_menu_settings_load(g_menu_settings_path.c_str(), &vms);
         }
 
         psx_video_menu_init(&vms);
+        /* Tell the player their saves moved, once, on the launch that moved
+         * them. Silently relocating someone's memory cards and leaving them to
+         * work out where they went is how an update gets reported as "it wiped
+         * my save" - the data is fine, but nobody can see it from here. ASCII
+         * only: the OSD font is an 8x8 ASCII sheet and anything else lands as
+         * '?'. */
+        if (g_player_data_migrated)
+            host_osd_push("Saves moved to Documents\\My Games - see the log for the path",
+                          6000);
         /* Baseline for the "what changed" toast, so the first change of the
          * session is announced correctly. */
         g_last_applied_vms   = vms;
@@ -12835,6 +13158,12 @@ CPUState cpu;
          * psx_apply_video_menu_state finally pushed it through. */
         if (g_gl_active) gl_renderer_set_swap_interval(g_video_vsync);
         if (g_vk_active) vk_renderer_set_present_mode(g_video_vsync);
+        /* Same trap as vsync above and GAME SPEED below: psx_apply_video_menu_
+         * state only fires on a CHANGE, so a stored WINDOWED SCALE would leave
+         * the window at its default size until the player nudged the row. The
+         * window and GL context are already up by here (video init runs before
+         * menu_settings.ini is read), so this can size it for real. */
+        psx_apply_windowed_scale(&vms);
         /* Same reason as the rows below: a stored GAME SPEED never reached the
          * pacer, because psx_apply_video_menu_state only fires on a CHANGE and
          * nothing seeded the multiplier here — the menu showed 3x while the

@@ -28,6 +28,12 @@ typedef struct PsxVideoMenuState {
     int filter;          /* PSX_VM_FILTER_*   — final present filter  */
     int texture_filter;  /* PSX_VM_FILTER_*   — in-game texture filter */
     int screen;          /* PSX_VM_SCREEN_*   */
+    /* Windowed zoom, PSX_VM_WINDOWED_SCALE_MIN..MAX. The window is resized
+     * so the picture lands at exactly this many whole pixels per guest
+     * pixel. Inert unless SCREEN is WINDOWED and SCALING is INTEGER: at
+     * FILL the picture stretches to whatever the window is, so a zoom
+     * factor has nothing to mean, and fullscreen has no window to size. */
+    int windowed_scale;
     /* PSX_VM_VSYNC_* — cycle index, NOT the SDL swap interval. The host maps
      * it to 0 / 1 / -1 so the menu order reads worst-lag -> best-lag. */
     int vsync;
@@ -59,6 +65,12 @@ typedef struct PsxVideoMenuState {
 #define PSX_VM_SPEED_MAX 16
 /* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
 #define PSX_VM_SUPERSAMPLING_MAX 4
+/* Windowed zoom bounds. 3x is the default because 1x is unreadably small on
+ * a modern panel, and 3x still fits a 1080p desktop with room for the title
+ * bar (960x720 plus the menu strip). */
+#define PSX_VM_WINDOWED_SCALE_MIN 1
+#define PSX_VM_WINDOWED_SCALE_MAX 8
+#define PSX_VM_WINDOWED_SCALE_DEFAULT 3
 
 /* Disc-load acceleration levels. OFF is the authentic 1x drive. FAST divides
  * the sector delay; INSTANT selects cdrom.c's bounded instant scheduler. Both

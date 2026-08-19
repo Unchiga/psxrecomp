@@ -2573,6 +2573,12 @@ void gl_renderer_set_present_native_size(int w, int h) {
     if (w > 0 && h > 0) { s_native_w = w; s_native_h = h; }
 }
 
+void gl_renderer_get_present_native_size(int *w, int *h) {
+    if (s_native_w <= 0 || s_native_h <= 0) return;   /* nothing presented yet */
+    if (w) *w = s_native_w;
+    if (h) *h = s_native_h;
+}
+
 /* Both derive from psx_video_menu_*, the single definition shared with the
  * software renderer, so the reserved strip always matches the bar drawn. */
 static int menu_ui_scale(int ww, int wh) {

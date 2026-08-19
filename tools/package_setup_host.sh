@@ -357,6 +357,23 @@ built on your machine, from the disc you already own, and never leaves it.
 Shipping a ready-made build would mean shipping Konami's work; this way
 nobody does.
 
+YOUR SAVES ARE NOT IN THIS FOLDER
+
+Memory cards, save states and your settings live in
+
+    Documents\\My Games\\${DISPLAY_NAME}
+
+so updating cannot touch them. Extract a new version wherever you like --
+over the top of the old one or into a brand new folder -- and your saves
+are safe either way. You do not have to copy anything.
+
+Upgrading from a version that kept saves next to the game? The first launch
+copies them across for you and leaves the originals where they are, so
+nothing is lost if you change your mind.
+
+Want everything in this folder instead (USB stick, shared machine)? Put an
+empty file named portable.txt next to ${EXE_BASENAME}, or set PSX_PORTABLE=1.
+
 RetComM uses this same zip: it harvests emitters into a shared SDK cache,
 downloads the toolchain pack (or uses RETCOMM_TOOLCHAIN_DIR), and preserves
 saves/user config across updates.
