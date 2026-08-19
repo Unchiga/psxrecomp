@@ -226,9 +226,33 @@ rematch.
    function, never by line range.
 3. **present path** (~1,550). 102 shared globals, hot path, interpolation
    thread and `s_interp_mutex`. Highest risk — last, with a soak test.
-4. **`debug_server.c`** is 15,038 lines with the same disease. It is a dispatch
-   table of independent handlers, so it splits far more easily — good parallel
-   work when you want a lower-risk win.
+4. **`debug_server.c` — STARTED, and the seam is built.** Was 15,070 lines
+   (~3,700-line core, ~8,300 in 456 handlers, 215 registered commands).
+
+   `debug_server_internal.h` now names what a handler needs from the core:
+   `json_get_int/str/double`, `hex_to_u32`, `json_escape_string`, `send_ok`,
+   `send_err`, the `send_fmt` macro, and `debug_server_cpu()`. That was the
+   only thing forcing one translation unit. First group moved:
+   `debug_cmds_hardware.c` (44 handlers, 1,512 lines) -> **13,583**.
+
+   **Cut by SUBSYSTEM, not by position.** The largest contiguous slab is 1,837
+   lines of adjacent handlers spanning wtrace, mmio, mdec, overlay and cdrom —
+   a file made of that has no identity. Use `groups.py`-style prefix grouping
+   to find themes, then take the range.
+
+   Keep the dispatch table in debug_server.c: it is the only place all 215
+   command names appear together, so it is the file's index. Each moved group
+   gets a small header of handler declarations that the table includes.
+
+   Next groups, largest coherent first: the trace rings (wtrace / call_focus /
+   mmio / rtrace, ~1,200-1,400 lines) — note these span the RECORDING side too
+   (`wtrace_record`, `call_focus_record`) and the ring state, so move all three
+   together or not at all; then overlay/autocompile (~380), then netplay.
+
+   **Oracle: the commands themselves.** Snapshot a set before and after and
+   diff. Compare BY VALUE only what is static (guest memory at a fixed address,
+   settings); everything else reports live counters, DMA in flight or a
+   streaming drive, so assert those merely answer.
 
 ## HOW TO VERIFY (do not skip; this caught real bugs)
 
