@@ -2620,8 +2620,17 @@ static void letterbox_rect_aspect(int ww, int wh, int num, int den,
         }
     }
     *x = (ww - dw) / 2;
-    /* Centre within the area BELOW the reserved strip, not the whole window. */
-    *y = inset + (avail_h - dh) / 2;
+    /* Centre within the area below the reserved strip, not the whole window.
+     *
+     * This y is BOTTOM-origin: every consumer feeds it straight to glViewport
+     * (present_target_quad, interp_draw_quad, the CPU-readout present), and
+     * GL's viewport origin is bottom-left. Shrinking avail_h is therefore the
+     * WHOLE of reserving the top strip - the remaining height no longer
+     * reaches the bar, so centring inside it leaves the gap at the top by
+     * construction. Adding inset here would push the picture UP by the bar's
+     * height instead, reserving the strip at the BOTTOM and sliding the
+     * picture under the very bar it was meant to clear. */
+    *y = (avail_h - dh) / 2;
     *w = dw; *h = dh;
 }
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
