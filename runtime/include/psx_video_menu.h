@@ -195,6 +195,15 @@ int  psx_video_menu_take_savestate(void);
  * snapshot depth is zero) and says so if not. */
 int  psx_video_menu_take_rewind(void);
 
+/* 1 exactly once after the player picks FILE > CHANGE GAME DISC. Same
+ * hands-off contract as the rows above: this module knows nothing about discs
+ * or file pickers and only reports that the row was chosen. The host opens its
+ * own picker, runs the same identity check the launch path runs, and stores
+ * the answer. The dropdown has already collapsed by the time this returns 1,
+ * so the modal dialog does not come back to a menu still holding the
+ * keyboard. */
+int  psx_video_menu_take_pick_disc(void);
+
 /* Bar height in LOGICAL pixels (multiply by the ui scale for drawable px).
  * The renderer reserves this strip at the top so the game is letterboxed
  * BELOW the bar rather than hidden underneath it. */

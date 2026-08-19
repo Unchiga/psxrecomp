@@ -1472,6 +1472,23 @@ static void write_cached_path(const char* argv0, const char* filename,
 }
 
 #ifdef _WIN32
+/* The window these prompts belong to, or NULL before it exists.
+ *
+ * The launch-time BIOS/disc prompts run before any window is created, and NULL
+ * is right for them. FILE > CHANGE GAME DISC raises the same prompts over a
+ * RUNNING game, and there an unowned modal is not merely untidy: closing an
+ * unowned MessageBox with its X or Alt+F4 takes the process down with it —
+ * measured, and specific to the message box, since the same WM_CLOSE on the
+ * (owned) file picker returns to the game normally. Naming the owner also
+ * gives the modal the behaviour a player expects: it stays over the game
+ * window instead of falling behind it. */
+static HWND launcher_dialog_owner(void) {
+    if (!sdl_window) return NULL;
+    return (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window),
+                                        SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                        NULL);
+}
+
 /* These prompts are UTF-8 in source, and they interpolate paths the player
  * chose, which carry whatever their filesystem holds. MessageBoxA would read
  * those bytes back in the system ANSI codepage: an em dash (E2 80 94) reaches
@@ -1494,8 +1511,8 @@ static void launcher_warning(const char* title, const std::string& msg) {
     // Headless (--headless / PSX_HEADLESS): NEVER pop a blocking modal — it would
     // hang an unattended/CI/scripted run forever waiting for a click.
     if (!g_headless)
-        MessageBoxW(NULL, widen_utf8(msg).c_str(), widen_utf8(title).c_str(),
-                    MB_OK | MB_ICONWARNING);
+        MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
+                    widen_utf8(title).c_str(), MB_OK | MB_ICONWARNING);
 #endif
 }
 
@@ -1503,8 +1520,8 @@ static void launcher_info(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
     if (!g_headless)
-        MessageBoxW(NULL, widen_utf8(msg).c_str(), widen_utf8(title).c_str(),
-                    MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
+                    widen_utf8(title).c_str(), MB_OK | MB_ICONINFORMATION);
 #endif
 }
 
@@ -1523,6 +1540,13 @@ static std::string s_picker_game_name = "PSXRecomp";
  * candidate dump against. */
 static bool     s_expected_disc_crc_set = false;
 static uint32_t s_expected_disc_crc     = 0;
+
+/* The disc gate's two inputs, kept for the whole session. FILE > CHANGE GAME
+ * DISC runs from the vblank body, which has neither argv nor the boot config
+ * in scope, and the row must apply exactly the check the launch path applies —
+ * so it reads the same values rather than a second copy that could drift. */
+static std::string s_session_argv0;
+static std::string s_session_game_id;
 
 /* Whether the player was actually asked for a BIOS this launch. A build that
  * ships its own redistributable BIOS resolves it silently, and then labelling
@@ -1564,7 +1588,7 @@ static bool pick_runtime_file(const char* title, const char* filter,
     OPENFILENAMEW ofn;
     std::memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = NULL;
+    ofn.hwndOwner = launcher_dialog_owner();
     ofn.lpstrFilter = wfilter.empty() ? NULL : wfilter.c_str();
     ofn.lpstrFile = path_buf.data();
     ofn.nMaxFile = (DWORD)path_buf.size();
@@ -2051,6 +2075,50 @@ static bool accept_disc_for_launch(const std::filesystem::path& p,
     if (check_content && s_expected_disc_crc_set)
         write_disc_verify_record(argv0, p, crc);
     return true;
+}
+
+/* FILE > CHANGE GAME DISC.
+ *
+ * The launch path already re-asks by itself when a remembered disc has gone
+ * missing, so this row is not that safety net — it is for the player who gets
+ * there first: the dump moved or was renamed and they want to say where it
+ * went before the next launch trips over it, or they keep more than one copy
+ * and want to point at a different one.
+ *
+ * It re-points; it does not remount. Swapping the mounted image out from under
+ * a running guest means resetting the CD drive mid-read, and a disc that
+ * changes underneath a game that is using it is a far worse failure than
+ * asking someone to restart. So the answer is stored and the toast says when
+ * it takes effect.
+ *
+ * The pick runs through accept_disc_for_launch, which is the SAME gate the
+ * launch path runs — a wrong dump is refused here, with the same explanation,
+ * rather than being written into disc.cfg for the next launch to choke on.
+ */
+static void host_change_game_disc(void) {
+    /* No modal in an unattended run; pick_runtime_file refuses too, but
+     * returning here keeps a headless session from printing about it. */
+    if (g_headless) return;
+
+    const std::string title =
+        s_picker_game_name + " — select " + s_picker_game_name +
+        " disc image (.cue / .bin / .img / .iso / .car / .chd)";
+    std::filesystem::path picked;
+    if (!pick_runtime_file(
+            title.c_str(),
+            "PS1 Disc Images (*.cue;*.bin;*.img;*.iso;*.car;*.chd)\0*.cue;*.bin;*.img;*.iso;*.car;*.chd\0All Files (*.*)\0*.*\0",
+            picked, "--disc"))
+        return;   /* cancelled — say nothing, the player just changed their mind */
+
+    picked = normalize_disc_path_for_launch(picked);
+    if (!accept_disc_for_launch(picked, s_session_game_id,
+                                s_session_argv0.c_str()))
+        return;   /* refused; the gate has already said why, in its own dialog */
+
+    write_cached_path(s_session_argv0.c_str(), "disc.cfg", picked);
+    /* ASCII only: the OSD font is an 8x8 bitmap sheet with no glyph for an
+     * em dash, which reaches the screen as "???". */
+    host_osd_push("Disc saved. Restart to load it.", 2500);
 }
 
 static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::path& config_disc,
@@ -5613,6 +5681,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_osd_push("Close save states first", 1200);
             else if (!psx_rewind_toggle() && !psx_rewind_enabled())
                 host_osd_push("Rewind is off (set snapshots above 0)", 1500);
+        }
+        /* FILE > CHANGE GAME DISC. Ordered after the two overlay rows on
+         * purpose: those own the keyboard while they are open, and a modal
+         * file dialog raised over them would return to an overlay that had
+         * been sitting blind. */
+        if (psx_video_menu_take_pick_disc()) {
+            if (savestate_menu_open)
+                host_osd_push("Close save states first", 1200);
+            else if (psx_rewind_is_open())
+                host_osd_push("Close rewind first", 1200);
+            else
+                host_change_game_disc();
         }
         savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
@@ -10440,6 +10520,8 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
      * name: after the config has loaded, before any disc resolution reads it. */
     s_expected_disc_crc_set = boot.game_has_disc_crc;
     s_expected_disc_crc     = boot.game_disc_crc;
+    s_session_argv0   = (argv && argv[0]) ? argv[0] : "";
+    s_session_game_id = boot.game_id;
 
     /* Layer the launcher-written settings.toml (next to the exe) over the
      * bundled game.toml. Any field present there overrides the config value;

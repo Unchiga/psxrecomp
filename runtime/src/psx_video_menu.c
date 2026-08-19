@@ -86,7 +86,11 @@ enum { MENU_FILE = 0, MENU_VIEW = 1, MENU_VIDEO = 2, MENU_AUDIO = 3,
 /* AUDIO rows. MASTER scales everything; MUSIC and SOUND are the split buses. */
 enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2 };
 enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
-enum { ACT_CLOSE = 0, ACT_QUIT = 1 };
+/* ACT_DISC sits between CLOSE and QUIT so QUIT stays the last row, where
+ * players expect it. Safe to renumber: unlike s_item[]'s MENU_* index, these
+ * row constants are never persisted — menu_settings.ini stores options, not
+ * the cursor. */
+enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT = 2 };
 
 #define VM_EDIT_MAX 5   /* digits; 32767 is the widest useful value */
 
@@ -123,6 +127,7 @@ static int s_changed;
 static int s_quit;
 static int s_savestate;
 static int s_rewind;
+static int s_pick_disc;
 
 static int s_lw = 640, s_lh = 480, s_ui = 1;   /* logical size + magnification */
 static int s_hover_menu = -1, s_hover_row = -1;
@@ -229,7 +234,7 @@ static const char *menu_title(int m) {
 }
 
 static int menu_rows(int m) {
-    if (m == MENU_FILE) return 2;
+    if (m == MENU_FILE) return 3;
     if (m == MENU_VIEW) return 4;
     if (m == MENU_VIDEO) return 6;
     if (m == MENU_AUDIO) return 3;
@@ -338,7 +343,9 @@ static void edit_nudge(int delta) {
 
 static const char *row_label(int m, int row) {
     if (m == MENU_FILE)
-        return (row == 0) ? "CLOSE MENU" : "QUIT";
+        return (row == 0) ? "CLOSE MENU"
+             : (row == 1) ? "CHANGE GAME DISC"
+                          : "QUIT";
     if (m == MENU_VIEW)
         return (row == 0) ? "MENU BAR"
              : (row == 1) ? "DUEL RANK"
@@ -446,7 +453,9 @@ static const char *row_hint(int m, int row) {
     if (s_editing && m == s_menu && row == s_item[s_menu])
         return "TYPE DIGITS  ENTER APPLY  ESC CANCEL";
     if (m == MENU_FILE)
-        return (row == 0) ? "CLOSE THIS MENU" : "EXIT THE GAME";
+        return (row == 0) ? "CLOSE THIS MENU"
+             : (row == 1) ? "PICK YOUR DISC AGAIN IF IT MOVED  (APPLIES ON RESTART)"
+                          : "EXIT THE GAME";
     if (m == MENU_VIEW && row == 2)
         return (s_state.fusion_hint == PSX_VM_FUSION_HINT_OFF)
                    ? "SHOW WHAT YOUR HAND CAN FUSE INTO"
@@ -913,6 +922,7 @@ void psx_video_menu_init(const PsxVideoMenuState *initial) {
     s_quit = 0;
     s_savestate = 0;
     s_rewind = 0;
+    s_pick_disc = 0;
     s_hover_menu = s_hover_row = -1;
     s_dirty = 1;
 }
@@ -1165,6 +1175,8 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
                 if (s_menu == MENU_GAME) {
                     if (r == 3) s_rewind = 1;
                     else        s_savestate = 1;
+                } else if (s_menu == MENU_FILE && r == ACT_DISC) {
+                    s_pick_disc = 1;
                 }
                 psx_video_menu_collapse();
             }
@@ -1251,6 +1263,9 @@ int psx_video_menu_handle_key(int key) {
                     if (s_menu == MENU_GAME) {
                         if (s_item[s_menu] == 3) s_rewind = 1;
                         else                     s_savestate = 1;
+                    } else if (s_menu == MENU_FILE &&
+                               s_item[s_menu] == ACT_DISC) {
+                        s_pick_disc = 1;
                     }
                     psx_video_menu_collapse();
                 }
@@ -1291,6 +1306,12 @@ int psx_video_menu_take_rewind(void) {
     int r = s_rewind;
     s_rewind = 0;
     return r;
+}
+
+int psx_video_menu_take_pick_disc(void) {
+    int d = s_pick_disc;
+    s_pick_disc = 0;
+    return d;
 }
 
 /* ---- settings persistence ------------------------------------------------
