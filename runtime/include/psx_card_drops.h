@@ -30,6 +30,15 @@ extern "C" {
  * returns immediately while its gate is closed. */
 void psx_card_drops_register_hooks(void);
 
+/* Stock award count, and the ceiling the menu row accepts. Owned here rather
+ * than by the shared menu: how many cards a duel awards is this game's idea. */
+#define PSX_VM_CARD_DROPS_DEFAULT 1
+#define PSX_VM_CARD_DROPS_MAX 99
+
+/* Adds MODS > CARD DROPS to the overlay menu. Called from this file's mod
+ * constructor, so the row exists wherever this translation unit is linked. */
+void psx_card_drops_register_menu(void);
+
 /* Host-frame update: drives the results page's "New!" sprite overlay. */
 void psx_card_drops_tick(void);
 

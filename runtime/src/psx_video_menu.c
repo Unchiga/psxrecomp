@@ -208,7 +208,6 @@ static PsxVideoMenuState s_state = {
     .rank_meter     = PSX_VM_RANK_OFF,
     .fusion_hint    = PSX_VM_FUSION_HINT_OFF,
     .fusion_by_def  = 0,
-    .card_drops     = PSX_VM_CARD_DROPS_DEFAULT,
 };
 
 /* Inline numeric entry. Active only while the player is typing into a row. */
@@ -245,9 +244,6 @@ static int num_range(int m, int row, int *lo, int *hi) {
     if (m == MENU_GAME && row == 0) {
         *lo = 1; *hi = PSX_VM_SPEED_MAX; return 1;
     }
-    if (m == MENU_MODS && row == 0) {
-        *lo = 1; *hi = PSX_VM_CARD_DROPS_MAX; return 1;
-    }
     if (m == MENU_AUDIO) { *lo = 0; *hi = 100; return 1; }   /* percent */
     return 0;
 }
@@ -257,7 +253,6 @@ static int num_get(int m, int row) {
     if (m == MENU_CHEATS && row == 0) return s_state.life_points;
     if (m == MENU_CHEATS && row == 1) return s_state.starchips;
     if (m == MENU_GAME && row == 0) return s_state.speed;
-    if (m == MENU_MODS && row == 0) return s_state.card_drops;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER) return s_state.vol_master;
         if (row == AUD_MUSIC)  return s_state.vol_music;
@@ -279,7 +274,6 @@ static void num_set(int m, int row, int v) {
     if (m == MENU_CHEATS && row == 0) s_state.life_points = v;
     if (m == MENU_CHEATS && row == 1) s_state.starchips = v;
     if (m == MENU_GAME && row == 0) s_state.speed = v;
-    if (m == MENU_MODS && row == 0) s_state.card_drops = v;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER)     s_state.vol_master = v;
         else if (row == AUD_MUSIC) s_state.vol_music  = v;
@@ -306,7 +300,6 @@ static int builtin_rows(int m) {
     if (m == MENU_VIDEO) return 6;
     if (m == MENU_AUDIO) return 3;
     if (m == MENU_CHEATS) return 4;
-    if (m == MENU_MODS) return 1;
     if (m == MENU_GAME) return 4;
     if (m == MENU_MODS) return 0;   /* mods fill this; empty until they do */
     return 1;
@@ -442,8 +435,6 @@ static const char *row_label(int m, int row) {
              : (row == 1) ? "STARCHIPS"
              : (row == 2) ? "FREE SPENDING"
                           : "ALL CARDS";
-    if (m == MENU_MODS)
-        return "CARD DROPS";
     if (m == MENU_GAME)
         return (row == 0) ? "SPEED"
              : (row == 1) ? "FAST LOADING"
@@ -615,10 +606,6 @@ static const char *row_hint(int m, int row) {
             return (s_state.speed <= 1)
                        ? "1X IS NORMAL SPEED. 1 TO 16"
                        : "FAST FORWARD - AUDIO MAY DISTORT";
-        if (m == MENU_MODS && row == 0)
-            return (s_state.card_drops <= 1)
-                       ? "1 IS STOCK. CARDS PER DUEL WON"
-                       : "SAME DROP POOL - ROLLED ONCE PER CARD";
         return "ENTER TO TYPE A VALUE";
     }
     switch (row) {
@@ -820,7 +807,6 @@ static int row_is_slider(int m, int row) {
     if (!num_range(m, row, &lo, &hi)) return 0;
     if (m == MENU_AUDIO) return 1;
     if (m == MENU_GAME) return 1;                 /* SPEED 1..16 */
-    if (m == MENU_MODS) return 1;                 /* CARD DROPS 1..99 */
     if (m == MENU_CHEATS && row == 0) return 1;   /* LIFE POINTS 1..9999 */
     return 0;                                     /* STARCHIPS stays type-only */
 }
@@ -1577,8 +1563,19 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "rank_meter")) out->rank_meter = (v >= 0 && v <= 3) ? v : 0;
         else if (!strcmp(key, "fusion_hint")) out->fusion_hint = (v >= 0 && v <= 2) ? v : 0;
         else if (!strcmp(key, "fusion_by_def")) out->fusion_by_def = v ? 1 : 0;
-        else if (!strcmp(key, "card_drops")) {
-            if (v >= 1 && v <= PSX_VM_CARD_DROPS_MAX) out->card_drops = v;
+        else {
+            /* Rows a title registered. Clamped to the row's own bounds so a
+             * hand-edited file cannot push a value past what the row accepts. */
+            int i;
+            for (i = 0; i < s_reg_count; i++) {
+                VmRegRow *r = &s_reg[i];
+                if (!r->key || strcmp(key, r->key)) continue;
+                if (r->kind == PSX_VM_ROW_NUMBER)
+                    r->value = (v < r->lo) ? r->lo : (v > r->hi) ? r->hi : v;
+                else if (r->kind == PSX_VM_ROW_OPTION)
+                    r->value = (v >= 0 && v < r->choice_count) ? v : 0;
+                break;
+            }
         }
     }
     fclose(f);
@@ -1607,7 +1604,6 @@ int psx_video_menu_settings_save(const char *path) {
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
         "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n"
         "rank_meter=%d      # 0 off, 1 live duel rank, 2 rank + worst term\n"
-        "card_drops=%d      # cards awarded per duel won, 1..99 (1 = stock)\n"
         "fusion_hint=%d     # 0 off, 1 pick-order numbers, 2 numbers + card\n"
         "fusion_by_def=%d   # 0 suggest best attack, 1 best defense\n",
         s_state.scaling ? 1 : 0,
@@ -1626,11 +1622,20 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,
         (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
         (s_state.rank_meter >= 0 && s_state.rank_meter <= 3) ? s_state.rank_meter : 0,
-        (s_state.card_drops >= 1 && s_state.card_drops <= PSX_VM_CARD_DROPS_MAX)
-            ? s_state.card_drops : PSX_VM_CARD_DROPS_DEFAULT,
         (s_state.fusion_hint >= 0 && s_state.fusion_hint <= 2)
             ? s_state.fusion_hint : 0,
         s_state.fusion_by_def ? 1 : 0);
+    /* Rows a title registered, in registration order. A row with no key is
+     * deliberately not written: a live cheat re-applied at startup would
+     * overwrite the player's real save. */
+    {
+        int i;
+        for (i = 0; i < s_reg_count; i++) {
+            const VmRegRow *r = &s_reg[i];
+            if (!r->key) continue;
+            fprintf(f, "%s=%d\n", r->key, r->value);
+        }
+    }
     fclose(f);
     return 1;
 }

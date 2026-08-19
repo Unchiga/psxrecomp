@@ -4837,15 +4837,6 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
         }
     }
 
-    /* MODS > CARD DROPS. A preference, not a live write: it only changes what
-     * the NEXT won duel awards, so there is nothing to apply to guest state. */
-    {
-        int cd = s->card_drops;
-        if (cd < 1) cd = 1;
-        if (cd > PSX_VM_CARD_DROPS_MAX) cd = PSX_VM_CARD_DROPS_MAX;
-        (void)psx_card_drops_set(cd);
-    }
-
     /* Emulation speed. The wall-clock pacer targets g_frame_period_ms, so a
      * multiplier is just a shorter target period — the guest still runs its
      * normal 59.94 Hz of work per frame, it is simply allowed to do it sooner.
@@ -12771,7 +12762,11 @@ CPUState cpu;
          * immediately). menu_settings.ini still wins, so anyone who turned it
          * off stays off. */
         vms.rank_meter  = PSX_VM_RANK_INGAME;
-        vms.card_drops  = PSX_VM_CARD_DROPS_DEFAULT;
+
+        /* Rows this title owns, registered BEFORE the settings file is read:
+         * a stored value for a registered row has nowhere to land until the
+         * row exists. */
+        psx_card_drops_register_menu();
 
         /* Stored settings override the defaults above, so the player's choices
          * survive a restart. Resolved beside the exe like keybinds.ini. */
@@ -12851,9 +12846,6 @@ CPUState cpu;
          * registers its own hooks; they cost nothing at 1 (every callback
          * returns immediately) so registration is unconditional, which also
          * avoids a second path for a player who raises the value later. */
-        (void)psx_card_drops_set(
-            (vms.card_drops >= 1 && vms.card_drops <= PSX_VM_CARD_DROPS_MAX)
-                ? vms.card_drops : PSX_VM_CARD_DROPS_DEFAULT);
         psx_card_drops_register_hooks();
         psx_rank_logic_arm_sprite_watch();
         gl_renderer_set_integer_scale(vms.scaling == PSX_VM_SCALING_INTEGER);

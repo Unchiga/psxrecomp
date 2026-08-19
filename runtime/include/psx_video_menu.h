@@ -88,23 +88,11 @@ typedef struct PsxVideoMenuState {
      * and folding them together would make six states where two suffice. */
     int fusion_hint;
     int fusion_by_def;
-    /* MODS > CARD DROPS: how many cards a won duel awards, 1..99. 1 is stock.
-     * Unlike the CHEATS rows this is a PREFERENCE, not a live save write — it
-     * changes what the next duel awards and is persisted like any other
-     * setting. The extra cards are rolled by the game's own drop routine, so
-     * they come from the same per-opponent, per-rank pool as the first. */
-    int card_drops;
 } PsxVideoMenuState;
 
 #define PSX_VM_LIFE_POINTS_DEFAULT 8000
 #define PSX_VM_SPEED_DEFAULT 1
 #define PSX_VM_SPEED_MAX 16
-/* Cards awarded per won duel. 1 is stock; the 99 ceiling keeps the value two
- * digits and matches how many New! labels the chest can carry. It is not a
- * game limit — the award routine caps each card at 251 copies, so nothing
- * here can overflow a trunk entry. */
-#define PSX_VM_CARD_DROPS_DEFAULT 1
-#define PSX_VM_CARD_DROPS_MAX 99
 /* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
 #define PSX_VM_SUPERSAMPLING_MAX 4
 

@@ -956,6 +956,26 @@ int psx_card_drops_set(int drops) {
  * nothing while its gate is closed (they return immediately), and doing it
  * once here avoids a second registration path for a player who raises the
  * setting mid-session. */
+/* MODS > CARD DROPS. Registered rather than written into the shared menu:
+ * how many cards a duel awards is this game's idea, and no other title should
+ * compile a row about it.
+ *
+ * A preference, not a live save write, so it carries a settings key and is
+ * restored at startup like any other setting -- the extra cards are rolled by
+ * the game's own drop routine, from the same per-opponent, per-rank pool as
+ * the first. */
+static void cd_row_changed(int value) {
+    (void)psx_card_drops_set(value);
+}
+
+void psx_card_drops_register_menu(void) {
+    (void)psx_video_menu_add_number(
+        PSX_VM_MENU_MODS, "CARD DROPS",
+        "1 IS STOCK. CARDS PER DUEL WON",
+        1, PSX_VM_CARD_DROPS_MAX, /*slider*/1,
+        "card_drops", PSX_VM_CARD_DROPS_DEFAULT, cd_row_changed);
+}
+
 void psx_card_drops_register_hooks(void) {
     (void)psx_mod_register_function_entry_plugin(
         "ygofm.card_drops", PSX_DROP_ROLL_FN, psx_mod_card_drops_on_roll);
