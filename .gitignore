@@ -1,7 +1,7 @@
 # Build outputs
-build/
-build-*/
-recompiler/build/
+/build/
+/build-*/
+/recompiler/build/
 *.exe
 *.dll
 *.o
@@ -12,24 +12,31 @@ recompiler/build/
 *.ilk
 
 # Recompiler output is a build artifact (CLAUDE.md rule 4): regenerate, don't commit
-generated/
+# ANCHORED. Unanchored, this also swallowed
+# recompiler/lib/rabbitizer/**/generated/*.h -- vendored headers that
+# upstream tracks and the recompiler cannot compile without.
+/generated/
 
 # Fetched dependencies
-runtime/third_party/
+# NOT a fetched dependency: upstream tracks runtime/third_party/stb_image.h
+# and psx_window_icon.cpp includes it, so ignoring it left a fresh clone
+# unable to compile. Rule removed deliberately.
 _deps/
 
 # Local runtime state
-saves/
-*.pst
-*.thumb
-*.mcd
+/saves/
+/*.pst
+/*.thumb
+/*.mcd
+# anchored: runtime/tests/*.mcd are fixtures upstream tracks
 menu_settings.ini
 keybinds.ini
 input.ini
 mods/state.toml
 
 # Editor / OS
-.vscode/
+/.vscode/
+# anchored: vendored libs ship their own .vscode upstream
 .idea/
 *.swp
 Thumbs.db
