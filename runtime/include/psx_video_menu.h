@@ -77,6 +77,12 @@ void psx_video_menu_init(const PsxVideoMenuState *initial);
 int  psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out);
 int  psx_video_menu_settings_save(const char *path);
 
+/* Hand every value restored from the settings file to the row that owns it.
+ * Loading only puts the number back in the MENU; the module behind a row
+ * hears about values through its change callback, which a restore does not
+ * fire. Call once the guest is up -- these callbacks touch it. */
+void psx_video_menu_apply_restored(void);
+
 /* Reflect a change made outside the menu (e.g. the fullscreen hotkey) so the
  * menu never shows a stale value. Does not raise a change event. */
 void psx_video_menu_sync_screen(int screen);

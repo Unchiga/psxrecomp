@@ -107,6 +107,9 @@ typedef struct VmRegRow {
     int   mark;              /* notch on the track, or -1 */
     const char *key;         /* menu_settings.ini name; NULL = not persisted */
     int   value;
+    int   restored;          /* value came from the settings file, not the
+                              * registered default -- see
+                              * psx_video_menu_apply_restored */
     void (*on_change)(int);
     void (*on_activate)(void);
 } VmRegRow;
@@ -1454,12 +1457,44 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
                     r->value = (v < r->lo) ? r->lo : (v > r->hi) ? r->hi : v;
                 else if (r->kind == PSX_VM_ROW_OPTION)
                     r->value = (v >= 0 && v < r->choice_count) ? v : 0;
+                r->restored = 1;
                 break;
             }
         }
     }
     fclose(f);
     return 1;
+}
+
+/* Hand every restored value to the row that owns it.
+ *
+ * Loading a setting only put the number back in the MENU. The module
+ * behind the row hears about a value through its change callback, and that
+ * fires on a change -- which a restore is not. So a stored choice showed
+ * correctly in the menu and did nothing in the game until the player nudged
+ * the row, at which point it finally took. Reported as: started with CARD
+ * DROPS reading 99, won one card, and only after lowering and raising it
+ * again did 99 actually apply.
+ *
+ * The builtin rows never had this problem because main.cpp seeded each of
+ * them by hand after the settings file was read. Rows that moved to the
+ * registration API lost that seeding and nothing replaced it.
+ *
+ * Deliberately NOT called from the loader: settings are read long before
+ * the guest exists, and these callbacks touch it -- LIFE POINTS patches a
+ * code word. The runtime calls this once the game is up, alongside the
+ * title start hooks.
+ *
+ * Only rows that actually came from the file are applied. A row sitting at
+ * its registered default is already what the module believes, so firing its
+ * callback would be a behaviour change nobody asked for. */
+void psx_video_menu_apply_restored(void) {
+    int i;
+    for (i = 0; i < s_reg_count; i++) {
+        VmRegRow *r = &s_reg[i];
+        if (!r->restored || !r->on_change) continue;
+        r->on_change(r->value);
+    }
 }
 
 int psx_video_menu_settings_save(const char *path) {

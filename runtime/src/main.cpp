@@ -12863,14 +12863,17 @@ CPUState cpu;
                          vms.fast_loads == PSX_VM_LOADS_INSTANT ? "instant" : "fast",
                          divisor);
         }
-        /* Same reason as FAST LOADING above: psx_apply_video_menu_state only
-         * fires on a CHANGE, so a stored rank-meter choice needs seeding here
-         * or it would stay off until the player toggled the row. */
-        /* Same reason as the rows above: apply_video_menu_state only fires on a
-         * CHANGE, so a stored CARD DROPS value needs seeding here. The mod
-         * registers its own hooks; they cost nothing at 1 (every callback
-         * returns immediately) so registration is unconditional, which also
-         * avoids a second path for a player who raises the value later. */
+        /* Same reason as FAST LOADING above, for every row a title registered:
+         * a change callback fires on a CHANGE, and a restore is not one, so a
+         * stored choice showed correctly in the menu and did nothing in the
+         * game until the player nudged the row.
+         *
+         * The builtin rows were each seeded by hand here. The rows that moved
+         * to the registration API lost that and nothing replaced it, which is
+         * how CARD DROPS came to read 99 at startup while awarding one card.
+         *
+         * After the guest is up, because these callbacks touch it. */
+        psx_video_menu_apply_restored();
         psx_game_run_start_hooks();
         gl_renderer_set_integer_scale(vms.scaling == PSX_VM_SCALING_INTEGER);
     }
