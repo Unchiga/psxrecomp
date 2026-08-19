@@ -82,6 +82,23 @@
  * separated and this is the one that happened. That also pins the fold's base
  * case: when a step does not fuse, the incoming card is what stands.
  */
+/* Whose turn it is: 0 the player, 1 the opponent.
+ *
+ * The selection table alone is NOT enough of a gate. During the opponent's
+ * turn the game keeps the hand's card objects allocated and the records
+ * populated -- it just draws the cards face DOWN -- so every "is the hand
+ * pickable" test built from them stays true and the hint kept giving advice
+ * while the player could not act on it.
+ *
+ * Found by recording a full turn cycle: 49 whole-RAM samples, each paired with
+ * a composited screenshot so every sample could be labelled by what was
+ * actually on screen rather than by assumption, then keeping only the bytes
+ * that held one value across all 44 player-turn samples and a different one
+ * across all five opponent-turn samples -- including the summon animations,
+ * which belong to whoever's turn they happen in. Four bytes survived; this is
+ * the only one that also stayed put through the next turn's animations. */
+#define PSX_FUSION_TURN       0x8009B1D5u
+
 #define PSX_FUSION_SELECT     0x800EA030u
 #define PSX_FUSION_SEL_STRIDE 12u
 #define PSX_FUSION_SEL_MARK   4u    /* u32; nonzero => picked */
@@ -101,6 +118,12 @@
 static uint32_t rec_addr(int slot)
 {
     return PSX_FUSION_RECORDS + (uint32_t)slot * PSX_FUSION_STRIDE;
+}
+
+/* Can the player act on their hand at all right now? */
+static int players_turn(void)
+{
+    return psx_mod_read_byte(PSX_FUSION_TURN) == 0u;
 }
 
 /* Is this hand position currently a pickable card? */
@@ -132,6 +155,7 @@ static void read_record(int slot, PsxFusionCard *c)
 int psx_fusion_assist_hand(PsxFusionCard *out, int cap)
 {
     if (!out || cap <= 0) return 0;
+    if (!players_turn()) return 0;
     int n = 0;
     for (int slot = 0; slot < PSX_FUSION_HAND_MAX && n < cap; slot++) {
         if (!slot_pickable(slot)) continue;
@@ -453,10 +477,11 @@ int psx_fusion_assist_best_json(char *out, unsigned cap)
 
 /* Hand gate state for `fusion_hand`: which slots the game currently treats as
  * pickable, and the selection count it keeps alongside them. */
-void psx_fusion_assist_hand_source(int *mask, int *sel_count)
+void psx_fusion_assist_hand_source(int *mask, int *sel_count, int *turn)
 {
     if (mask)      *mask      = hand_gate_mask();
     if (sel_count) *sel_count = psx_mod_read_byte(PSX_FUSION_SEL_COUNT);
+    if (turn)      *turn      = (int)psx_mod_read_byte(PSX_FUSION_TURN);
 }
 
 int psx_fusion_assist_try_json(char *out, unsigned cap, int a, int b)

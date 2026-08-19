@@ -12274,10 +12274,10 @@ static void handle_fusion_hand(int id, const char *json)
     char body[2048];
     body[0] = 0;
     psx_fusion_assist_hand_json(body, sizeof body);
-    int mask = 0, sel = 0;
-    psx_fusion_assist_hand_source(&mask, &sel);
-    send_fmt("{\"id\":%d,\"ok\":true,\"gate_mask\":\"0x%02X\",\"sel_count\":%d,%s}",
-             id, (unsigned)mask, sel, body);
+    int mask = 0, sel = 0, turn = 0;
+    psx_fusion_assist_hand_source(&mask, &sel, &turn);
+    send_fmt("{\"id\":%d,\"ok\":true,\"gate_mask\":\"0x%02X\",\"sel_count\":%d,\"turn\":%d,%s}",
+             id, (unsigned)mask, sel, turn, body);
 }
 
 static void handle_fusion_list(int id, const char *json)

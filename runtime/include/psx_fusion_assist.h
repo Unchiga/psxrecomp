@@ -71,9 +71,10 @@ int psx_fusion_assist_best(uint16_t *result, int *atk, int *def, int *cards,
 /* `fusion_best`: the above as JSON. */
 int psx_fusion_assist_best_json(char *out, unsigned cap);
 
-/* The hand gate: which slots the game currently treats as pickable, and its
- * own selection count. Any pointer may be NULL. */
-void psx_fusion_assist_hand_source(int *mask, int *sel_count);
+/* The hand gate: which slots the game currently treats as pickable, its own
+ * selection count, and whose turn it is (0 player, 1 opponent). Any pointer
+ * may be NULL. */
+void psx_fusion_assist_hand_source(int *mask, int *sel_count, int *turn);
 
 #ifdef __cplusplus
 }
