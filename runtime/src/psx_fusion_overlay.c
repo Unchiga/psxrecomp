@@ -71,17 +71,20 @@ static const char k_charset[0x80] = {
  * so the order badges can ride on the cards. Everything here is tunable live:
  * placing this against the game's own art is a by-eye job. */
 #define FO_W        320
-#define FO_H        32
+#define FO_H        112
 #define FO_X        0
-#define FO_Y        126   /* canvas top; the text line sits at the very top */
+/* Canvas top. The text sits under the FIELD box the game draws at the top
+ * left, and the order badges ride the hand a hundred pixels below, so one tall
+ * mostly-transparent canvas covers both rather than two composite passes. */
+#define FO_Y        52
 #define FO_TEXT_X   16
-#define FO_TEXT_Y   6     /* the line's top within the canvas */
+#define FO_TEXT_Y   0     /* the line's top within the canvas */
 #define FO_CARD_X   22    /* left edge of hand card 0 */
 #define FO_CARD_DX  58    /* card pitch */
 /* The badge sits INSIDE each card's top-right corner, where it reads as part
  * of the card rather than as something floating above the hand. */
 #define FO_BADGE_DX 36    /* badge left, from the card's left edge */
-#define FO_BADGE_DY 25    /* badge top within the canvas */
+#define FO_BADGE_DY 99    /* badge top within the canvas = inside the card */
 
 static int s_x        = FO_X;
 static int s_y        = FO_Y;
@@ -105,13 +108,20 @@ static int      s_have_content;
  * pickable, which is exactly when it must be gone. */
 static int      s_present_hold;
 
-/* ---- am I still on the recommended line? ----------------------------------
+/* ---- would this selection land on the suggestion? --------------------------
  *
- * The suggestion is a SEQUENCE, so "have I followed it" is a prefix test, not
- * a set test: picking the right two cards in the wrong order reaches a
- * different card, and telling the player they are on track would be a lie.
+ * Compares the CARD the current picks would summon against the card being
+ * suggested — not the pick order against the suggested pick order.
  *
- * Neutral until there are two picks — one card fuses with nothing, so there is
+ * The order test was the first cut and it was wrong. The suggestion is the
+ * SHORTEST line to a card, but it is rarely the only one: with Flame Viper,
+ * Takriminos, Yamatano Dragon Scroll, Ancient Jar and Maiden of the Moonlight
+ * in hand the suggestion is two cards, and picking all five left to right also
+ * ends on Mystical Sand — the very card being suggested — because the first
+ * three fail to fuse and simply hand the fourth along. Marking that red told
+ * the player they were wrong while they were about to be right.
+ *
+ * Neutral until there are two picks: one card fuses with nothing, so there is
  * nothing to be right or wrong about yet. */
 enum { FO_TRACK_NEUTRAL = 0, FO_TRACK_ON = 1, FO_TRACK_OFF = 2 };
 static int s_track;
@@ -336,12 +346,8 @@ static void compose(char *out, int cap, uint8_t *badges)
     uint16_t show = 0;
     if (picked >= 2) {
         show = chain;                       /* the player's own running answer */
-        s_track = FO_TRACK_ON;
-        for (int i = 0; i < picked; i++)
-            if (i >= nbest || steps[i].slot != pick[i]) {
-                s_track = FO_TRACK_OFF;
-                break;
-            }
+        s_track = (best && chain == best) ? FO_TRACK_ON : FO_TRACK_OFF;
+        (void)nbest;
     } else {
         show = best;
         s_track = FO_TRACK_NEUTRAL;
