@@ -114,7 +114,9 @@ Do not re-derive these; do re-verify one before acting on it.
   14,448 -> 14,034.
 - **`psx_host_audio.c` (445 lines)** — the SDL device, the DRC bridge, the pump
   and the turbo mute/sink gate. Six "shared" symbols became four API calls
-  (open / close / resync / fade-reset). 14,034 -> **13,651**.
+  (open / close / resync / fade-reset). 14,034 -> 13,651.
+- **`psx_input_config.cpp` (~430 lines)** — the PSX pad bit layout, the
+  button-mapping tables and the input.ini parser. 13,651 -> **13,274**.
 - **`psx_savestate_host.c` (334 lines, 2026-08-18)** — the slot menu's state
   machine plus the post-restore input guard and its trace ring. 14,996 ->
   14,708. Raw SDL polling and the host pause loop stayed in main.cpp on
@@ -194,9 +196,12 @@ rematch.
    already where it belongs.
 
    **What is actually left**, largest first, none gated yet:
-   - input/pad (~520 across parse_controller_source, capture_pad_slot,
-     pad_sticks_for, open_player, capture_local_human_pad, load_input_config) —
-     scattered; move function by function, never by line range.
+   - input/pad — the CONFIG half is done (`psx_input_config.cpp`). **The rest
+     does NOT move; do not retry.** It is spined on `g_players`: even after
+     absorbing every pad-sampling function, 18 external uses remain in the
+     debug-server pad JSON, the rewind/save-state nav polls, SDL event routing
+     and the boot phases. Owning that array puts `PlayerInput` and its SDL
+     handles on a public boundary — the trade already rejected three times.
    - netplay glue (~455, headed by `netplay_barrier_admit` at 217).
      `psx_netplay.c` exists. **The user has said netplay is not needed**, so
      treat this as low priority, and note nothing here can exercise it.
@@ -269,7 +274,7 @@ were throwaway, so rebuild them, but rebuild them to THIS shape.
    differ ONLY by the edits you intended. This is what caught nothing and
    proved everything — and it is the only real check available for the
    launcher region (below).
-6. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
+7. **Verify behaviour, not compilation.** The `psx_card_drops` extraction
    compiled clean and the behavioural pass still found a real latent bug.
 
 ## REWIND IS NOW BUILT (was off; fixed 2026-08-18)
