@@ -22,25 +22,32 @@
  *         summon, and 0x8400 once it is a monster ON the field
  *     +12 the record's own slot index, 0-based
  *
- * ---- what is settled, and what is not -------------------------------------
+ * ---- which slots are actually IN the hand ---------------------------------
  *
- * On the opening turn slots 0..4 are exactly the hand and the summoned monster
- * lands at 5, and reading "id in range, flags 0x8000, not on the field" gives
- * the right five cards. That much is measured.
+ * Not answerable from the records. The hand refills to five every turn, so at
+ * rest slots 0..4 with the live flag are right — but during a summon the game
+ * keeps spent materials in their records, flag and all, for the whole
+ * animation. Measured: after picking slots 0 and 1 and summoning, the records
+ * still read all five live for several seconds while the cards were visibly
+ * gone. Worse, two slots that were being drawn and two that were not had
+ * byte-identical record shapes, so no field in the record decides it.
  *
- * It does NOT survive a summon. After fusing slots 0 and 1, slot 0 was reused
- * to hold the RESULT with its live flag cleared, but slot 1 -- the other
- * material, just as consumed -- was left reading 0x8000. So the live flag is
- * about the record, not about hand membership, and this reader will report a
- * spent material as still holdable from the second turn onward.
+ * The selection table does decide it. Its per-slot entry holds the slot's card
+ * OBJECT at +0, and the game tears those pointers down the instant the hand
+ * stops being pickable: they read as five live pointers while the player is
+ * choosing, and as five zeros from the first frame of the summon onward.
+ * Checked against the game's own hand display pass (func_800170C8, called once
+ * per card actually in the hand) across a turn: the two agree exactly while
+ * the hand is pickable, which is the only time this feature has anything to
+ * say. During the animation the gate reports an empty hand, which is the
+ * honest answer — there is nothing to pick.
  *
- * The authoritative list is almost certainly the one the hand's sprite pass
- * walks: func_800170C8 is called once per displayed hand card with
- * a0 = record_base - 12 + slot*28, in descending slot order. Finding what
- * drives that loop is the fix; until then this reader is honest about the
- * first turn and wrong after it, which is why `fusion_hand` dumps the whole
- * 28-byte record for a window of slots -- the evidence to settle it is in
- * that output, not in a re-derivation.
+ * Hooking the display pass would be the other way to do it, and was tried
+ * first. It needs 0x800170C8 added to game.toml's `mod_function_entry_funcs`
+ * and the whole game regenerated, because that hook is an opt-in allow-list
+ * baked into the recompiled C. A pointer that is already in RAM, already
+ * per-slot, and already means exactly "this hand position is pickable" is not
+ * worth a regenerate.
  */
 
 #include "psx_fusion_assist.h"
@@ -48,6 +55,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cpu_state.h"
 #include "mod_plugins.h"
 #include "psx_fusion_db.h"
 
@@ -95,6 +103,22 @@ static uint32_t rec_addr(int slot)
     return PSX_FUSION_RECORDS + (uint32_t)slot * PSX_FUSION_STRIDE;
 }
 
+/* Is this hand position currently a pickable card? */
+static int slot_pickable(int slot)
+{
+    return psx_mod_read_word(PSX_FUSION_SELECT +
+                             (uint32_t)slot * PSX_FUSION_SEL_STRIDE) != 0u;
+}
+
+/* Bitmask of pickable hand slots, for the read-back. */
+static int hand_gate_mask(void)
+{
+    int m = 0;
+    for (int slot = 0; slot < PSX_FUSION_HAND_MAX; slot++)
+        if (slot_pickable(slot)) m |= 1 << slot;
+    return m;
+}
+
 static void read_record(int slot, PsxFusionCard *c)
 {
     const uint32_t a = rec_addr(slot);
@@ -110,11 +134,10 @@ int psx_fusion_assist_hand(PsxFusionCard *out, int cap)
     if (!out || cap <= 0) return 0;
     int n = 0;
     for (int slot = 0; slot < PSX_FUSION_HAND_MAX && n < cap; slot++) {
+        if (!slot_pickable(slot)) continue;
         PsxFusionCard c;
         read_record(slot, &c);
         if (c.id < 1 || c.id > PSX_FUSION_CARD_ID_MAX) continue;
-        if (!(c.flags & PSX_FUSION_FLAG_LIVE)) continue;
-        if (c.flags & PSX_FUSION_FLAG_FIELD) continue;   /* already summoned */
         out[n++] = c;
     }
     return n;
@@ -304,6 +327,93 @@ int psx_fusion_assist_chain_json(char *out, unsigned cap)
     }
     p += (unsigned)snprintf(out + p, cap - p, "]");
     return (int)p;
+}
+
+/* ---- the best line in the hand --------------------------------------------
+ *
+ * "The highest-attack monster you can make, using as few cards as possible."
+ * Attack decides; among lines that reach the same attack the shortest wins,
+ * and after that the strongest defence, so a two-card line is never passed
+ * over for a four-card one that lands on the same card.
+ *
+ * Searched by brute force over every ORDERED subset of the hand, because the
+ * fold is order-sensitive: with five cards that is 320 sequences, each a
+ * handful of table reads. The recursion carries the running card, so a prefix
+ * is evaluated once and extended rather than re-folded per permutation. */
+typedef struct {
+    int      atk, def, len;
+    uint16_t result;
+    uint8_t  slot[PSX_FUSION_HAND_MAX];
+} BestLine;
+
+static int line_better(const BestLine *a, const BestLine *b)
+{
+    if (!b->len) return 1;
+    if (a->atk != b->atk) return a->atk > b->atk;
+    if (a->len != b->len) return a->len < b->len;
+    return a->def > b->def;
+}
+
+static void best_search(const PsxFusionCard *hand, int n, uint8_t used,
+                        uint16_t carry, int depth, uint8_t *path,
+                        BestLine *best)
+{
+    /* Belt and braces on the recursion depth. `n` cannot exceed the hand size,
+     * but that is only provable at the call site, and this writes into a
+     * fixed-size array on every level -- so bound it where the writes are. */
+    if (depth > PSX_FUSION_HAND_MAX) return;
+    if (depth >= 2) {
+        BestLine cand;
+        cand.result = carry;
+        cand.len = depth;
+        cand.atk = cand.def = 0;
+        psx_fusion_db_stats(carry, &cand.atk, &cand.def, NULL);
+        for (int i = 0; i < depth; i++) cand.slot[i] = path[i];
+        if (line_better(&cand, best)) *best = cand;
+    }
+    if (depth >= n || depth >= PSX_FUSION_HAND_MAX) return;
+    for (int i = 0; i < n; i++) {
+        if (used & (1u << i)) continue;
+        const uint16_t next = depth ? chain_step(carry, hand[i].id, NULL)
+                                    : hand[i].id;
+        path[depth] = hand[i].slot;
+        best_search(hand, n, (uint8_t)(used | (1u << i)), next, depth + 1,
+                    path, best);
+    }
+}
+
+int psx_fusion_assist_best_json(char *out, unsigned cap)
+{
+    if (!out || cap < 192u) return 0;
+    PsxFusionCard hand[PSX_FUSION_HAND_MAX];
+    int n = psx_fusion_assist_hand(hand, PSX_FUSION_HAND_MAX);
+    if (n > PSX_FUSION_HAND_MAX) n = PSX_FUSION_HAND_MAX;
+
+    BestLine best;
+    memset(&best, 0, sizeof best);
+    uint8_t path[PSX_FUSION_HAND_MAX];
+    if (psx_fusion_db_ready())
+        best_search(hand, n, 0, 0, 0, path, &best);
+
+    unsigned p = 0;
+    p += (unsigned)snprintf(out + p, cap - p,
+                            "\"ready\":%d,\"in_hand\":%d,\"result\":%u,"
+                            "\"atk\":%d,\"def\":%d,\"cards\":%d,\"pick\":[",
+                            psx_fusion_db_ready(), n, best.result,
+                            best.atk, best.def, best.len);
+    for (int i = 0; i < best.len && p + 24u < cap; i++)
+        p += (unsigned)snprintf(out + p, cap - p, "%s%u", i ? "," : "",
+                                best.slot[i]);
+    p += (unsigned)snprintf(out + p, cap - p, "]");
+    return (int)p;
+}
+
+/* Hand gate state for `fusion_hand`: which slots the game currently treats as
+ * pickable, and the selection count it keeps alongside them. */
+void psx_fusion_assist_hand_source(int *mask, int *sel_count)
+{
+    if (mask)      *mask      = hand_gate_mask();
+    if (sel_count) *sel_count = psx_mod_read_byte(PSX_FUSION_SEL_COUNT);
 }
 
 int psx_fusion_assist_try_json(char *out, unsigned cap, int a, int b)

@@ -24,7 +24,8 @@ typedef struct PsxFusionCard {
     uint16_t id;
     uint16_t atk;
     uint16_t def;
-    uint16_t flags;   /* record+8; 0x8000 while the card is live in hand */
+    uint16_t flags;   /* record+10; reported for inspection, not trusted as
+                       * hand membership -- see the .c file on why */
     uint8_t  slot;    /* index into the guest's card-record array */
 } PsxFusionCard;
 
@@ -56,6 +57,14 @@ int psx_fusion_assist_chain(PsxFusionCard *steps, int cap, uint16_t *out_result)
 
 /* `fusion_chain`: the above as JSON, with the running result after each pick. */
 int psx_fusion_assist_chain_json(char *out, unsigned cap);
+
+/* `fusion_best`: the highest-attack monster this hand can make, using as few
+ * cards as possible, with the slots to pick and the order to pick them in. */
+int psx_fusion_assist_best_json(char *out, unsigned cap);
+
+/* The hand gate: which slots the game currently treats as pickable, and its
+ * own selection count. Any pointer may be NULL. */
+void psx_fusion_assist_hand_source(int *mask, int *sel_count);
 
 #ifdef __cplusplus
 }
