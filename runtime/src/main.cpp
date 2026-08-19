@@ -12,6 +12,7 @@
 #include "psx_runtime_perf.h"
 #include "psx_post_load_probe.h"
 #include "psx_host_audio.h"
+#include "psx_input_config.h"
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
 #include "device_trace.h"    /* general two-process device-event cycle ring */
 #include "psx_interpreter.h"
@@ -2091,96 +2092,7 @@ static void teardown_game_session_keep_lobby(void) {
 /* Linear gain ramp g0 -> g1 across a block of interleaved stereo frames. */
 
 
-/* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
- * Bit 0 = SELECT, Bit 1 = L3, Bit 2 = R3, Bit 3 = START,
- * Bit 4 = UP, Bit 5 = RIGHT, Bit 6 = DOWN, Bit 7 = LEFT,
- * Bit 8 = L2, Bit 9 = R2, Bit 10 = L1, Bit 11 = R1,
- * Bit 12 = TRIANGLE, Bit 13 = CIRCLE, Bit 14 = CROSS, Bit 15 = SQUARE.
- * L3/R3 (stick clicks) exist on a DualShock only; the wire reports them like
- * Beetle's dualshock.cpp does — straight from the button word, no mode mask. */
-#define PAD_SELECT   (1 << 0)
-#define PAD_L3       (1 << 1)
-#define PAD_R3       (1 << 2)
-#define PAD_START    (1 << 3)
-#define PAD_UP       (1 << 4)
-#define PAD_RIGHT    (1 << 5)
-#define PAD_DOWN     (1 << 6)
-#define PAD_LEFT     (1 << 7)
-#define PAD_L2       (1 << 8)
-#define PAD_R2       (1 << 9)
-#define PAD_L1       (1 << 10)
-#define PAD_R1       (1 << 11)
-#define PAD_TRIANGLE (1 << 12)
-#define PAD_CIRCLE   (1 << 13)
-#define PAD_CROSS    (1 << 14)
-#define PAD_SQUARE   (1 << 15)
 
-struct ControllerSource {
-    enum class Kind {
-        None,
-        Button,
-        AxisPositive,
-        AxisNegative,
-    };
-
-    Kind kind = Kind::None;
-    int id = -1;
-};
-
-struct PsxButtonMap {
-    uint16_t bit;               /* 0 = stick-direction slot (no digital bit alone) */
-    const char* ini_name;
-    std::vector<ControllerSource> sources;
-    /* When set, a pressed stick-direction source also contributes this d-pad
-     * bit in digital mode (ls_* -> Up/Down/Left/Right). */
-    uint16_t fold_bit = 0;
-};
-
-static int controller_device_index = 0;
-/* Default ~10% of SDL axis range (32767). Overridden per-player via settings. */
-static int controller_deadzone = 3277;
-/* [controller] anti_deadzone (game.toml). 0 = off, the historical behaviour. */
-static int controller_anti_deadzone = 0;
-static constexpr int kDefaultDeadzoneRaw = 3277;
-static constexpr int kControllerMapN = 24;
-using ControllerMap = std::array<PsxButtonMap, kControllerMapN>;
-static ControllerMap controller_map = {{
-    { PAD_UP,       "up",       {}, 0 },
-    { PAD_DOWN,     "down",     {}, 0 },
-    { PAD_LEFT,     "left",     {}, 0 },
-    { PAD_RIGHT,    "right",    {}, 0 },
-    { PAD_CROSS,    "cross",    {}, 0 },
-    { PAD_CIRCLE,   "circle",   {}, 0 },
-    { PAD_SQUARE,   "square",   {}, 0 },
-    { PAD_TRIANGLE, "triangle", {}, 0 },
-    { PAD_L1,       "l1",       {}, 0 },
-    { PAD_R1,       "r1",       {}, 0 },
-    { PAD_L2,       "l2",       {}, 0 },
-    { PAD_R2,       "r2",       {}, 0 },
-    { PAD_L3,       "l3",       {}, 0 },
-    { PAD_R3,       "r3",       {}, 0 },
-    { PAD_START,    "start",    {}, 0 },
-    { PAD_SELECT,   "select",   {}, 0 },
-    /* Stick directions (analog axes by default; fold onto d-pad digitally). */
-    { 0, "ls_up",    {}, PAD_UP },
-    { 0, "ls_down",  {}, PAD_DOWN },
-    { 0, "ls_left",  {}, PAD_LEFT },
-    { 0, "ls_right", {}, PAD_RIGHT },
-    { 0, "rs_up",    {}, 0 },
-    { 0, "rs_down",  {}, 0 },
-    { 0, "rs_left",  {}, 0 },
-    { 0, "rs_right", {}, 0 },
-}};
-/* Per-GUID overrides from input.ini [mapping.<guid>]. Absent GUID => global. */
-static std::unordered_map<std::string, ControllerMap> controller_maps_by_guid;
-
-static const ControllerMap& controller_map_for(const PlayerInput& p) {
-    if (p.guid[0]) {
-        auto it = controller_maps_by_guid.find(p.guid);
-        if (it != controller_maps_by_guid.end()) return it->second;
-    }
-    return controller_map;
-}
 
 static std::string trim_copy(const std::string& s) {
     size_t first = 0;
@@ -2271,298 +2183,6 @@ static std::string lower_copy(std::string s) {
     return s;
 }
 
-static bool parse_bool_value(const std::string& value, bool fallback) {
-    std::string v = lower_copy(trim_copy(value));
-    if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
-    if (v == "0" || v == "false" || v == "no" || v == "off") return false;
-    return fallback;
-}
-
-static ControllerSource parse_controller_source(const std::string& raw) {
-    std::string s = lower_copy(trim_copy(raw));
-    ControllerSource out;
-    if (s.empty() || s == "none" || s == "disabled") return out;
-
-    // recomp-ui pad capture persists axes as "name+" / "name-" (see
-    // source_from_bind). Defaults historically omit the suffix for triggers
-    // ("lefttrigger"). Accept both; strip the sign before name lookup.
-    int dir = 0; // -1, 0 (unspecified), +1
-    if (s.size() >= 2) {
-        const char last = s.back();
-        const char prev = s[s.size() - 2];
-        if ((last == '+' || last == '-') &&
-            (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_')) {
-            dir = (last == '+') ? +1 : -1;
-            s.pop_back();
-        }
-    }
-
-    auto as_button = [&](SDL_GameControllerButton b) -> ControllerSource {
-        out.kind = ControllerSource::Kind::Button;
-        out.id = b;
-        return out;
-    };
-    auto as_axis = [&](SDL_GameControllerAxis a, int d) -> ControllerSource {
-        // Unspecified direction → positive (triggers / capture default).
-        out.kind = (d < 0) ? ControllerSource::Kind::AxisNegative
-                           : ControllerSource::Kind::AxisPositive;
-        out.id = a;
-        return out;
-    };
-
-    if (s == "a") return as_button(SDL_CONTROLLER_BUTTON_A);
-    if (s == "b") return as_button(SDL_CONTROLLER_BUTTON_B);
-    if (s == "x") return as_button(SDL_CONTROLLER_BUTTON_X);
-    if (s == "y") return as_button(SDL_CONTROLLER_BUTTON_Y);
-    if (s == "back" || s == "view" || s == "select")
-        return as_button(SDL_CONTROLLER_BUTTON_BACK);
-    if (s == "start" || s == "menu")
-        return as_button(SDL_CONTROLLER_BUTTON_START);
-    if (s == "guide") return as_button(SDL_CONTROLLER_BUTTON_GUIDE);
-    if (s == "leftstick") return as_button(SDL_CONTROLLER_BUTTON_LEFTSTICK);
-    if (s == "rightstick") return as_button(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
-    // Shoulders are digital buttons. A trailing +/- from axis-style capture is
-    // ignored so "leftshoulder+" still maps to L1 instead of becoming unbound.
-    if (s == "leftshoulder" || s == "lb" || s == "l1")
-        return as_button(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
-    if (s == "rightshoulder" || s == "rb" || s == "r1")
-        return as_button(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
-    if (s == "dpup" || s == "dpadup")
-        return as_button(SDL_CONTROLLER_BUTTON_DPAD_UP);
-    if (s == "dpdown" || s == "dpaddown")
-        return as_button(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
-    if (s == "dpleft" || s == "dpadleft")
-        return as_button(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
-    if (s == "dpright" || s == "dpadright")
-        return as_button(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
-
-    // Triggers: default "lefttrigger" and capture "lefttrigger+" both work.
-    if (s == "lefttrigger" || s == "lt" || s == "l2")
-        return as_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, dir == 0 ? +1 : dir);
-    if (s == "righttrigger" || s == "rt" || s == "r2")
-        return as_axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, dir == 0 ? +1 : dir);
-
-    // Stick axes (suffix required unless using a directional alias).
-    if (s == "leftx") {
-        if (dir == 0) return out;
-        return as_axis(SDL_CONTROLLER_AXIS_LEFTX, dir);
-    }
-    if (s == "lefty") {
-        if (dir == 0) return out;
-        return as_axis(SDL_CONTROLLER_AXIS_LEFTY, dir);
-    }
-    if (s == "rightx") {
-        if (dir == 0) return out;
-        return as_axis(SDL_CONTROLLER_AXIS_RIGHTX, dir);
-    }
-    if (s == "righty") {
-        if (dir == 0) return out;
-        return as_axis(SDL_CONTROLLER_AXIS_RIGHTY, dir);
-    }
-    if (s == "lsright") return as_axis(SDL_CONTROLLER_AXIS_LEFTX, +1);
-    if (s == "lsleft") return as_axis(SDL_CONTROLLER_AXIS_LEFTX, -1);
-    if (s == "lsdown") return as_axis(SDL_CONTROLLER_AXIS_LEFTY, +1);
-    if (s == "lsup") return as_axis(SDL_CONTROLLER_AXIS_LEFTY, -1);
-    if (s == "rsright") return as_axis(SDL_CONTROLLER_AXIS_RIGHTX, +1);
-    if (s == "rsleft") return as_axis(SDL_CONTROLLER_AXIS_RIGHTX, -1);
-    if (s == "rsdown") return as_axis(SDL_CONTROLLER_AXIS_RIGHTY, +1);
-    if (s == "rsup") return as_axis(SDL_CONTROLLER_AXIS_RIGHTY, -1);
-
-    SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(s.c_str());
-    if (button != SDL_CONTROLLER_BUTTON_INVALID)
-        return as_button(button);
-
-    SDL_GameControllerAxis axis = SDL_GameControllerGetAxisFromString(s.c_str());
-    if (axis != SDL_CONTROLLER_AXIS_INVALID)
-        return as_axis(axis, dir == 0 ? +1 : dir);
-
-    return out;
-}
-
-static std::vector<ControllerSource> parse_source_list(const std::string& value) {
-    std::vector<ControllerSource> sources;
-    std::stringstream ss(value);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        ControllerSource source = parse_controller_source(item);
-        if (source.kind != ControllerSource::Kind::None) {
-            sources.push_back(source);
-        }
-    }
-    return sources;
-}
-
-static void apply_sources_to_map(ControllerMap& map, const char* name,
-                                 const char* sources) {
-    for (auto& entry : map) {
-        if (std::strcmp(entry.ini_name, name) == 0) {
-            entry.sources = parse_source_list(sources);
-            return;
-        }
-    }
-}
-
-static void set_default_controller_mapping_into(ControllerMap& map) {
-    for (auto& entry : map) entry.sources.clear();
-    /* D-pad and sticks are separate (launcher Gamepad Bindings layout). Digital
-     * mode still folds ls_* onto d-pad bits via fold_bit. */
-    apply_sources_to_map(map, "up",       "dpup");
-    apply_sources_to_map(map, "down",     "dpdown");
-    apply_sources_to_map(map, "left",     "dpleft");
-    apply_sources_to_map(map, "right",    "dpright");
-    apply_sources_to_map(map, "cross",    "a");
-    apply_sources_to_map(map, "circle",   "b");
-    apply_sources_to_map(map, "square",   "x");
-    apply_sources_to_map(map, "triangle", "y");
-    apply_sources_to_map(map, "l1",       "leftshoulder");
-    apply_sources_to_map(map, "r1",       "rightshoulder");
-    apply_sources_to_map(map, "l2",       "lefttrigger");
-    apply_sources_to_map(map, "r2",       "righttrigger");
-    apply_sources_to_map(map, "l3",       "leftstick");
-    apply_sources_to_map(map, "r3",       "rightstick");
-    apply_sources_to_map(map, "start",    "start");
-    apply_sources_to_map(map, "select",   "back");
-    apply_sources_to_map(map, "ls_up",    "lefty-");
-    apply_sources_to_map(map, "ls_down",  "lefty+");
-    apply_sources_to_map(map, "ls_left",  "leftx-");
-    apply_sources_to_map(map, "ls_right", "leftx+");
-    apply_sources_to_map(map, "rs_up",    "righty-");
-    apply_sources_to_map(map, "rs_down",  "righty+");
-    apply_sources_to_map(map, "rs_left",  "rightx-");
-    apply_sources_to_map(map, "rs_right", "rightx+");
-}
-
-static void set_default_controller_mapping(void) {
-    set_default_controller_mapping_into(controller_map);
-    controller_maps_by_guid.clear();
-}
-
-static std::string default_input_ini_text(void) {
-    return
-        "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
-        "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
-        "; lefttrigger[/+],righttrigger[/+],leftstick,rightstick (stick clicks -> L3/R3),\n"
-        "; dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
-        "; Axis capture may append +/−; both forms are accepted. PSX slots are digital.\n"
-        "; Optional per-device overrides: [mapping.<sdl-guid>].\n"
-        "\n"
-        "[controller]\n"
-        "enabled = true\n"
-        "device = 0\n"
-        "deadzone = 3277\n"
-        "\n"
-        "[mapping]\n"
-        "up = dpup\n"
-        "down = dpdown\n"
-        "left = dpleft\n"
-        "right = dpright\n"
-        "cross = a\n"
-        "circle = b\n"
-        "square = x\n"
-        "triangle = y\n"
-        "l1 = leftshoulder\n"
-        "r1 = rightshoulder\n"
-        "l2 = lefttrigger\n"
-        "r2 = righttrigger\n"
-        "l3 = leftstick\n"
-        "r3 = rightstick\n"
-        "start = start\n"
-        "select = back\n"
-        "ls_up = lefty-\n"
-        "ls_down = lefty+\n"
-        "ls_left = leftx-\n"
-        "ls_right = leftx+\n"
-        "rs_up = righty-\n"
-        "rs_down = righty+\n"
-        "rs_left = rightx-\n"
-        "rs_right = rightx+\n";
-}
-
-static void load_input_config(const char* argv0) {
-    set_default_controller_mapping();
-
-    namespace fs = std::filesystem;
-    fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
-    std::error_code ec;
-    if (!fs::exists(config_path, ec)) {
-        std::ofstream out(config_path, std::ios::binary);
-        if (out) out << default_input_ini_text();
-        psx_keybinds_init(argv0);
-        return;
-    }
-
-    std::ifstream in(config_path);
-    if (!in) {
-        psx_keybinds_init(argv0);
-        return;
-    }
-
-    bool controller_enabled = true;
-    std::string section;
-    std::string line;
-    ControllerMap* guid_target = nullptr;
-    while (std::getline(in, line)) {
-        size_t comment = line.find_first_of(";#");
-        if (comment != std::string::npos) line.resize(comment);
-        line = trim_copy(line);
-        if (line.empty()) continue;
-        if (line.front() == '[' && line.back() == ']') {
-            section = lower_copy(trim_copy(line.substr(1, line.size() - 2)));
-            guid_target = nullptr;
-            if (section.rfind("mapping.", 0) == 0) {
-                const std::string guid = section.substr(8);
-                if (!guid.empty()) {
-                    /* Seed from the current global map (defaults + any
-                     * [mapping] keys already parsed), then overlay GUID keys. */
-                    if (!controller_maps_by_guid.count(guid))
-                        controller_maps_by_guid[guid] = controller_map;
-                    guid_target = &controller_maps_by_guid[guid];
-                }
-            }
-            continue;
-        }
-        size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-
-        std::string key = lower_copy(trim_copy(line.substr(0, eq)));
-        std::string value = trim_copy(line.substr(eq + 1));
-        if (section == "controller") {
-            if (key == "enabled") {
-                controller_enabled = parse_bool_value(value, controller_enabled);
-            } else if (key == "device") {
-                controller_device_index = std::max(0, std::atoi(value.c_str()));
-            } else if (key == "deadzone") {
-                controller_deadzone = std::max(0, std::min(32767, std::atoi(value.c_str())));
-            }
-        } else if (section == "mapping") {
-            for (auto& entry : controller_map) {
-                if (key == entry.ini_name) {
-                    entry.sources = parse_source_list(value);
-                    break;
-                }
-            }
-        } else if (guid_target) {
-            for (auto& entry : *guid_target) {
-                if (key == entry.ini_name) {
-                    entry.sources = parse_source_list(value);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!controller_enabled) {
-        for (auto& entry : controller_map) entry.sources.clear();
-        for (auto& kv : controller_maps_by_guid)
-            for (auto& entry : kv.second) entry.sources.clear();
-    }
-
-    /* Configurable KEYBOARD keybinds (keybinds.ini, next to the exe) — separate
-     * from input.ini's gamepad map. Loads the user's map (or writes defaults on
-     * first run). The launcher may have just edited+saved this file; we re-read
-     * it here so the runtime always reflects the current bindings. */
-    psx_keybinds_init(argv0);
-}
 
 static void close_player(PlayerInput& p) {
     if (p.handle) {
@@ -2968,7 +2588,7 @@ static uint16_t pad_buttons_for(const PlayerInput& p, int player, bool suppress_
     if (psx_video_menu_is_open()) return 0xFFFF;
     if (p.kind == 1) return pad_from_keyboard(player);
     if (p.kind == 2)
-        return controller_pad_buttons(controller_map_for(p), p.handle,
+        return controller_pad_buttons(controller_map_for(p.guid), p.handle,
                                       suppress_stick_axes, p.deadzone);
     return 0xFFFF;
 }
@@ -3001,7 +2621,7 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], boo
         return;
     }
     if (p.kind == 2 && p.handle) {
-        const ControllerMap& map = controller_map_for(p);
+        const ControllerMap& map = controller_map_for(p.guid);
         auto find_entry = [&](const char* name) -> const PsxButtonMap* {
             for (const auto& e : map)
                 if (std::strcmp(e.ini_name, name) == 0) return &e;
@@ -3238,7 +2858,7 @@ static uint16_t dev_all_controllers_buttons(bool suppress_stick_axes) {
             SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
             SDL_JoystickGetGUIDString(g, tmp.guid, (int)sizeof(tmp.guid));
         }
-        btn &= controller_pad_buttons(controller_map_for(tmp), h,
+        btn &= controller_pad_buttons(controller_map_for(tmp.guid), h,
                                       suppress_stick_axes, controller_deadzone);
     }
     return btn;
@@ -4592,7 +4212,7 @@ extern "C" uint16_t psx_host_pad_mask_for_slot(int slot) {
     const PlayerInput &p = g_players[slot];
     if (p.kind == 1) return pad_from_keyboard(slot + 1);
     if (p.kind == 2 && p.handle)
-        return controller_pad_buttons(controller_map_for(p), p.handle,
+        return controller_pad_buttons(controller_map_for(p.guid), p.handle,
                                       false, p.deadzone);
     return 0xFFFF;
 }
@@ -12175,7 +11795,10 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
             return false;
         }
     }
-    load_input_config(argv[0]);
+    load_input_config(exe_dir_from_argv(argv[0]));
+    /* Keyboard binds live in their own file and their own module; load_input_config
+     * used to call this on every one of its exit paths. */
+    psx_keybinds_init(argv[0]);
     /* The launcher / settings.toml / game.toml deadzone (when set) is the
      * user-facing authority; apply it over the input.ini value here, after
      * load_input_config has read input.ini. */
