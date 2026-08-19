@@ -237,3 +237,47 @@ in that output.
 Navigating into a duel over TCP: wait ~5 s after Cross on Simon before pressing
 Circle. Rushing it leaves the presses inside the DECK BUILDER, editing the deck.
 Back up `saves/card*.mcd` first.
+
+---
+
+## STATUS after 2026-08-18 session 3 — the feature is ON SCREEN
+
+The chain preview is built and verified end to end. A line above the hand names
+the best fusion the hand can reach; as cards are picked it shows the card that
+would stand if they were summoned now. The line read Twin-headed Thunder Dragon
+2800/2100 and summoning those three cards produced exactly that.
+
+**Everything since the last status:**
+
+- **Card table 0x801D4244**, u32 per card by `id-1`: `atk=(w&0x1FF)*10`,
+  `def=((w>>9)&0x1FF)*10`, `type=(w>>26)&0x1F`. Found by write-tracing a hand
+  record during the deal. Matches the password guide on 614/620 cards; all six
+  misses are guide typos.
+- **Hand membership is the selection table, not the records.** Entry+0 at
+  0x800EA030 + slot*12 is the slot's card object and is nonzero exactly while
+  the hand is pickable. The records keep spent materials, live flag and all,
+  through the whole summon animation.
+- **Pick state**: entry+4 nonzero = picked, byte at +9 = 1-based pick order.
+  The fold runs in PICK order, and a step that does not fuse leaves the
+  incoming card standing.
+- **`fusion_best`**: highest attack, fewest cards, defence breaking ties.
+  Brute force over every ordered subset (320 at five cards).
+- **Font**: `tools/font_extract.py` (untracked, beside sprite_extract.py) bakes
+  the duel card-name font from VRAM 4bpp (2560,0), 8x12 cells, ASCII order with
+  a seam at 0x5B..0x5F. The 4-bit value is a brightness ramp, not a palette
+  index. At 8bpp the texels pair up and you get legible shapes full of colour
+  noise — that is what sent the first search to the wrong sheet.
+
+**New instrument: `screenshot_present`.** `screenshot` and `screenshot_hires`
+both resolve BEFORE the overlay pass, so neither has ever been able to see the
+rank meter, the CARD DROPS tags, or an OSD toast — proven by capturing a toast
+that was plainly on screen and finding it absent. Use `screenshot_present`
+(queue, then poll `screenshot_present_status`) for any overlay work.
+
+### Open
+
+- Layout is fitted by eye at y=124; tune live with
+  `fusion_overlay x= y= text_x= enabled=`. No backing bar behind the text yet —
+  over the bright field it is readable but not as crisp as the game's own bar.
+- Guardian stars are bits 18..25 of the card word, unread and unmeasured.
+- Nothing persists the overlay's on/off state; there is no MODS menu row yet.
