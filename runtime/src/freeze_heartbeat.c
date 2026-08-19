@@ -13,6 +13,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
+#else
+#include <sys/stat.h>   /* mkdir for the diagnostics directory */
+#include <sys/types.h>
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -82,8 +85,31 @@ static DWORD  s_main_thread_id = 0;
 static int    s_sym_initialized = 0;
 #endif
 
-#define HB_FILE        "psx_freeze_heartbeat.json"
+/* Everything this file writes goes in one subdirectory rather than beside the
+ * executable.
+ *
+ * The heartbeat is rewritten ten times a second, atomically -- .tmp, then
+ * rename over the target. A file explorer refreshing over that catches it
+ * mid-replacement, so at the top level it visibly flickers in and out and
+ * reads as the game littering its own folder. It is not litter: it is the only
+ * observability that survives a main-thread stall, and it is what identified a
+ * 42-second startup freeze from a stack trace instead of guesswork. So keep it
+ * findable and uploadable, just not underfoot -- and put the freeze dumps
+ * beside it for the same reason. */
+#define HB_DIR         "diagnostics"
+#define HB_FILE        HB_DIR "/psx_freeze_heartbeat.json"
 #define HB_INTERVAL_MS 100u
+
+/* Best-effort; a failure just means the writes below fail too, which is
+ * already handled everywhere they happen. Called before each write rather
+ * than once at startup so a deleted directory heals on its own. */
+static void hb_ensure_dir(void) {
+#ifdef _WIN32
+    CreateDirectoryA(HB_DIR, NULL);
+#else
+    mkdir(HB_DIR, 0755);
+#endif
+}
 
 /* Wedge detection.
  *
@@ -480,9 +506,10 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         return;
 #endif
 
-    char path[128];
+    char path[160];
+    hb_ensure_dir();
     snprintf(path, sizeof(path),
-             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
+             HB_DIR "/psx_freeze_dump_%s_%lld.json", s_backend, wall);
 
     FILE *f = fopen(path, "wb");
     if (!f) { freeze_dump_unlock(); return; }
@@ -1033,7 +1060,8 @@ static void heartbeat_write(void) {
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
      * mid-write file and parsing partial JSON. Cheap on Windows
      * (MoveFileEx with REPLACE_EXISTING). */
-    char tmp_path[64];
+    char tmp_path[96];
+    hb_ensure_dir();
     snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
 
     FILE *f = fopen(tmp_path, "wb");
