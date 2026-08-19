@@ -70,19 +70,9 @@
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
 #include "psx_video_menu.h"
-#include "psx_fusion_overlay.h"
-#include "psx_rank_meter.h"
-#include "psx_cd_overlay.h"
+#include "psx_guest_overlay.h"
 /* gpu.c — general "is the watched sprite group covered this frame" query. */
 extern int gpu_sprite_watch_query(int max_age, int *x, int *y, int *occluded);
-/* Last rank-meter placement, for the rank_meter_state debug command. */
-static int s_rm_lx, s_rm_ly, s_rm_lw, s_rm_lh, s_rm_nw, s_rm_nh;
-static int s_rm_dx, s_rm_dy, s_rm_dw, s_rm_dh;
-void gl_rank_meter_placement(int *o) {
-    o[0]=s_rm_lx; o[1]=s_rm_ly; o[2]=s_rm_lw; o[3]=s_rm_lh;
-    o[4]=s_rm_nw; o[5]=s_rm_nh;
-    o[6]=s_rm_dx; o[7]=s_rm_dy; o[8]=s_rm_dw; o[9]=s_rm_dh;
-}
 #include "host_time.h"
 #include "latency_ring.h"
 #include "psx_rewind.h"
@@ -4358,24 +4348,35 @@ static void gl_swap_with_osd(void) {
             }
             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
-            /* Duel-rank meter. Unlike every other overlay here this one belongs
-             * to the GAME's coordinate space, not the window's: it is authored
-             * in guest pixels so it can sit beside the FIELD box the game draws
-             * at (12,24). Map it through the same letterbox rect the picture
-             * uses, so it tracks the image under scaling, aspect and the
-             * menu-bar inset instead of drifting away from the box it labels.
+            /* Guest-space overlays, back to front in registration order.
+             *
+             * Unlike every other overlay here these belong to the GAME's
+             * coordinate space, not the window's: they are authored in guest
+             * pixels so they can sit beside boxes the game draws at fixed guest
+             * coordinates. Map them through the same letterbox rect the picture
+             * uses, so they track the image under scaling, aspect and the
+             * menu-bar inset instead of drifting away from what they label.
+             *
              * Drawn before the menu bar, which is the topmost layer. */
-            /* Re-test occlusion HERE, not just where the meter's state is
-             * decided. That decision runs in the frame loop, so it can only see
-             * occluders from the frame BEFORE — which means the frame where a
-             * card view first covers the meter is drawn with the meter still
-             * on, a one-frame flash. Compositing happens after all of this
-             * frame's GPU work, so the answer here is current. */
-            int rm_occluded = 0;
-            (void)gpu_sprite_watch_query(2, NULL, NULL, &rm_occluded);
-            if (!rm_occluded && psx_rank_meter_image(&px, &ow, &oh) && px) {
+            for (int oi = 0; oi < psx_guest_overlay_count(); oi++) {
+                const PsxGuestOverlay *ov = psx_guest_overlay_at(oi);
+                /* Re-test occlusion HERE, not where the overlay's state is
+                 * decided. That decision runs in the frame loop, so it can only
+                 * see occluders from the frame BEFORE — which means the frame
+                 * where a card view first covers the meter is drawn with it
+                 * still on, a one-frame flash. Compositing happens after all of
+                 * this frame's GPU work, so the answer here is current. */
+                if (ov->occlusion_group >= 0) {
+                    int occluded = 0;
+                    (void)gpu_sprite_watch_query(ov->occlusion_group,
+                                                 NULL, NULL, &occluded);
+                    if (occluded) continue;
+                }
+                if (!ov->image(&px, &ow, &oh) || !px) continue;
+
                 int lx, ly, lw, lh;
                 letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+                if (lw <= 0 || lh <= 0) continue;
                 const int nw = (s_native_w > 0) ? s_native_w : 320;
                 const int nh = (s_native_h > 0) ? s_native_h : 240;
                 /* letterbox_rect_aspect's y is fed straight to glViewport by
@@ -4389,67 +4390,25 @@ static void gl_swap_with_osd(void) {
                  * could ever line it up everywhere. */
                 const int ly_top = wh - ly - lh;
                 int gx = 0, gy = 0;
-                psx_rank_meter_origin(&gx, &gy);
-                if (lw > 0 && lh > 0) {
-                    const int dx = lx + (gx * lw) / nw;
-                    const int dy = ly_top + (gy * lh) / nh
-                                 + (psx_rank_meter_subpixel_y() * lh) / (2 * nh);
-                    int dw = (ow * lw) / nw;
-                    int dh = (oh * lh) / nh;
-                    if (dw < 1) dw = 1;
-                    if (dh < 1) dh = 1;
-                    /* Publish the mapping so alignment against the game's own
-                     * art can be checked exactly, instead of being eyeballed
-                     * out of a screenshot full of other pale UI. */
-                    s_rm_lx = lx; s_rm_ly = ly_top; s_rm_lw = lw; s_rm_lh = lh;
-                    s_rm_nw = nw; s_rm_nh = nh;
-                    s_rm_dx = dx; s_rm_dy = dy; s_rm_dw = dw; s_rm_dh = dh;
-                    gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
+                ov->origin(&gx, &gy);
+                const int sub = ov->subpixel_y ? ov->subpixel_y() : 0;
+                const int dx = lx + (gx * lw) / nw;
+                const int dy = ly_top + (gy * lh) / nh + (sub * lh) / (2 * nh);
+                int dw = (ow * lw) / nw;
+                int dh = (oh * lh) / nh;
+                if (dw < 1) dw = 1;
+                if (dh < 1) dh = 1;
+                /* Publish the mapping so alignment against the game's own art
+                 * can be checked exactly, instead of being eyeballed out of a
+                 * screenshot full of other pale UI. */
+                if (ov->placed) {
+                    const int o[10] = { lx, ly_top, lw, lh, nw, nh,
+                                        dx, dy, dw, dh };
+                    ov->placed(o);
                 }
+                gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
             }
-            /* CARD DROPS page "New!" tags: guest-space overlay like the rank
-             * meter, same letterbox mapping, no occlusion watch (the results
-             * screen draws nothing over its plates). */
-            if (psx_cd_overlay_image(&px, &ow, &oh) && px) {
-                int lx, ly, lw, lh;
-                letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-                const int nw = (s_native_w > 0) ? s_native_w : 320;
-                const int nh = (s_native_h > 0) ? s_native_h : 240;
-                const int ly_top = wh - ly - lh;
-                int gx = 0, gy = 0;
-                psx_cd_overlay_origin(&gx, &gy);
-                if (lw > 0 && lh > 0) {
-                    const int dx = lx + (gx * lw) / nw;
-                    const int dy = ly_top + (gy * lh) / nh;
-                    int dw = (ow * lw) / nw;
-                    int dh = (oh * lh) / nh;
-                    if (dw < 1) dw = 1;
-                    if (dh < 1) dh = 1;
-                    gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
-                }
-            }
-            /* Fusion assistant's line above the hand: guest-space overlay,
-             * same letterbox mapping as the two above it. No occlusion watch —
-             * it only draws while the hand is pickable, which is exactly when
-             * nothing covers that strip. */
-            if (psx_fusion_overlay_image(&px, &ow, &oh) && px) {
-                int lx, ly, lw, lh;
-                letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
-                const int nw = (s_native_w > 0) ? s_native_w : 320;
-                const int nh = (s_native_h > 0) ? s_native_h : 240;
-                const int ly_top = wh - ly - lh;
-                int gx = 0, gy = 0;
-                psx_fusion_overlay_origin(&gx, &gy);
-                if (lw > 0 && lh > 0) {
-                    const int dx = lx + (gx * lw) / nw;
-                    const int dy = ly_top + (gy * lh) / nh;
-                    int dw = (ow * lw) / nw;
-                    int dh = (oh * lh) / nh;
-                    if (dw < 1) dw = 1;
-                    if (dh < 1) dh = 1;
-                    gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
-                }
-            }
+
             /* Menu bar last: it is the topmost UI layer. Blended, because the
              * canvas is transparent everywhere the bar/dropdown does not cover
              * and the game must remain visible underneath.
@@ -4609,8 +4568,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1) &&
-        !host_osd_needs_present() && !psx_rank_meter_needs_present() &&
-        !psx_fusion_overlay_needs_present()) {
+        !host_osd_needs_present() && !psx_guest_overlay_any_needs_present()) {
         s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(0);
@@ -4718,8 +4676,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
         !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1) &&
-        !host_osd_needs_present() && !psx_rank_meter_needs_present() &&
-        !psx_fusion_overlay_needs_present()) {
+        !host_osd_needs_present() && !psx_guest_overlay_any_needs_present()) {
         s_probe_skip++;
         gl_perf_present_enter();
         gl_perf_present_exit(1);

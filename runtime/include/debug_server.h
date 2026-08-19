@@ -104,6 +104,12 @@ int  debug_server_fmv_quiet(void);
 uint64_t debug_server_get_tcp_stall_ms(void);
 uint32_t debug_server_get_tcp_drops(void);
 
+/* Simulated-vblank counter. The stamp every display / trace / write ring
+ * uses, so anything sampling per vblank (including a title's own rings, via
+ * psx_game_add_vblank_hook) can be compared against them entry-for-entry.
+ * Advances in release builds too, where the debug server is compiled out. */
+uint64_t debug_server_frame_number(void);
+
 /* Record the current frame's state into the ring buffer.
  * Call after vblank processing. */
 void debug_server_record_frame(void);

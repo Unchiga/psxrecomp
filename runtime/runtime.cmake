@@ -293,6 +293,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_host.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_game_hooks.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_debug_commands.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_guest_overlay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_input_config.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_host_audio.c

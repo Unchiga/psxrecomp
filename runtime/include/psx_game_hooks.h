@@ -30,9 +30,17 @@ int psx_game_add_start_hook(PsxGameHook fn);
  * hook that does nothing when its feature is off costs a predictable call. */
 int psx_game_add_frame_hook(PsxGameHook fn);
 
+/* Runs once per simulated vblank, on the emulator thread, before the debug
+ * server records the frame. This is the guest's own cadence, not the host
+ * window's: a sampler that wants its entries stamped with the same frame
+ * number the display and trace rings use must run here, not in a frame hook.
+ * Read that number with debug_server_frame_number(). */
+int psx_game_add_vblank_hook(PsxGameHook fn);
+
 /* Called by the runtime. Not for titles. */
 void psx_game_run_start_hooks(void);
 void psx_game_run_frame_hooks(void);
+void psx_game_run_vblank_hooks(void);
 
 #ifdef __cplusplus
 }

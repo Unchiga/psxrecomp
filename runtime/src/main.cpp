@@ -5174,6 +5174,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         }
     } probe_scope{&probe_turbo, &probe_reached};
 
+    /* Whatever this title registered for its own per-vblank sampling. Before
+     * the debug server records the frame, and outside the debug guard, so a
+     * title's rings carry the same frame stamp in every build. */
+    psx_game_run_vblank_hooks();
+
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
