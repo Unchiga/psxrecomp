@@ -6807,13 +6807,50 @@ static void handle_savestate(int id, const char *json)
     extern int psx_netplay_is_host(void);
     extern int psx_netplay_request_save(int slot);
     extern int psx_netplay_request_load(int slot);
+    extern const char* savestate_dir(void);
+    extern int savestate_slot_path(int slot, char* out, size_t cap);
     int slot = json_get_int(json, "slot", -1);
     if (slot < 0) { send_err(id, "missing slot"); return; }
     char op[16];
     if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
     int staged;
+    /* Where the states REALLY are. Savestates and menu_settings.ini both live
+     * in the player-data directory, while stale pre-migration copies sit
+     * beside the exe and read perfectly plausibly -- a tool that guesses the
+     * path reads a dead file and reports success. Two separate investigations
+     * lost time to exactly that, so the runtime answers instead of tools
+     * guessing. */
+    if (!strcmp(op, "path")) {
+        char p[600];
+        const char *dir = savestate_dir();
+        if (!savestate_slot_path(slot, p, sizeof p)) {
+            send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\","
+                     "\"slot\":%d,\"path\":null,\"configured\":false}",
+                     id, dir ? dir : "", slot);
+            return;
+        }
+        /* JSON-escape the backslashes a Windows path is full of. */
+        char esc[1200];
+        size_t e = 0;
+        for (size_t i = 0; p[i] && e + 2 < sizeof esc; i++) {
+            if (p[i] == '\\' || p[i] == '"') esc[e++] = '\\';
+            esc[e++] = p[i];
+        }
+        esc[e] = '\0';
+        char desc[1200];
+        size_t k = 0;
+        for (size_t i = 0; dir && dir[i] && k + 2 < sizeof desc; i++) {
+            if (dir[i] == '\\' || dir[i] == '"') desc[k++] = '\\';
+            desc[k++] = dir[i];
+        }
+        desc[k] = '\0';
+        send_fmt("{\"id\":%d,\"ok\":true,\"dir\":\"%s\",\"slot\":%d,"
+                 "\"path\":\"%s\",\"configured\":true}",
+                 id, desc, slot, esc);
+        return;
+    }
     if (strcmp(op, "save") && strcmp(op, "load")) {
-        send_err(id, "op must be save|load");
+        send_err(id, "op must be save|load|path");
         return;
     }
     if (psx_netplay_active()) {
