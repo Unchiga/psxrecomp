@@ -145,6 +145,9 @@ enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
 enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT = 2 };
 
 #define VM_EDIT_MAX 5   /* digits; 32767 is the widest useful value */
+/* Draw a notch per step at or below this many steps. Above it the ticks
+ * would be sub-pixel and just muddy the track (a 0..100 volume). */
+#define VM_SLIDER_TICK_MAX 16
 
 
 static const char *const SCALING_LABELS[] = { "FILL WINDOW", "INTEGER" };
@@ -231,6 +234,10 @@ static int num_range(int m, int row, int *lo, int *hi) {
     if (m == MENU_GAME && row == 0) {
         *lo = 1; *hi = PSX_VM_SPEED_MAX; return 1;
     }
+    if (m == MENU_VIDEO && row == 4) {   /* WINDOWED SCALE */
+        *lo = PSX_VM_WINDOWED_SCALE_MIN;
+        *hi = PSX_VM_WINDOWED_SCALE_MAX; return 1;
+    }
     if (m == MENU_AUDIO) { *lo = 0; *hi = 100; return 1; }   /* percent */
     return 0;
 }
@@ -238,6 +245,7 @@ static int num_range(int m, int row, int *lo, int *hi) {
 static int num_get(int m, int row) {
     { VmRegRow *r = row_reg(m, row); if (r) return r->value; }
     if (m == MENU_GAME && row == 0) return s_state.speed;
+    if (m == MENU_VIDEO && row == 4) return s_state.windowed_scale;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER) return s_state.vol_master;
         if (row == AUD_MUSIC)  return s_state.vol_music;
@@ -257,6 +265,7 @@ static void num_set(int m, int row, int v) {
         }
     }
     if (m == MENU_GAME && row == 0) s_state.speed = v;
+    if (m == MENU_VIDEO && row == 4) s_state.windowed_scale = v;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER)     s_state.vol_master = v;
         else if (row == AUD_MUSIC) s_state.vol_music  = v;
@@ -470,6 +479,18 @@ static const char *row_value(int m, int row) {
             buf[s_edit_len] = '_';
             buf[s_edit_len + 1] = '\0';
             return buf;
+        }
+        /* WINDOWED SCALE reads as a zoom factor, not a count: the slider now
+         * owns this row, and the numeric path below would print a bare "3"
+         * where "3X" is what tells the player it means three times native. */
+        if (m == MENU_VIDEO && row == 4) {
+            static char zbuf[8];
+            const char *d = lp_text(num_get(m, row));
+            int i = 0;
+            while (d[i] && i < (int)sizeof(zbuf) - 2) { zbuf[i] = d[i]; i++; }
+            zbuf[i] = 'X';
+            zbuf[i + 1] = '\0';
+            return zbuf;
         }
         return lp_text(num_get(m, row));
     }
@@ -714,6 +735,7 @@ static int row_is_slider(int m, int row) {
     if (!num_range(m, row, &lo, &hi)) return 0;
     if (m == MENU_AUDIO) return 1;
     if (m == MENU_GAME) return 1;                 /* SPEED 1..16 */
+    if (m == MENU_VIDEO && row == 4) return 1;    /* WINDOWED SCALE 1..8 */
     return 0;   /* built-in number rows are type-only unless listed above */
 }
 
@@ -877,6 +899,28 @@ static void redraw(void) {
                 if (fill > 0)
                     fill_rect(sx, sy, fill, sh, sel ? COL_ACCENT : COL_TEXT);
                 stroke_rect(sx, sy, sw, sh, COL_PANEL_ED);
+                /* Notches, one per selectable value, on short ranges only.
+                 *
+                 * A bare track says "anywhere along here", which is true for a
+                 * 0..100 volume and a lie for a 1..8 zoom, where every position
+                 * between the steps is unreachable. The ticks show how many
+                 * stops there are and where the pointer will actually land.
+                 * Skipped above VM_SLIDER_TICK_MAX steps, where they would be
+                 * closer together than the pixels drawing them. */
+                if (hi > lo && (hi - lo) <= VM_SLIDER_TICK_MAX) {
+                    int t;
+                    for (t = lo; t <= hi; t++) {
+                        const int tx = sx + ((t - lo) * (sw - 1)) / (hi - lo);
+                        /* Drawn TALLER than the track, not inside it. Inside,
+                         * the first and last ticks land on the border and the
+                         * rest wash out against the filled part, so a 1..8 row
+                         * reads as about six notches - you cannot count the
+                         * stops, which is the whole point of having them.
+                         * Standing proud of the track, all eight are countable
+                         * whether or not the fill has reached them. */
+                        fill_rect(tx, sy - 2, 1, sh + 4, COL_DIM);
+                    }
+                }
                 {
                     const int mark = slider_mark(s_menu, i);
                     if (mark >= lo && mark <= hi && hi > lo) {
