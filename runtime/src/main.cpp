@@ -5841,11 +5841,23 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             if (psx_update_check_take(up_tag, (int)sizeof(up_tag),
                                       up_url, (int)sizeof(up_url))) {
                 char msg[640];
+                /* Deliberately says NOTHING about where saves are.
+                 *
+                 * It reads as the obvious reassurance to add, and it was here
+                 * until it did not survive review: this dialog cannot know the
+                 * answer. A portable install (portable.txt / PSX_PORTABLE=1)
+                 * keeps saves in the game folder ON PURPOSE, and the Documents
+                 * lookup falls back to the exe directory when the profile
+                 * cannot be resolved - so "your saves are in Documents" is
+                 * simply false for those players, and false reassurance about
+                 * save data is worse than none.
+                 *
+                 * The save move is announced where it can be stated truthfully
+                 * instead: a one-time on-screen notice on the launch that
+                 * actually migrates, and the README section for upgraders who
+                 * extracted into a fresh folder. Neither has to guess. */
                 std::snprintf(msg, sizeof(msg),
                     "%s is available.\n\nYou are running %s.\n\n"
-                    "Your saves live in Documents\\My Games, not in the game "
-                    "folder, so updating cannot touch them - extract the new "
-                    "version wherever you like.\n\n"
                     "Open the download page now?",
                     up_tag, psx_update_check_current_version());
                 const bool go = launcher_confirm("Update available", msg);
@@ -13160,9 +13172,15 @@ CPUState cpu;
          * my save" - the data is fine, but nobody can see it from here. ASCII
          * only: the OSD font is an 8x8 ASCII sheet and anything else lands as
          * '?'. */
+        /* Announced HERE rather than in the update dialog, because here the
+         * answer is known: this fires only on the launch that actually moved
+         * the files, so it can name the change without guessing. Portable
+         * installs never migrate and so never see it. ASCII only - the OSD
+         * font is an 8x8 ASCII sheet and anything else lands as '?'. */
         if (g_player_data_migrated)
-            host_osd_push("Saves moved to Documents\\My Games - see the log for the path",
-                          6000);
+            host_osd_push("Saves now live in Documents\\My Games "
+                          "- copied out of the game folder, originals kept",
+                          7000);
 
         /* Ask about a newer release, on every launch, unless the player turned
          * it off. Fired here rather than earlier so it cannot delay anything
