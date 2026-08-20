@@ -3633,6 +3633,10 @@ static int host_paths_same_file(const char* a, const char* b) {
 }
 
 /* Setup-host zip-root exe → build-release product (bios/mods/assets/settings). */
+/* Defined further down with the update-check helpers; needed here for the
+ * stale-build test below. */
+static int host_local_game_version(char* out, size_t cap);
+
 void psxrecomp_codegen_host_forward_if_built(
     const PsxrecompCodegenHostConfig* cfg, int argc, char** argv) {
 #if defined(PSX_HAS_GAME_DISPATCH)
@@ -3679,6 +3683,46 @@ void psxrecomp_codegen_host_forward_if_built(
         return;
     if (host_paths_same_file(self, g_exe_path))
         return;
+
+    /* Refuse to forward a build older than the sources sitting next to it.
+     *
+     * An update to a setup-host zip is SOURCE ONLY: it replaces this exe and
+     * the tree, but never build-<cfg>/, because the built game is not in the
+     * archive. Forwarding unconditionally therefore keeps launching the
+     * PREVIOUS version's binary forever - the player extracts the update, sees
+     * the old build start, and is still playing the version they just
+     * replaced. Measured: a tree at 0.2.4 next to a build stamped 0.2.3,
+     * launching 0.2.3 every time, and (because the runtime asks GitHub what
+     * the latest release is) nagging to download an update it already had.
+     *
+     * Declining to forward drops through to the generate/build path below,
+     * which rebuilds and then forwards to the fresh binary. */
+    {
+        char src_ver[64], built_ver[64], stamp[1200];
+        src_ver[0] = built_ver[0] = '\0';
+        (void)host_local_game_version(src_ver, sizeof(src_ver));
+        if (join_path(stamp, sizeof(stamp), g_build_dir,
+                      "psx_game_version.txt")) {
+            FILE* f = fopen(stamp, "rb");
+            if (f) {
+                size_t n = fread(built_ver, 1, sizeof(built_ver) - 1, f);
+                fclose(f);
+                built_ver[n] = '\0';
+                while (n && (built_ver[n - 1] == '\n' || built_ver[n - 1] == '\r' ||
+                             built_ver[n - 1] == ' '  || built_ver[n - 1] == '\t'))
+                    built_ver[--n] = '\0';
+            }
+        }
+        /* Only when BOTH are known: a missing stamp is an older layout, not a
+         * stale build, and must not trigger an endless rebuild loop. */
+        if (src_ver[0] && built_ver[0] && strcmp(src_ver, built_ver) != 0) {
+            fprintf(stderr,
+                    "psxrecomp-codegen: installed sources are %s but the build "
+                    "is %s - rebuilding instead of launching the old one\n",
+                    src_ver, built_ver);
+            return;
+        }
+    }
 
     fprintf(stderr,
             "psxrecomp-codegen: setup host forwarding to product build:\n  %s\n",
