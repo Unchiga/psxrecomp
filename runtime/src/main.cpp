@@ -13177,10 +13177,17 @@ CPUState cpu;
          * the files, so it can name the change without guessing. Portable
          * installs never migrate and so never see it. ASCII only - the OSD
          * font is an 8x8 ASCII sheet and anything else lands as '?'. */
-        if (g_player_data_migrated)
-            host_osd_push("Saves now live in Documents\\My Games "
-                          "- copied out of the game folder, originals kept",
-                          7000);
+        if (g_player_data_migrated) {
+            /* Names the REAL destination rather than a hardcoded "Documents\
+             * My Games": that string is only right for the default layout, and
+             * a message about someone's save data has no business guessing.
+             * ASCII only - the OSD font is an 8x8 ASCII sheet, so a non-ASCII
+             * character anywhere in the path renders as '?'. */
+            char note[320];
+            std::snprintf(note, sizeof(note), "Saves copied to %s",
+                          g_player_data_dir.c_str());
+            host_osd_push(note, 7000);
+        }
 
         /* Ask about a newer release, on every launch, unless the player turned
          * it off. Fired here rather than earlier so it cannot delay anything
