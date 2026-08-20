@@ -317,3 +317,105 @@ the overlay first drew:
   resolve before the overlay pass and can see none of this.
 
 Next work is packaging for other people — see `SHARE_BUILD_PROMPT.md`.
+
+---
+
+## STATUS after 2026-08-20 — equips are now worth something
+
+### Corrections to the section above
+
+- **"Per-card stats table not located" is STALE.** It was found: packed one
+  u32 per card at `PSX_FUSION_STATS_BASE 0x801D4244`, indexed by `id - 1`,
+  with `atk/10` in bits 0-8, `def/10` in bits 9-17 and type in bits 26-30
+  (`psx_fusion_db_stats`). Ranking by the result's real stats has worked for a
+  while. Bits 18-25 are still undecoded (level/attribute, most likely).
+- Searching for that table as a plain array of `u16` atk/def pairs finds
+  nothing at any stride, because of the packing above. Do not repeat that hunt.
+
+### The equip defect the user reported, and what it actually was
+
+Reported: with two Blue-Eyes, a Trihorned Dragon, Dragon Treasure and
+Megamorph in hand, the helper suggested only a two-card play.
+
+It was **not** missing chain support — `best_search` already walks every
+ordered subset. It was that an equip scored **zero**: the line was ranked with
+`psx_fusion_db_stats(carry)`, and in an equip chain `carry` stays the base
+monster, so a 2-card and a 3-card line both scored 3000/2500. `line_better`
+then breaks ties with *shorter wins*, so the longer, stronger line was actively
+discarded. Equips looked free and worthless at the same time.
+
+### What an equip is worth — traced, not taken from the FAQ
+
+`0x8001A7F8` in the summon path:
+
+```asm
+8001A7F8  li   v0, 500          default bonus
+8001A800  sh   v0, 42(s1)
+8001A814  lh   v1, 766(gp)      the equip's card id
+8001A818  li   v0, 657          Megamorph
+8001A81C  bne  v1, v0 -> skip   anything else keeps 500
+8001A828  sh   v1, 42(s1)       Megamorph stores 1000
+```
+
+There is no per-equip bonus to read from the card table instead: **every**
+equip's stats word is byte-identical (`0x5C000000` — atk 0, def 0, type 23), so
+this two-case rule is the whole of it.
+
+**The bonus applies to ATTACK AND DEFENCE ALIKE, and successive equips ADD.**
+Verified in a live duel by the user: Blue-Eyes White Dragon (3000/2500) fused
+with Dragon Treasure and Megamorph came out **4500/4000**, and the resulting
+field record read base 3000/2500 with the accumulator at record `+6` holding
+**1500** = 500 + 1000. The record keeps base stats; the bonus is a separate
+field added on display.
+
+Note the earlier reading of `+6` as a terrain/FIELD bonus was wrong — two field
+monsters each showing 500 were each wearing one equip.
+
+### Fixed
+
+`psx_fusion_db_equip_bonus()` plus a `fold_step`/`line_stats` pair that carry
+the running bonus through the chain. `fusion_best`, `fusion_chain` and
+`fusion_list` all report stats **including** equips, and `fusion_chain` also
+reports the running `bonus`.
+
+Verified by rebuilding that exact hand in a scratch duel (write the ids into
+the records at `0x801A7AE4` and the pickable-marker words at `0x800EA030`):
+
+```
+fusion_best -> cards=3  pick=[0,3,4]  result=1  atk=4500  def=4000
+fusion_list ->   1 + 657 -> 1   atk=4000 def=3500
+                 1 + 315 -> 1   atk=3500 def=3000
+```
+
+which is exactly what the game produced.
+
+**One modelling assumption, NOT verified:** a step that produces a *different*
+card resets the bonus to zero, on the reasoning that the equips were spent on
+the monster just consumed. The verified case is equips accumulating onto one
+monster. Someone should check fuse-then-equip-then-fuse before relying on it.
+
+### Still missing — the six-card case
+
+The user's point: *"it actually allows you to combine up to six cards if you
+place them on a monster card you already have on the field."*
+
+Unimplemented. `PSX_FUSION_FLAG_FIELD (0x0400)` is defined and **never used**,
+`psx_fusion_assist_hand()` only walks the five hand slots, and
+`PSX_FUSION_HAND_MAX` caps the search at 5. So a field monster is never
+considered as a fusion base, and equipping onto an existing monster — often the
+strongest play, since that monster may already carry a bonus — is invisible to
+the helper.
+
+What it needs, in order:
+
+1. **Which records are the player's field.** Records 5, 6, 7 read `flags
+   0x8400` (LIVE|FIELD) with the player's three monsters out, and the 12-record
+   window has room for more. Establish the player/opponent split from the game
+   rather than assuming a slot range — putting a monster on each side and
+   diffing is enough.
+2. **Seed the search from each eligible field monster**, with `carry` = its id
+   and `bonus` = its existing record `+6`, then fold hand cards onto it. Raise
+   the depth cap to 6.
+3. **Report it distinctly.** "Play these onto your Blue-Eyes on the field" is a
+   different instruction from "play these from hand", and the UI has to say
+   which.
