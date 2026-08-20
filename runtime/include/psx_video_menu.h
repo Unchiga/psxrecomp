@@ -280,6 +280,13 @@ typedef struct PsxVideoMenuDebug {
     int logical_w, logical_h, ui_scale;
     int rows;         /* rows in the selected menu */
     int vol_master, vol_music, vol_sound;   /* audio buses, 0..100 */
+    /* The menu's OWN copy of the stored choices. Compare against the values
+     * the subsystems actually hold (e.g. fast_loads vs cdrom game_divisor) to
+     * tell "the ini never reached the menu" apart from "the menu has it but
+     * the subsystem does not". */
+    int fast_loads;        /* 0 authentic, 1 fast, 2 instant */
+    int speed;             /* emulation speed multiplier */
+    int supersampling;     /* internal render scale */
 } PsxVideoMenuDebug;
 
 void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out);

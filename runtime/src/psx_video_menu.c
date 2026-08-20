@@ -1027,6 +1027,9 @@ void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out) {
     out->vol_master = s_state.vol_master;
     out->vol_music  = s_state.vol_music;
     out->vol_sound  = s_state.vol_sound;
+    out->fast_loads    = s_state.fast_loads;
+    out->speed         = s_state.speed;
+    out->supersampling = s_state.supersampling;
 }
 
 /* F10 (and the controller Guide button): show the menu EXPANDED, or hide it

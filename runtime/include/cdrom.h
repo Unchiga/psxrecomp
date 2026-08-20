@@ -179,6 +179,19 @@ typedef struct CDROMDebugState {
     uint64_t int1_pended;
     uint64_t int1_lost;
     uint8_t  int1_pending_now;
+    /* Command-response INT accounting. int1_lost above only sees the
+     * one-deep data-ready pend; these cover INT2/INT3/INT5 as well.
+     * Indexed by CD INT type 1..5, so index == type (slot 0 unused).
+     * int_lost_unseen is the one that matters: an INT destroyed by the next
+     * one before ever being presented to INTC — the guest never saw it. */
+    uint64_t int_raised[6];
+    uint64_t int_presented[6];
+    uint64_t int_clobbered[6];
+    uint64_t int_lost_unseen[6];
+    uint64_t int_acked_unpresented[6];
+    uint8_t  int_last_lost_old;
+    uint8_t  int_last_lost_new;
+    uint32_t int_last_lost_gen;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {
@@ -276,6 +289,11 @@ typedef struct CDROMSectorHistoryEntry {
 } CDROMSectorHistoryEntry;
 
 void cdrom_debug_snapshot(CDROMDebugState* out);
+/* Live disc-speed divisor (1 authentic, >1 fast, 0 instant). During BIOS
+ * boot this is 1 regardless of configuration; the configured value is
+ * cdrom_get_game_speed_divisor() and is latched at game entry. */
+int cdrom_get_speed_divisor(void);
+int cdrom_get_game_speed_divisor(void);
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries);
 void cdrom_debug_clear_trace(void);
 uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries);

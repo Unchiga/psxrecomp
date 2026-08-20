@@ -285,6 +285,20 @@ void cdrom_notify_game_started(void) {
 
 int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
 
+/* Live disc-speed divisor: 1 = authentic, >1 = fast, 0 = 'instant'.
+ * Exposed because the `fast_loads` command with no argument reports the
+ * ARGUMENT it parsed (-1), not the active setting. Reading that as "off" is
+ * how "fast loading ruled out" got recorded against a machine configured for
+ * instant loads (menu_settings.ini fast_loads=2). */
+int cdrom_get_speed_divisor(void) { return g_disc_speed_divisor; }
+
+/* Divisor latched in at game entry. During BIOS boot the LIVE divisor is
+ * deliberately 1 (authentic) and only becomes this at cdrom_notify_game_started,
+ * so reporting the live value alone makes a correctly-configured instant setup
+ * read as "authentic" for the whole boot — the same misreading that put
+ * "fast loading ruled out" in ISSUES.md. Report both. */
+int cdrom_get_game_speed_divisor(void) { return g_game_divisor; }
+
 /* Frontend XA-stream probe (FMV auto-skip / turbo-load gating in main.cpp). */
 int cdrom_xa_stream_active(void) { return xa_stream_active; }
 
@@ -522,6 +536,23 @@ static int warm_route_period(void) {
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
 }
 
+/* RULE — SECOND RESPONSES ARE NEVER ACCELERATED.
+ *
+ * apply_speed() must not be used on the completion latency of a two-phase
+ * command (INT3 ack now, INT2 complete later). Those latencies are a
+ * CPU-visible ordering contract: games issue the command from mainline code
+ * and finish their driver bookkeeping in the frames before the INT2 lands.
+ * Compressing one delivers it inside the issuing frame, where an async CD
+ * queue can miss the completion and wedge forever.
+ *
+ * Established by pause_complete_delay_cycles() (Ape Escape's scene loader) and
+ * extended 2026-08-19 to Stop/MotorOn/Seek after YGO FM ISSUE #1 — a duel
+ * soft-lock whose stuck effect is retired by a CD-ROM interrupt callback chain.
+ *
+ * The load-time win lives in sector cadence (apply_read_speed): thousands of
+ * sectors per load against a handful of command handshakes. Giving the
+ * handshakes back their real latency costs almost nothing and removes the
+ * race entirely. */
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
@@ -619,8 +650,9 @@ static int seek_complete_delay_cycles(void) {
     /* PCSX carries a far-SetLoc seek state and explicitly calls out Rockman X5:
      * far SeekL/SeekP completes after roughly four 1x sector periods, while a
      * near/already-settled seek returns quickly. */
-    int base = setloc_seek_far ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES * 4) : 0x800;
-    return apply_speed(base);
+    /* NOT accelerated — second-response rule at apply_speed(). SeekL/SeekP
+     * are two-phase: INT3 ack, then INT2 once the head settles. */
+    return setloc_seek_far ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES * 4) : 0x800;
 }
 
 /* Pending second-response command. due_cyc is an absolute guest deadline —
@@ -844,6 +876,57 @@ static int has_disc(void) {
 #define CDIRQ_DATA_END    4
 #define CDIRQ_ERROR       5
 
+/* ---- CD INT loss accounting -------------------------------------------
+ * s_int1_lost (below) covers only the one-deep data-ready pend, so it sees
+ * nothing when a COMMAND response is dropped. irq_flag is a single numeric
+ * response code: a new set_irq overwrites an unacked one outright, and if
+ * that one never reached INTC the guest never saw it. That is a genuinely
+ * dropped INT2/INT3 and until now nothing counted it.
+ *
+ * Indexed by CD INT type 1..5 (1=DATA_READY 2=COMPLETE 3=ACK 4=DATA_END
+ * 5=ERROR); slot 0 is unused so index == type.
+ *
+ * Purely observational: nothing here changes delivery behaviour. */
+static uint64_t s_int_raised[6];
+static uint64_t s_int_presented[6];
+static uint64_t s_int_clobbered[6];         /* unacked INT overwritten */
+static uint64_t s_int_lost_unseen[6];       /* ...and never presented to INTC */
+static uint64_t s_int_acked_unpresented[6]; /* guest polled it, no IRQ raised */
+static uint8_t  s_irq_presented;            /* current generation reached INTC */
+static uint8_t  s_int_last_lost_old;
+static uint8_t  s_int_last_lost_new;
+static uint32_t s_int_last_lost_gen;
+
+static void cdrom_note_irq_replaced(uint8_t new_type) {
+    uint8_t prev = (uint8_t)(irq_flag & 0x1F);
+    if (prev && prev < 6) {
+        s_int_clobbered[prev]++;
+        if (!s_irq_presented) {
+            s_int_lost_unseen[prev]++;
+            s_int_last_lost_old = prev;
+            s_int_last_lost_new = new_type;
+            s_int_last_lost_gen = cdrom_irq_generation;
+            /* 'L' = an INT the guest never saw, destroyed by the next one.
+             * val = (lost << 8) | replacement. */
+            trace_cdrom('L', 0, ((uint32_t)prev << 8) | (uint32_t)new_type, 0);
+        }
+    }
+    s_irq_presented = 0;
+    if (new_type > 0 && new_type < 6) s_int_raised[new_type]++;
+}
+
+static void cdrom_note_irq_presented(void) {
+    uint8_t t = (uint8_t)(irq_flag & 0x1F);
+    s_irq_presented = 1;
+    if (t && t < 6) s_int_presented[t]++;
+}
+
+static void cdrom_note_irq_acked(uint8_t acked_type) {
+    if (!s_irq_presented && acked_type && acked_type < 6)
+        s_int_acked_unpresented[acked_type]++;
+    s_irq_presented = 0;
+}
+
 static void response_clear(void) {
     response_read = 0;
     response_count = 0;
@@ -856,6 +939,8 @@ static void response_push(uint8_t val) {
 }
 
 static void set_irq(int type) {
+    /* Account for the outgoing response BEFORE it is overwritten. */
+    cdrom_note_irq_replaced((uint8_t)type);
     irq_flag = (uint8_t)type;
     /* New visible CD INT generation: it has not yet been presented to INTC,
      * so re-arm the latch (the delayed present below raises it once). */
@@ -892,6 +977,7 @@ static void present_cdrom_irq(void) {
     if (cdrom_irq_mask_matches_reason(irq_enable, irq_flag) &&
         !cdrom_intc_request_latched) {
         psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
+        cdrom_note_irq_presented();
         cdrom_intc_request_latched = 1;
         cdrom_intc_latched_generation = cdrom_irq_generation;
         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
@@ -1881,7 +1967,8 @@ static void exec_command(uint8_t cmd) {
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
         {
-            int lat = apply_speed(30000); /* motor spin-up */
+            /* NOT accelerated — second-response rule at apply_speed(). */
+            int lat = 30000; /* motor spin-up */
             pending_arm(0x07, lat, 1);
             s_cd_probe_motor_count++;
             s_cd_probe_motor_cycles += (uint64_t)lat;
@@ -1906,7 +1993,8 @@ static void exec_command(uint8_t cmd) {
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
         {
-            int lat = apply_speed(30000); /* motor spin-down */
+            /* NOT accelerated — second-response rule at apply_speed(). */
+            int lat = 30000; /* motor spin-down */
             pending_arm(0x08, lat, 1);
             s_cd_probe_stop_count++;
             s_cd_probe_stop_cycles += (uint64_t)lat;
@@ -2620,9 +2708,14 @@ void cdrom_write(uint32_t addr, uint32_t value) {
              * latch so the NEXT generation can be presented to INTC. Use the
              * active->inactive edge rather than a bare !=0->0 so partial-clear
              * writes don't mis-rearm. */
-            int had_active_irq = (irq_flag & 0x1F) != 0;
+            uint8_t acked_type = (uint8_t)(irq_flag & 0x1F);
+            int had_active_irq = acked_type != 0;
             irq_flag &= ~(val & 0x1F);
             if (had_active_irq && (irq_flag & 0x1F) == 0) {
+                /* Fully acked. An ack of an INT that never reached INTC means
+                 * the guest found it by polling, not by interrupt — counted
+                 * apart from a true drop so the two are never conflated. */
+                cdrom_note_irq_acked(acked_type);
                 cdrom_intc_request_latched = 0;
             }
             if (val & 0x40) {
@@ -2778,6 +2871,15 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->int1_pended = s_int1_pended;
     out->int1_lost = s_int1_lost;
     out->int1_pending_now = pending_dataready;
+    memcpy(out->int_raised, s_int_raised, sizeof(out->int_raised));
+    memcpy(out->int_presented, s_int_presented, sizeof(out->int_presented));
+    memcpy(out->int_clobbered, s_int_clobbered, sizeof(out->int_clobbered));
+    memcpy(out->int_lost_unseen, s_int_lost_unseen, sizeof(out->int_lost_unseen));
+    memcpy(out->int_acked_unpresented, s_int_acked_unpresented,
+           sizeof(out->int_acked_unpresented));
+    out->int_last_lost_old = s_int_last_lost_old;
+    out->int_last_lost_new = s_int_last_lost_new;
+    out->int_last_lost_gen = s_int_last_lost_gen;
     out->pending_pending = pending.pending;
     out->pending_delay = pending_rem_cycles();
     out->pending_phase = pending.phase;

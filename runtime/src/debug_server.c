@@ -5175,11 +5175,13 @@ static void handle_menu_state(int id, const char *json)
              "\"menu\":%d,\"item\":%d,\"rows\":%d,"
              "\"hover_menu\":%d,\"hover_row\":%d,\"editing\":%d,\"dirty\":%d,"
              "\"logical_w\":%d,\"logical_h\":%d,\"ui_scale\":%d,"
-             "\"vol_master\":%d,\"vol_music\":%d,\"vol_sound\":%d}",
+             "\"vol_master\":%d,\"vol_music\":%d,\"vol_sound\":%d,"
+             "\"fast_loads\":%d,\"speed\":%d,\"supersampling\":%d}",
              id, m.visible, m.expanded, m.menu, m.item, m.rows,
              m.hover_menu, m.hover_row, m.editing, m.dirty,
              m.logical_w, m.logical_h, m.ui_scale,
-             m.vol_master, m.vol_music, m.vol_sound);
+             m.vol_master, m.vol_music, m.vol_sound,
+             m.fast_loads, m.speed, m.supersampling);
 }
 
 /* In-process input-latency samples. `reset=1` clears the ring first. */

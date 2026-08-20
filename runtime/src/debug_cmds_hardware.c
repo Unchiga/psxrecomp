@@ -179,12 +179,28 @@ void handle_geom_correction(int id, const char *json)
 void handle_fast_loads(int id, const char *json)
 {
     int level = json_get_int(json, "level", -1);
-    int divisor = -1;
     if (level >= 0 && level <= 2)
-        divisor = psx_host_set_fast_loads(level);
-    send_fmt("{\"id\":%d,\"ok\":true,\"level\":%d,\"divisor\":%d,"
-             "\"instant_budget\":%d}",
-             id, level, divisor, cdrom_get_instant_rate());
+        psx_host_set_fast_loads(level);
+    /* Report BOTH divisors, never the parsed argument. The original form
+     * echoed level/divisor = -1 when called with no argument, which reads as
+     * "fast loading is off" — and was recorded as exactly that in ISSUES.md on
+     * a machine running instant loads. Reporting only the LIVE divisor has the
+     * same failure mode for a different reason: boot deliberately runs at 1x
+     * until cdrom_notify_game_started latches the configured value, so an
+     * instant setup reads "authentic" for the whole boot. `mode` therefore
+     * describes the CONFIGURED setting; `active_now` says whether it has been
+     * latched yet. */
+    int divisor = cdrom_get_speed_divisor();
+    int game_divisor = cdrom_get_game_speed_divisor();
+    send_fmt("{\"id\":%d,\"ok\":true,\"requested_level\":%d,"
+             "\"divisor\":%d,\"game_divisor\":%d,\"mode\":\"%s\","
+             "\"active_now\":%s,\"boot_phase\":%s,\"instant_budget\":%d}",
+             id, level, divisor, game_divisor,
+             game_divisor == 0 ? "instant"
+                               : (game_divisor == 1 ? "authentic" : "fast"),
+             divisor == game_divisor ? "true" : "false",
+             divisor != game_divisor ? "true" : "false",
+             cdrom_get_instant_rate());
 }
 
 void handle_gpu_state(int id, const char *json)
@@ -465,6 +481,10 @@ void handle_cdrom_state(int id, const char *json)
     (void)json;
     CDROMDebugState s;
     cdrom_debug_snapshot(&s);
+/* Expand a uint64_t[6] counter into the six %llu arguments it feeds. */
+#define CD_INT6(a) (unsigned long long)(a)[0], (unsigned long long)(a)[1], \
+                   (unsigned long long)(a)[2], (unsigned long long)(a)[3], \
+                   (unsigned long long)(a)[4], (unsigned long long)(a)[5]
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"seq\":%llu,\"has_disc\":%d,"
              "\"index\":%u,\"stat\":\"0x%02X\","
@@ -482,6 +502,13 @@ void handle_cdrom_state(int id, const char *json)
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
              "\"last_sector\":{\"lba\":%d,\"size\":%d,\"frame\":%u,"
              "\"mode\":\"0x%02X\",\"have_raw\":%u},"
+             "\"speed_divisor\":%d,"
+             "\"int_raised\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+             "\"int_presented\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+             "\"int_clobbered\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+             "\"int_lost_unseen\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+             "\"int_acked_unpresented\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+             "\"int_last_lost\":{\"old\":%u,\"new\":%u,\"gen\":%u},"
              "\"i_stat\":\"0x%08X\"}",
              id, (unsigned long long)s.seq, s.has_disc,
              s.index_reg, s.stat_reg, s.request_reg, s.irq_enable, s.irq_flag,
@@ -501,8 +528,15 @@ void handle_cdrom_state(int id, const char *json)
              s.pending_phase,
              s.last_sector_lba, s.last_sector_size, s.last_sector_frame,
              s.last_sector_mode, s.last_sector_have_raw,
+             s.speed_divisor,
+             CD_INT6(s.int_raised), CD_INT6(s.int_presented),
+             CD_INT6(s.int_clobbered), CD_INT6(s.int_lost_unseen),
+             CD_INT6(s.int_acked_unpresented),
+             s.int_last_lost_old, s.int_last_lost_new, s.int_last_lost_gen,
              s.i_stat);
 }
+
+#undef CD_INT6
 
 void handle_cdrom_sector_dump(int id, const char *json)
 {
