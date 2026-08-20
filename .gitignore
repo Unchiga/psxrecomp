@@ -52,3 +52,4 @@ psx_freeze_heartbeat.json
 psx_screenshot.bmp
 __pycache__/
 /toolchain
+/card2.mcd.bak.before_beetle_copy
