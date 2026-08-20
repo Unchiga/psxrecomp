@@ -13145,6 +13145,17 @@ CPUState cpu;
         vms.vol_master  = 100;
         vms.vol_music   = 100;
         vms.vol_sound   = 100;
+        /* MUST be seeded here. `vms` is a plain uninitialised local whose
+         * fields are assigned one by one, and menu_settings.ini only
+         * overwrites keys it actually contains - so a field missed here holds
+         * stack garbage, and an absent key leaves it there. This one read
+         * nonzero on the machine it was written on (the prompt appeared) and
+         * zero in the shipped build (the whole check silently disabled
+         * itself), which is the worst possible way for it to fail. The same
+         * hazard is called out at s_state's designated initialiser in
+         * psx_video_menu.c: every field added to PsxVideoMenuState needs a
+         * line here. */
+        vms.update_check = 1;
         /* Duel rank ON by default, as the in-game sprites beside the FIELD box.
          * It is the enhancement most players never find otherwise — a feature
          * gated behind a menu row nobody opens may as well not ship — and it
