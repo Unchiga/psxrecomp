@@ -3850,7 +3850,23 @@ void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
         if (g_relaunch_is_helper) {
             fprintf(stderr,
                     "psxrecomp-codegen: starting deferred rebuild helper\n");
-            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"%s\"", exe);
+            /* Doubled quotes, and /S, or cmd eats the path.
+             *
+             * `cmd /C "<path>"` preserves its quotes only when the text
+             * between them has no character from &<>()@^| AND contains
+             * whitespace. An install directory named `ygofm-0.2.5-win-x64(1)`
+             * -- exactly what a browser produces on a second download of the
+             * same zip -- fails both tests, so cmd strips the quotes and then
+             * parses the bare parenthesis as a command group. The helper never
+             * runs, nothing rebuilds, and the player keeps launching the
+             * previous version's binary with no error anywhere. Measured: a
+             * tree at 0.2.5 next to a build stamped 0.2.3, across two updates.
+             * `&` in a path fails the same way.
+             *
+             * /S makes the rule deterministic (always strip the outer pair),
+             * and the inner pair then protects the path. Same idiom as the
+             * toolchain probe further up this file. */
+            snprintf(cmd, sizeof(cmd), "cmd.exe /S /C \"\"%s\"\"", exe);
             flags = CREATE_NEW_CONSOLE;
         } else {
             fprintf(stderr, "psxrecomp-codegen: relaunching %s\n", exe);
