@@ -347,6 +347,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_bios_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_netplay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_lobby_client.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_update_check.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
     ${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp
     # (sljit Tier-2 in-process JIT backend removed 2026-07-15 — was disabled by
@@ -792,6 +793,7 @@ function(psxrecomp_add_runtime_target target)
         LAUNCHER_BRAND
         EXE_NAME
         GAME_VERSION
+        UPDATE_REPO
         MAX_PLAYERS
         APP_ICON
     )
@@ -1172,6 +1174,21 @@ function(psxrecomp_add_runtime_target target)
         "${PSXRECOMP_ROOT}/runtime/src/psx_lobby_client.c"
         PROPERTIES COMPILE_DEFINITIONS "PSX_GAME_VERSION=\"${PSXRT_GAME_VERSION}\""
     )
+    # The update check needs the same version string, plus the repo to ask
+    # about. With no UPDATE_REPO the module compiles to a no-op and the
+    # build makes no network access at all.
+    if(PSXRT_UPDATE_REPO)
+        set_source_files_properties(
+            "${PSXRECOMP_ROOT}/runtime/src/psx_update_check.c"
+            PROPERTIES COMPILE_DEFINITIONS
+            "PSX_GAME_VERSION=\"${PSXRT_GAME_VERSION}\";PSX_UPDATE_REPO=\"${PSXRT_UPDATE_REPO}\""
+        )
+        # WinHTTP is the Windows transport; elsewhere the module's whole body
+        # is #ifdef'd out, so there is nothing to link against.
+        if(WIN32)
+            target_link_libraries(${target} PRIVATE winhttp)
+        endif()
+    endif()
     set_source_files_properties(
         "${PSXRECOMP_ROOT}/runtime/src/crash_trace.c"
         PROPERTIES COMPILE_DEFINITIONS "PSX_BUILD_REV=\"${PSX_GIT_REV}\""

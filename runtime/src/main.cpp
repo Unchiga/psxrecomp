@@ -30,6 +30,7 @@
 #include "psx_savestate_menu.h"
 #include "psx_game_hooks.h"
 #include "psx_video_menu.h"
+#include "psx_update_check.h"  /* "is there a newer release?", off the boot path */
 #include "host_osd.h"
 #include "psx_host_input.h"   /* our own exports: injection, pad mask, lag ring */
 #include "host_keymap.h"
@@ -5826,6 +5827,39 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_game_run_frame_hooks();
         /* Drives the menu's hover-to-open dwell; the module keeps no clock. */
         psx_video_menu_tick((unsigned int)SDL_GetTicks());
+        /* A newer release, if the background check found one. Polled once a
+         * frame and answered at most once a run — the module latches, so this
+         * cannot turn into a dialog every frame if the player dismisses it.
+         *
+         * The prompt is deliberately the LAST thing wired: it interrupts, and
+         * the only two honest answers are "take me there" and "leave me
+         * alone". Nothing is downloaded and nothing in the install is touched
+         * — a self-updater that rewrites its own directory while running is a
+         * far bigger promise than a version number can justify. */
+        {
+            char up_tag[64], up_url[512];
+            if (psx_update_check_take(up_tag, (int)sizeof(up_tag),
+                                      up_url, (int)sizeof(up_url))) {
+                char msg[640];
+                std::snprintf(msg, sizeof(msg),
+                    "%s is available.\n\nYou are running %s.\n\n"
+                    "Your saves live in Documents\\My Games, not in the game "
+                    "folder, so updating cannot touch them - extract the new "
+                    "version wherever you like.\n\n"
+                    "Open the download page now?",
+                    up_tag, psx_update_check_current_version());
+                const bool go = launcher_confirm("Update available", msg);
+                /* The dialog blocks THIS thread, and this thread is the one
+                 * that emits the starvation heartbeat. However long the player
+                 * spent reading is indistinguishable, on resume, from a hung
+                 * emulator: the watchdog trips on the gap and exit(2)s a
+                 * perfectly healthy session. Measured - a 52 s think ended the
+                 * run. Beat it before the next check, because the runtime was
+                 * waiting for a human, which is not starvation. */
+                starvation_watchdog_heartbeat();
+                if (go) SDL_OpenURL(up_url);
+            }
+        }
         {
             PsxVideoMenuState vms;
             if (psx_video_menu_take_change(&vms))
@@ -13129,6 +13163,16 @@ CPUState cpu;
         if (g_player_data_migrated)
             host_osd_push("Saves moved to Documents\\My Games - see the log for the path",
                           6000);
+
+        /* Ask about a newer release, on every launch, unless the player turned
+         * it off. Fired here rather than earlier so it cannot delay anything
+         * the player is waiting on; the answer is polled in the frame loop and
+         * may never arrive, which is a normal outcome, not an error. */
+        if (vms.update_check)
+            psx_update_check_start(NULL);   /* module knows its own version */
+        else
+            fprintf(stdout, "psxrecomp: update check disabled "
+                            "(update_check=0 in menu_settings.ini)\n");
         /* Baseline for the "what changed" toast, so the first change of the
          * session is announced correctly. */
         g_last_applied_vms   = vms;

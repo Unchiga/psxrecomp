@@ -367,9 +367,24 @@ so updating cannot touch them. Extract a new version wherever you like --
 over the top of the old one or into a brand new folder -- and your saves
 are safe either way. You do not have to copy anything.
 
-Upgrading from a version that kept saves next to the game? The first launch
-copies them across for you and leaves the originals where they are, so
-nothing is lost if you change your mind.
+UPGRADING FROM AN OLDER VERSION -- READ THIS ONCE
+
+Older versions kept saves inside the game folder. To bring them across,
+EXTRACT THIS UPDATE OVER YOUR EXISTING INSTALL. The first launch then finds
+your old saves, copies them to Documents, and leaves the originals alone --
+you do nothing, and nothing is lost if you change your mind.
+
+If you instead extracted into a brand new folder, the game cannot see your
+old saves, because they are still sitting in the old folder. Nothing is
+gone. Copy these from the OLD game folder into
+
+    Documents\\My Games\\${DISPLAY_NAME}
+
+    card1.mcd, card2.mcd   (memory cards)
+    saves\\                 (or the openbios\\ folder inside it: save states)
+
+After that first launch, this no longer applies: your saves are outside the
+game folder for good, and any later update can be extracted anywhere.
 
 Want everything in this folder instead (USB stick, shared machine)? Put an
 empty file named portable.txt next to ${EXE_BASENAME}, or set PSX_PORTABLE=1.

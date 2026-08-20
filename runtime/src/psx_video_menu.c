@@ -204,6 +204,7 @@ static PsxVideoMenuState s_state = {
     .vol_master     = 100,
     .vol_music      = 100,
     .vol_sound      = 100,
+    .update_check   = 1,
 };
 
 /* Inline numeric entry. Active only while the player is typing into a row. */
@@ -1477,6 +1478,7 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "vol_master")) out->vol_master = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_sound"))  out->vol_sound  = (v >= 0 && v <= 100) ? v : 100;
+        else if (!strcmp(key, "update_check")) out->update_check = v ? 1 : 0;
         else {
             /* Rows a title registered. Clamped to the row's own bounds so a
              * hand-edited file cannot push a value past what the row accepts. */
@@ -1547,7 +1549,8 @@ int psx_video_menu_settings_save(const char *path) {
         "fast_loads=%d      # 0 authentic, 1 fast, 2 instant disc loads\n"
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
-        "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n",
+        "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n"
+        "update_check=%d   # 1 = check GitHub for a newer release on launch\n",
         s_state.scaling ? 1 : 0,
         s_state.filter ? 1 : 0,
         s_state.texture_filter ? 1 : 0,
@@ -1563,7 +1566,8 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.fast_loads >= 0 && s_state.fast_loads <= 2) ? s_state.fast_loads : 0,
         (s_state.vol_master >= 0 && s_state.vol_master <= 100) ? s_state.vol_master : 100,
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,
-        (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100);
+        (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
+        s_state.update_check ? 1 : 0);
     /* Rows a title registered, in registration order. A row with no key is
      * deliberately not written: a live cheat re-applied at startup would
      * overwrite the player's real save. */

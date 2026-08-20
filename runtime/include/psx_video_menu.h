@@ -59,6 +59,12 @@ typedef struct PsxVideoMenuState {
     int vol_master;
     int vol_music;
     int vol_sound;
+    /* 1 = ask GitHub for a newer release on launch and prompt if there is
+     * one. Lives here purely so it persists in menu_settings.ini with the
+     * player's other choices; it is not a video option and has no row.
+     * Set update_check=0 in that file to stop the check entirely - no
+     * request is made at all, not merely a suppressed prompt. */
+    int update_check;
 } PsxVideoMenuState;
 
 #define PSX_VM_SPEED_DEFAULT 1
