@@ -893,6 +893,8 @@ static int g_netplay_local_viewport = 0; /* 0 off, 1 vertical split */
  * activation, but remains game.toml opt-in so normal netplay stays vanilla. */
 static int g_netplay_local_viewport_aspect = 0; /* 0 off, 1 16:9, 2 21:9, 3 adaptive */
 
+static void video_aspect_live_apply();
+
 extern "C" int psx_mod_set_fixed_display_aspect(
     uint32_t numerator, uint32_t denominator) {
     if (numerator == 0 || denominator == 0 ||
@@ -907,6 +909,10 @@ extern "C" int psx_mod_set_fixed_display_aspect(
     g_video_aspect_num = (int)numerator;
     g_video_aspect_den = (int)denominator;
     g_ws_adaptive_view = false;
+    /* Before window creation this only records the globals the boot path
+     * reads; once a renderer exists it replumbs it in place, so a mod row
+     * can toggle the aspect mid-session. */
+    video_aspect_live_apply();
     std::fprintf(stdout, "psxrecomp: mod selected fixed display aspect %u:%u\n",
                  (unsigned)numerator, (unsigned)denominator);
     return 1;
@@ -1213,6 +1219,39 @@ static void refresh_widescreen_projection() {
                            mode == 1 ? proj_den : 3);
     gpu_ws_configure(proj_num, proj_den, g_ws_anchor_addr,
                      g_ws_hud_sprt ? 1 : 0, mode);
+}
+
+/* Re-apply the CURRENT fixed aspect to a renderer that already exists — the
+ * same replumb the adaptive-resize handler does. The boot path reads the
+ * globals at window creation; a mod toggling the aspect mid-session (e.g. a
+ * VIEW > WIDESCREEN row) needs the change to land immediately. Safe before
+ * init: the GL setter only stores, the SDL branch is skipped with no
+ * renderer, and the projection refresh returns until widescreen engages. */
+static void video_aspect_live_apply() {
+    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    if (sdl_renderer) {
+        g_logical_w = 480 * g_video_aspect_num * g_video_scale
+                      / g_video_aspect_den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w,
+                                 480 * g_video_scale);
+    }
+    /* A windowed session gets its window RESHAPED, exactly as if it had been
+     * created at this aspect: leaving the old shape and letterboxing inside
+     * it is what made a mid-session widescreen toggle look wrong. Keep the
+     * width; height follows from the aspect plus the menu-bar band (the
+     * 640x502 logical layout: 480 of picture, 22 of bar). Fullscreen keeps
+     * its mode and simply letterboxes, which is correct there. */
+    if (sdl_window && !g_fullscreen) {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(sdl_window, &w, &h);
+        if (w > 0) {
+            const int want_h = (int)((int64_t)w * g_video_aspect_den * 502
+                                     / ((int64_t)g_video_aspect_num * 480));
+            if (want_h > 0 && want_h != h)
+                SDL_SetWindowSize(sdl_window, w, want_h);
+        }
+    }
+    refresh_widescreen_projection();
 }
 
 /* Follow the host window without feeding its absolute pixel size into guest
