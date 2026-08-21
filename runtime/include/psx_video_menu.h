@@ -236,6 +236,11 @@ void psx_video_menu_set_row_hints(int row_handle, const char *const *hints);
  * value so it stays findable by eye after dragging. -1 (the default) = none. */
 void psx_video_menu_set_row_mark(int row_handle, int value);
 
+/* 1 while psx_video_menu_apply_restored() is replaying stored values. A row
+ * callback that shows a toast should skip it when this is set: the player
+ * did not touch the row, the settings file did. */
+int  psx_video_menu_is_restoring(void);
+
 int  psx_video_menu_get_row(int row_handle);
 void psx_video_menu_set_row(int row_handle, int value);
 

@@ -1568,13 +1568,23 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
  * Only rows that actually came from the file are applied. A row sitting at
  * its registered default is already what the module believes, so firing its
  * callback would be a behaviour change nobody asked for. */
+/* Set only while the loop below is replaying stored values, so a row's
+ * on_change can tell "the file said so at startup" from "the player just
+ * moved me". Without it a callback cannot distinguish the two, and any row
+ * that announces itself announces itself on every launch. */
+static int s_applying_restored;
+
+int psx_video_menu_is_restoring(void) { return s_applying_restored; }
+
 void psx_video_menu_apply_restored(void) {
     int i;
+    s_applying_restored = 1;
     for (i = 0; i < s_reg_count; i++) {
         VmRegRow *r = &s_reg[i];
         if (!r->restored || !r->on_change) continue;
         r->on_change(r->value);
     }
+    s_applying_restored = 0;
 }
 
 int psx_video_menu_settings_save(const char *path) {
