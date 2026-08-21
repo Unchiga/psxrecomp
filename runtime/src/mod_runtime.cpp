@@ -1219,6 +1219,11 @@ extern "C" void mod_runtime_on_vblank(void) {
         mod_invoke_vblank_plugin(plugin.id);
 }
 
+extern "C" const char *psx_mod_host_player_data_dir(void);
+extern "C" const char *psx_mod_player_data_dir(void) {
+    return psx_mod_host_player_data_dir();
+}
+
 extern "C" int psx_mod_game_started(void) {
     return fntrace_is_game_started();
 }

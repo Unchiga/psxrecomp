@@ -1493,6 +1493,12 @@ static std::filesystem::path resolve_existing_runtime_path(const char* requested
 /* Reported in the boot banner and used for the one-time "your saves moved"
  * notice, so the player is told rather than left to discover it. */
 static std::string g_player_data_dir;
+
+/* Published to mods: a mod that ships an editable config must write it where
+ * the player's other files live, not next to the exe. */
+extern "C" const char *psx_mod_host_player_data_dir(void) {
+    return g_player_data_dir.c_str();
+}
 static bool        g_player_data_migrated = false;
 
 static bool psx_portable_install(const char* argv0) {

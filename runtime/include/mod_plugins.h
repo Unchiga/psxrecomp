@@ -48,6 +48,12 @@ void psx_mod_write_code_word(uint32_t address, uint32_t value);
  */
 uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
 
+/* Where the player's files live: Documents/My Games/<title>, or the install
+ * folder for a portable install. Empty string before boot resolves it. A mod
+ * that ships an editable config needs this -- writing next to the exe puts it
+ * somewhere an update overwrites and a locked-down install cannot write. */
+const char *psx_mod_player_data_dir(void);
+
 /*
  * Allocate guest memory that is also addressable by 24-bit GPU linked-list
  * tags. This is intended for opt-in enhanced primitive/ordering-table arenas;
