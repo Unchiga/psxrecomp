@@ -2561,11 +2561,22 @@ void gl_renderer_set_display_aspect(int num, int den) {
     s_aspect_num = num; s_aspect_den = den;
 }
 
-/* Integer-scale state. s_native_* is the guest's CURRENT display size in native
- * PS1 pixels (pre-supersampling) - the host sets it each present, since the
- * game can change display mode at any time (320x240 <-> 256x240 <-> 368x240). */
+/* Integer-scale state. s_native_* is the PRESENTED source size in native PS1
+ * pixels (pre-supersampling): the current display mode's width for canonical
+ * frames, the wide compositor's full width (canonical + reveal margins) for
+ * native-wide frames. The host sets it on the CPU present paths; the FBO
+ * present paths refresh it themselves — they return before the host's setter
+ * runs, and a stale value here made the integer snap pin a 16:9 wide frame
+ * into multiples of a remembered 320x240, i.e. back into a squeezed 4:3 rect.
+ *
+ * s_present_pin43 remembers whether the LAST presented frame's rect was pinned
+ * to native 4:3 (FMV / menus under an engaged widescreen layer) rather than
+ * letterboxed at the display aspect. Guest-space overlays must map through the
+ * same rect the picture actually used, so the OSD compositor reads this
+ * instead of assuming 4:3. */
 static int s_integer_scale = 0;
 static int s_native_w = 0, s_native_h = 0;
+static int s_present_pin43 = 0;
 
 void gl_renderer_set_integer_scale(int on) { s_integer_scale = on ? 1 : 0; }
 
@@ -2978,6 +2989,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
                          int force_4_3, int content_w) {
     if (!s_ctx) return;
     interp_reset_history();
+    s_present_pin43 = force_4_3 ? 1 : 0;   /* overlay mapping follows this rect */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
@@ -4389,11 +4401,26 @@ static void gl_swap_with_osd(void) {
                 }
                 if (!ov->image(&px, &ow, &oh) || !px) continue;
 
+                /* Map through the rect the PICTURE actually used this frame,
+                 * not an assumed 4:3: a native-wide frame presents at the
+                 * display aspect with the canonical content offset into the
+                 * wide surface's centre columns, and overlays anchored to
+                 * boxes the game drew must ride the same transform or they
+                 * drift by exactly the reveal margin (and by the aspect
+                 * difference) whenever the widescreen layer presents wide. */
                 int lx, ly, lw, lh;
-                letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+                if (s_present_pin43)
+                    letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+                else
+                    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
                 if (lw <= 0 || lh <= 0) continue;
                 const int nw = (s_native_w > 0) ? s_native_w : 320;
                 const int nh = (s_native_h > 0) ? s_native_h : 240;
+                /* Guest coordinates are authored in CANONICAL space; on a wide
+                 * frame the canonical content sits g_wide_off columns into the
+                 * presented source. Recognize a wide present by its width. */
+                const int goff = (!s_present_pin43 && g_wide_w > 0 &&
+                                  nw == g_wide_w) ? g_wide_off : 0;
                 /* letterbox_rect_aspect's y is fed straight to glViewport by
                  * present_target_quad, and GL's viewport origin is BOTTOM-left.
                  * This overlay path is top-based (gl_draw_osd_image_ex converts
@@ -4407,7 +4434,7 @@ static void gl_swap_with_osd(void) {
                 int gx = 0, gy = 0;
                 ov->origin(&gx, &gy);
                 const int sub = ov->subpixel_y ? ov->subpixel_y() : 0;
-                const int dx = lx + (gx * lw) / nw;
+                const int dx = lx + ((gx + goff) * lw) / nw;
                 const int dy = ly_top + (gy * lh) / nh + (sub * lh) / (2 * nh);
                 int dw = (ow * lw) / nw;
                 int dh = (oh * lh) / nh;
@@ -4590,6 +4617,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         return;
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
+    /* This path returns before the host's per-frame native-size setter runs,
+     * so refresh it here or the integer snap (and the guest-overlay mapping in
+     * gl_swap_with_osd) works from whatever the last CPU-path frame left. */
+    s_native_w = w; s_native_h = h;
+    s_present_pin43 = force_4_3 ? 1 : 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
@@ -4698,6 +4730,12 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         return 1;
     }
     gl_perf_present_enter();
+    /* The presented source is the WIDE surface: canonical width + both reveal
+     * margins. Feed that to the integer snap / overlay mapping, not the
+     * canonical display width — snapping a 16:9 frame to multiples of 320x240
+     * is exactly the "widescreen looks 4:3 under integer scaling" bug. */
+    s_native_w = g_wide_w; s_native_h = disp_h;
+    s_present_pin43 = 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
