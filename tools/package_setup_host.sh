@@ -43,6 +43,7 @@ VERSION_ENV="RELEASE_VERSION"
 DISC_HINT="your legally owned game disc"
 PROJECT_FILES=()
 PROJECT_DIRS=()
+PROJECT_EXCLUDES=()
 RUNTIME_BIN_DIR="${PSXRECOMP_RUNTIME_BIN_DIR:-${BPE_RUNTIME_BIN_DIR:-/usr/x86_64-w64-mingw32/bin}}"
 EMBED_TOOLCHAIN=0
 if [[ "${PSXRECOMP_EMBED_TOOLCHAIN:-0}" == "1" ]]; then
@@ -67,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --disc-hint) DISC_HINT="${2:?}"; shift 2 ;;
     --project-file) PROJECT_FILES+=("${2:?}"); shift 2 ;;
     --project-dir) PROJECT_DIRS+=("${2:?}"); shift 2 ;;
+    --project-exclude) PROJECT_EXCLUDES+=("${2:?}"); shift 2 ;;
     --runtime-bin) RUNTIME_BIN_DIR="${2:?}"; shift 2 ;;
     --root) ROOT="${2:?}"; shift 2 ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
@@ -253,6 +255,18 @@ done
 for d in "${PROJECT_DIRS[@]}"; do
   copy_proj "${d}"
 done
+
+# Project paths a release must NOT carry, removed after the copy because
+# copy_proj is a plain cp -a of the working tree. The motivating case: art a
+# title bakes from the player's own disc or captures from a running game
+# (gitignored, but the working tree has it) sitting inside a --project-dir —
+# shipping it is exactly what the bake-from-disc rule exists to prevent, and
+# nothing fails when it leaks. Same defensive posture as the .mcd scrub.
+for x in "${PROJECT_EXCLUDES[@]}"; do
+  rm -rf "${STAGE:?}/${x}"
+done
+find "${STAGE}" -type d -name '__pycache__' -prune -exec rm -rf {} + \
+  2>/dev/null || true
 
 copy_tree_filtered() {
   local src="$1" dest="$2"
