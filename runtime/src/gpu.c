@@ -3202,10 +3202,6 @@ int gpu_texture_correction_enabled(void) {
     return s_texture_correction_enabled;
 }
 
-int gpu_texture_correction_enabled(void) {
-    return s_texture_correction_enabled;
-}
-
 /* Rejection census. "Perspective triangles: 0" says the feature is inert on a
  * title but not which of its three independent preconditions failed, and those
  * have completely different meanings: no source address means the packet did

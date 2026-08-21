@@ -2,4 +2,4 @@
  * Content hash of the recompiler codegen sources; folded into the overlay cache
  * path so an emitter change never reuses a stale DLL. */
 #pragma once
-#define PSX_OVERLAY_CODEGEN_HASH 0xe16e5224u
+#define PSX_OVERLAY_CODEGEN_HASH 0xb2ba59b1u
