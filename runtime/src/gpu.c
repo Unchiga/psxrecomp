@@ -174,10 +174,22 @@ static int ws_precise_nclip_cfg = 0;
 static uint32_t ws_gameplay_state_addr = 0;
 static uint32_t ws_gameplay_state_values[WS_GAMEPLAY_STATE_VALUES_MAX];
 static int ws_gameplay_state_value_count = 0;
-/* Any frame that projects a handful of vertices is "3D" (a low threshold so a
- * sparse close-up cutscene frame still counts — the flicker was frames dipping
- * below a high 16-vert bar and pillarboxing for a frame or two). */
-#define WS_GTE_GAME_MODE_MIN_VERTS 3u
+/* Two-threshold Schmitt trigger. ENTERING game mode takes real projection
+ * volume: a 3D world projects hundreds of verts per frame through RTPS/RTPT
+ * (same reasoning as WS_WORLD3D_MIN_VERTS below), while a menu's decorative
+ * GTE effect projects a quad or two. A single low bar (this was 3) let the
+ * YGO FM free-duel grid — whose cursor glint projects exactly 4 verts for a
+ * dozen frames every couple of seconds — arm game mode from a MENU, so the
+ * present flapped wide<->4:3 on the hysteresis cadence, a visible ~1 Hz
+ * pulse of the whole picture. Once ENTERED, the mode is HELD/refreshed by
+ * the original low bar, so a sparse close-up cutscene frame still counts —
+ * the flicker that low bar was added for (frames dipping below a high
+ * 16-vert bar and pillarboxing for a frame or two) stays fixed. A menu
+ * burst can only keep the mode alive if it lands within the hysteresis of
+ * a real 3D frame; bursts spaced wider than the hysteresis (the grid's
+ * ~2 s cadence vs 0.75 s) can never latch it. */
+#define WS_GTE_GAME_MODE_HOLD_VERTS  3u
+#define WS_GTE_GAME_MODE_ENTER_VERTS 48u
 /* STICKY: stay in native-wide for ~0.75s after the last 3D frame, so brief
  * low-poly frames in a real-time 3D cutscene never flip to a 4:3 pillarbox (the
  * intro-cutscene flicker). Only a genuine full-2D screen — no GTE projection for
@@ -254,8 +266,14 @@ void psx_ws_note_gte_project(int nverts) {
         ws_gte_frame = f; ws_gte_count = 0;
     }
     ws_gte_count += (uint32_t)nverts;
-    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS)
-        ws_last_gte_stamp = f;
+    if (ws_gte_game_mode_cfg) {
+        /* held: a stamped frame lies within the hysteresis window (unsigned
+         * wrap at the boot sentinel makes this false until first entry). */
+        const int held = f - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS;
+        if (ws_gte_count >= WS_GTE_GAME_MODE_ENTER_VERTS ||
+            (held && ws_gte_count >= WS_GTE_GAME_MODE_HOLD_VERTS))
+            ws_last_gte_stamp = f;
+    }
     if (ws_gte_count >= WS_WORLD3D_MIN_VERTS && ws_last_world3d_stamp != f) {
         if (f == ws_last_world3d_stamp + 1u) ws_sust_world3d_stamp = f;
         ws_last_world3d_stamp = f;
