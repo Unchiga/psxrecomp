@@ -24,6 +24,7 @@ void handle_dma_trace_dump(int id, const char *json);
 void handle_fast_loads(int id, const char *json);
 void handle_fill_ram(int id, const char *json);
 void handle_geom_correction(int id, const char *json);
+void handle_pgxp(int id, const char *json);
 void handle_get_quads(int id, const char *json);
 void handle_gpu_frame_dump(int id, const char *json);
 void handle_gpu_opcodes(int id, const char *json);

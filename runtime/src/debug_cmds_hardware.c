@@ -19,6 +19,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_render.h"
+#include "pgxp.h"
 #include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
@@ -156,6 +157,13 @@ void handle_geom_correction(int id, const char *json)
     gte_geometry_correction_stats(&lookups, &hits, &unrec, &ambig);
     uint32_t pa = 0, pns = 0, pnp = 0, pz = 0;
     gpu_texture_correction_stats(&pa, &pns, &pnp, &pz);
+    /* PGXP dataflow census (per-vertex): the primary provenance source.
+     * dataflow_hit is the number that had to move — the G1.9 gate is a
+     * dataflow-hit share dramatically above the 5.2% the position table
+     * measured on its own. value_mismatch counts shadows that were present
+     * but described a different word (stale = provenance hole to hunt). */
+    PGXPStats ps;
+    pgxp_get_stats(&ps);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"geometry_correction\":%d,"
              "\"perspective_texturing\":%d,"
@@ -163,14 +171,60 @@ void handle_geom_correction(int id, const char *json)
              "\"perspective_triangles\":%u,"
              "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
              "\"persp_attempts\":%u,\"persp_no_source\":%u,"
-             "\"persp_no_provenance\":%u,\"persp_zero_z\":%u}",
+             "\"persp_no_provenance\":%u,\"persp_zero_z\":%u,"
+             "\"pgxp\":{\"enabled\":%d,\"cpu_mode\":%d,\"tolerance\":%.3f,"
+             "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
+             "\"native\":%llu,\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
+             "\"tolerance_reject\":%llu,\"w_valid\":%llu,"
+             "\"produced\":%llu,\"swc2_stores\":%llu}}",
              id,
              gte_geometry_correction_enabled(),
              gpu_texture_correction_enabled(),
              (unsigned)hits,
              (unsigned)gpu_texture_correction_hits(),
              (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
-             (unsigned)pa, (unsigned)pns, (unsigned)pnp, (unsigned)pz);
+             (unsigned)pa, (unsigned)pns, (unsigned)pnp, (unsigned)pz,
+             pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+             (unsigned long long)ps.lookups,
+             (unsigned long long)ps.dataflow_hit,
+             (unsigned long long)ps.fallback_hit,
+             (unsigned long long)ps.native,
+             (unsigned long long)ps.value_mismatch,
+             (unsigned long long)ps.trunc_reject,
+             (unsigned long long)ps.tolerance_reject,
+             (unsigned long long)ps.w_valid,
+             (unsigned long long)ps.produced,
+             (unsigned long long)ps.swc2_stores);
+}
+
+/* pgxp — live-tune the value-propagation engine for one-toggle isolation runs
+ * without a rebuild: {"cmd":"pgxp","cpu_mode":0|1,"tolerance":F}. Fields are
+ * optional; the reply echoes the resulting state (same shape as
+ * geom_correction's "pgxp" object, flattened). */
+void handle_pgxp(int id, const char *json)
+{
+    /* Live toggles for the one-toggle-at-a-time A/B protocol (ENHANCEMENTS.md
+     * G1.6 method rule): same scene, flip one knob, screenshot_hires. */
+    int geom = json_get_int(json, "geometry", -1);
+    int tex = json_get_int(json, "texture", -1);
+    if (geom >= 0 || tex >= 0)
+        psx_host_set_geometry_enhancements(geom, tex);
+    int cm = json_get_int(json, "cpu_mode", -1);
+    if (cm >= 0)
+        pgxp_set_cpu_mode(cm != 0);
+    /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
+     * would truncate 0.5 to 0. */
+    const char *p = strstr(json, "\"tolerance\"");
+    if (p) {
+        p += 11;
+        while (*p == ' ' || *p == ':' || *p == '"') p++;
+        if (*p == '-' || (*p >= '0' && *p <= '9') || *p == '.')
+            pgxp_set_tolerance((float)strtod(p, NULL));
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"cpu_mode\":%d,"
+             "\"tolerance\":%.3f,\"suppress\":%u,\"active\":%d}",
+             id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
+             (unsigned)pgxp_test_suppress_depth(), pgxp_test_active());
 }
 
 /* fast_loads — set/read the disc-load acceleration level (GAME > FAST LOADING).
@@ -216,6 +270,8 @@ void handle_gpu_state(int id, const char *json)
     gpu_get_draw_area(&da);
     uint64_t nop, fill, draw, env, copy;
     gpu_get_gp0_stats(&nop, &fill, &draw, &env, &copy);
+    int split_active = 0, split_left_age = 0, split_right_age = 0;
+    gpu_vertical_split_debug(&split_active, &split_left_age, &split_right_age);
     GpuWsDebug ws;
     gpu_ws_get_debug(&ws);
     send_fmt("{\"id\":%d,\"ok\":true,"
@@ -230,6 +286,7 @@ void handle_gpu_state(int id, const char *json)
              "\"gp0_nop\":%llu,\"gp0_fill\":%llu,\"gp0_draw\":%llu,\"gp0_env\":%llu,\"gp0_copy\":%llu,"
              "\"draw_area\":[%u,%u,%u,%u],"
              "\"draw_offset\":[%d,%d],"
+             "\"vertical_split\":{\"active\":%d,\"left_age\":%d,\"right_age\":%d},"
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,"
              "\"activation_margin\":%d,\"squash\":[%d,%d],"
@@ -258,6 +315,7 @@ void handle_gpu_state(int id, const char *json)
              (unsigned long long)copy,
              da.left, da.top, da.right, da.bottom,
              da.offset_x, da.offset_y,
+             split_active, split_left_age, split_right_age,
              ws.configured, ws.active, ws.game_mode,
              ws.present_native_43, ws.x_margin, ws.activation_margin,
              ws.xnum, ws.xden,

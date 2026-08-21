@@ -474,6 +474,7 @@ extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 extern int psx_game_address_in_text(uint32_t addr);
 extern int psx_game_is_function_entry(uint32_t addr);  /* non-destructive entry test */
 extern int psx_game_text_native_ok(uint32_t addr);
+extern int psx_game_text_native_ok_full(uint32_t addr);
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
@@ -1512,30 +1513,48 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     switch (opc) {
     case 0x00: /* SPECIAL */
         switch (fnt) {
-        case 0x00: /* SLL rd, rt, sh (also nop when all fields are 0) */
-            cpu->gpr[rd] = cpu->gpr[rt] << sh;
+        case 0x00: { /* SLL rd, rt, sh (also nop when all fields are 0) */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = a << sh;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x02: /* SRL */
-            cpu->gpr[rd] = cpu->gpr[rt] >> sh;
+        }
+        case 0x02: { /* SRL */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = a >> sh;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x03: /* SRA */
-            cpu->gpr[rd] = (uint32_t)((int32_t)cpu->gpr[rt] >> sh);
+        }
+        case 0x03: { /* SRA */
+            uint32_t a = cpu->gpr[rt];
+            cpu->gpr[rd] = (uint32_t)((int32_t)a >> sh);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, sh);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x04: /* SLLV */
-            cpu->gpr[rd] = cpu->gpr[rt] << (cpu->gpr[rs] & 31);
+        }
+        case 0x04: { /* SLLV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = a << (b & 31);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x06: /* SRLV */
-            cpu->gpr[rd] = cpu->gpr[rt] >> (cpu->gpr[rs] & 31);
+        }
+        case 0x06: { /* SRLV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = a >> (b & 31);
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
-        case 0x07: /* SRAV */
-            cpu->gpr[rd] = (uint32_t)((int32_t)cpu->gpr[rt] >> (cpu->gpr[rs] & 31));
+        }
+        case 0x07: { /* SRAV */
+            uint32_t a = cpu->gpr[rt], b = cpu->gpr[rs];
+            cpu->gpr[rd] = (uint32_t)((int32_t)a >> (b & 31));
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
             if (target & 3) return interp_exception(cpu, 4, target, pc);  /* LoadAddressError */
@@ -1615,25 +1634,30 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
 #endif
             cpu->gpr[rd] = cpu->hi;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->hi, 0);
             cpu->gpr[0] = 0;
             return 0;
         case 0x11: /* MTHI */
             cpu->hi = cpu->gpr[rs];
+            psx_pgxp_alu(cpu, insn, cpu->hi, cpu->hi, 0);
             return 0;
         case 0x12: /* MFLO */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
 #endif
             cpu->gpr[rd] = cpu->lo;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], cpu->lo, 0);
             cpu->gpr[0] = 0;
             return 0;
         case 0x13: /* MTLO */
             cpu->lo = cpu->gpr[rs];
+            psx_pgxp_alu(cpu, insn, cpu->lo, cpu->lo, 0);
             return 0;
         case 0x18: { /* MULT */
             int64_t r = (int64_t)(int32_t)cpu->gpr[rs] * (int64_t)(int32_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)((uint64_t)r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[rs]));  /* completion deadline */
 #endif
@@ -1643,6 +1667,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             uint64_t r = (uint64_t)cpu->gpr[rs] * (uint64_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)(r >> 32);
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[rs]));  /* completion deadline */
 #endif
@@ -1661,6 +1686,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 cpu->lo = (uint32_t)(a / b);
                 cpu->hi = (uint32_t)(a % b);
             }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, 37u);   /* DIV completion deadline (fixed) */
 #endif
@@ -1674,31 +1700,41 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                 cpu->lo = cpu->gpr[rs] / cpu->gpr[rt];
                 cpu->hi = cpu->gpr[rs] % cpu->gpr[rt];
             }
+            psx_pgxp_muldiv(cpu, insn, cpu->hi, cpu->lo, cpu->gpr[rs], cpu->gpr[rt]);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_muldiv_set(cpu, 37u);   /* DIVU completion deadline (fixed) */
 #endif
             return 0;
         case 0x20: /* ADD - overflow traps are delegated if they occur. */
-        case 0x21: /* ADDU rd, rs, rt */
-            cpu->gpr[rd] = cpu->gpr[rs] + cpu->gpr[rt];
+        case 0x21: { /* ADDU rd, rs, rt */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
+            cpu->gpr[rd] = a + b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x22: /* SUB - overflow traps are delegated if they occur. */
-        case 0x23: /* SUBU */
+        case 0x23: { /* SUBU */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
             if (rs == 0 && psx_ws_is_cull_negsub_site(pc))
-                cpu->gpr[rd] = 0u - cpu->gpr[rt] - (uint32_t)psx_ws_x_margin();
+                cpu->gpr[rd] = 0u - b - (uint32_t)psx_ws_x_margin();
             else
-                cpu->gpr[rd] = cpu->gpr[rs] - cpu->gpr[rt];
+                cpu->gpr[rd] = a - b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x24: /* AND */
             cpu->gpr[rd] = cpu->gpr[rs] & cpu->gpr[rt];
             cpu->gpr[0] = 0;
             return 0;
-        case 0x25: /* OR */
-            cpu->gpr[rd] = cpu->gpr[rs] | cpu->gpr[rt];
+        case 0x25: { /* OR */
+            uint32_t a = cpu->gpr[rs], b = cpu->gpr[rt];
+            cpu->gpr[rd] = a | b;
+            psx_pgxp_alu(cpu, insn, cpu->gpr[rd], a, b);
             cpu->gpr[0] = 0;
             return 0;
+        }
         case 0x26: /* XOR */
             cpu->gpr[rd] = cpu->gpr[rs] ^ cpu->gpr[rt];
             cpu->gpr[0] = 0;
@@ -1852,24 +1888,28 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
     {
         uint32_t widened = 0;
+        uint32_t a = cpu->gpr[rs];
         if (psx_ws_angle_site(pc, insn, &widened))
             cpu->gpr[rt] = widened;
         else
-            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+            cpu->gpr[rt] = a + (uint32_t)simm
                          + (psx_ws_is_cull_bias_site(pc)
                                 ? (uint32_t)psx_ws_activation_margin() : 0u);
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, (uint32_t)simm);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x09: /* ADDIU rt, rs, simm */
     {
         uint32_t widened = 0;
+        uint32_t a = cpu->gpr[rs];
         if (psx_ws_angle_site(pc, insn, &widened))
             cpu->gpr[rt] = widened;
         else
-            cpu->gpr[rt] = cpu->gpr[rs] + (uint32_t)simm
+            cpu->gpr[rt] = a + (uint32_t)simm
                          + (psx_ws_is_cull_bias_site(pc)
                                 ? (uint32_t)psx_ws_activation_margin() : 0u);
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, (uint32_t)simm);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -1930,10 +1970,13 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         cpu->gpr[rt] = cpu->gpr[rs] & imm;
         cpu->gpr[0] = 0;
         return 0;
-    case 0x0D: /* ORI */
-        cpu->gpr[rt] = cpu->gpr[rs] | imm;
+    case 0x0D: { /* ORI */
+        uint32_t a = cpu->gpr[rs];
+        cpu->gpr[rt] = a | imm;
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, imm);
         cpu->gpr[0] = 0;
         return 0;
+    }
     case 0x0E: /* XORI */
         cpu->gpr[rt] = cpu->gpr[rs] ^ imm;
         cpu->gpr[0] = 0;
@@ -1943,6 +1986,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = (uint32_t)psx_ws_player_x_bound((int32_t)(imm << 16));
         else
             cpu->gpr[rt] = imm << 16;
+        psx_pgxp_alu(cpu, insn, cpu->gpr[rt], 0, 0);
         cpu->gpr[0] = 0;
         return 0;
     case 0x10: { /* COP0 */
@@ -2033,6 +2077,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2041,6 +2086,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2049,6 +2095,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             psx_gte_stall(cpu);
 #endif
             gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]);
+            psx_pgxp_cop2(cpu, insn, cpu->gpr[rt], 0);
             return 0;
         }
         if (cop_op == 0x06) { /* CTC2 */
@@ -2072,6 +2119,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2079,6 +2127,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2086,6 +2135,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwl_merge(addr, word, cpu->gpr[rt]);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2101,12 +2151,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else
             cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x24: { /* LBU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2114,6 +2166,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2121,6 +2174,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
         cpu->gpr[rt] = lwr_merge(addr, word, cpu->gpr[rt]);
+        psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2128,6 +2182,7 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         cpu->write_byte(addr, (uint8_t)cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt] & 0xFFu);
         return 0;
     }
     case 0x29: { /* SH */
@@ -2143,12 +2198,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             val = (uint16_t)psx_ws_backdrop_x((int16_t)val);
         g_debug_last_store_pc = pc;
         cpu->write_half(addr, val);
+        psx_pgxp_store(cpu, insn, addr, val);
         return 0;
     }
     case 0x2A: { /* SWL */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swl(cpu, addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2B: { /* SW */
@@ -2156,12 +2213,14 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         if (addr & 3) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         g_debug_last_store_pc = pc;
         cpu->write_word(addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2E: { /* SWR */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
         g_debug_last_store_pc = pc;
         interp_swr(cpu, addr, cpu->gpr[rt]);
+        psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x32: { /* LWC2 — §1+DO_LDS charged by exec_one's top step (mask 0) */
@@ -2169,7 +2228,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_gte_stall(cpu);   /* COP2 reg write stalls to GTE completion */
 #endif
-        gte_write_data(cpu, (uint8_t)rt, psx_cyc_lwc2_read(cpu, addr));
+        {
+            uint32_t lw2 = psx_cyc_lwc2_read(cpu, addr);
+            gte_write_data(cpu, (uint8_t)rt, lw2);
+            psx_pgxp_cop2(cpu, insn, lw2, addr);
+        }
         return 0;
     }
     case 0x3A: { /* SWC2 */
@@ -2178,8 +2241,12 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         psx_gte_stall(cpu);   /* COP2 reg read stalls to GTE completion */
 #endif
         g_debug_last_store_pc = pc;
-        cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt));
-        gte_precision_store_word(addr, (uint8_t)rt);
+        {
+            uint32_t sw2 = gte_read_data(cpu, (uint8_t)rt);
+            cpu->write_word(addr, sw2);
+            gte_precision_store_word(addr, (uint8_t)rt);
+            psx_pgxp_cop2(cpu, insn, sw2, addr);
+        }
         return 0;
     }
     default:
@@ -3086,10 +3153,14 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         }
         pc = next_pc;
 #ifdef PSX_HAS_GAME_DISPATCH
-        /* Guest call returns advance without transferred set. Re-check the
-         * resume PC so a patched entry can hand its unchanged tail back to
-         * compiled code without adding probes to ordinary dirty overlay runs. */
-        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+        /* Guest call returns advance without transferred set. A suffix-only
+         * continuation check is insufficient here: a split compiled piece can
+         * fall through by a direct host call into another piece without a new
+         * RAM-byte check. Require the continuation's complete emitted range to
+         * match before this straight-line handoff. Control-transfer handoffs
+         * retain suffix validation because they are explicit guest entries. */
+        if (clean_game_text_miss && psx_game_text_native_ok_full(pc) &&
+            interp_enter_compiled(cpu, pc)) {
             g_dirty_ram_native_handoffs++;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;

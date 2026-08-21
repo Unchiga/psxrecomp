@@ -209,6 +209,8 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_depth;        // [widescreen.cull] depth_sites
     std::set<uint32_t>    ws_cull_plane_nx;     // [widescreen.cull] plane_nx_sites
     std::set<uint32_t>    ws_cull_xclip_load;   // [widescreen.cull] xclip_load_sites
+    std::set<uint32_t>    ws_cull_nclip_keep;   // [widescreen.cull] nclip_keep_sites
+    std::set<uint32_t>    ws_cull_branch_keep;  // [widescreen.cull] branch_keep_sites
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep;
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
     PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
@@ -270,6 +272,8 @@ int main(int argc, char** argv) {
         ws_cull_depth.insert(cfg.ws_cull_depth_sites.begin(), cfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(cfg.ws_cull_plane_nx_sites.begin(), cfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(cfg.ws_cull_xclip_load_sites.begin(), cfg.ws_cull_xclip_load_sites.end());
+        ws_cull_nclip_keep.insert(cfg.ws_cull_nclip_keep_sites.begin(), cfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_branch_keep.insert(cfg.ws_cull_branch_keep_sites.begin(), cfg.ws_cull_branch_keep_sites.end());
         ws_cull_keep = cfg.ws_cull_keep_sites;
         ws_cull_angle = cfg.ws_cull_angle_sites;
         ws_aspect_cone = cfg.ws_aspect_cone;
@@ -363,6 +367,8 @@ int main(int argc, char** argv) {
         ws_cull_depth.insert(wscfg.ws_cull_depth_sites.begin(), wscfg.ws_cull_depth_sites.end());
         ws_cull_plane_nx.insert(wscfg.ws_cull_plane_nx_sites.begin(), wscfg.ws_cull_plane_nx_sites.end());
         ws_cull_xclip_load.insert(wscfg.ws_cull_xclip_load_sites.begin(), wscfg.ws_cull_xclip_load_sites.end());
+        ws_cull_nclip_keep.insert(wscfg.ws_cull_nclip_keep_sites.begin(), wscfg.ws_cull_nclip_keep_sites.end());
+        ws_cull_branch_keep.insert(wscfg.ws_cull_branch_keep_sites.begin(), wscfg.ws_cull_branch_keep_sites.end());
         if (ws_cull_keep.empty()) ws_cull_keep = wscfg.ws_cull_keep_sites;
         if (ws_cull_angle.empty()) ws_cull_angle = wscfg.ws_cull_angle_sites;
         if (ws_aspect_cone.sites.empty())
@@ -1225,6 +1231,8 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_depth_sites = ws_cull_depth;
     codegen_config.ws_cull_plane_nx_sites = ws_cull_plane_nx;
     codegen_config.ws_cull_xclip_load_sites = ws_cull_xclip_load;
+    codegen_config.ws_cull_nclip_keep_sites = ws_cull_nclip_keep;
+    codegen_config.ws_cull_branch_keep_sites = ws_cull_branch_keep;
     codegen_config.ws_cull_keep_sites = ws_cull_keep;
     codegen_config.ws_cull_angle_sites = ws_cull_angle;
     codegen_config.ws_aspect_cone = ws_aspect_cone;
@@ -1450,6 +1458,7 @@ int main(int argc, char** argv) {
         ds << "#include \"psx_runtime.h\"\n\n";
         ds << "extern void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc);\n\n";
         ds << "extern int dirty_ram_text_native_ok_ranges_from(const uint32_t* lo_len_pairs, uint32_t count, uint32_t exec_pc);\n\n";
+        ds << "extern int dirty_ram_text_native_ok_ranges(const uint32_t* lo_len_pairs, uint32_t count);\n\n";
 
         // Forward declarations
         ds << "/* Forward declarations for all recompiled functions */\n";
@@ -1494,9 +1503,13 @@ int main(int argc, char** argv) {
                 records.push_back({cont, cont, owner, 0, 0});
             }
         }
+        // Sort by PHYSICAL address. psx_game_find_entry() compares masked
+        // addresses so a KUSEG-executing guest still matches KSEG-normalized
+        // keys; the search invariant must therefore be the masked order too.
+        // Within one segment this is identical to sorting by the raw address.
         std::sort(records.begin(), records.end(),
                   [](const DispatchRecord& a, const DispatchRecord& b) {
-                      return a.addr < b.addr;
+                      return (a.addr & 0x1FFFFFFFu) < (b.addr & 0x1FFFFFFFu);
                   });
 
         // Attach the exact CFG instruction ranges from the manifest to every
@@ -1578,13 +1591,22 @@ int main(int argc, char** argv) {
         }
         ds << "};\n";
         ds << fmt::format("#define PSX_GAME_DISPATCH_COUNT {}u\n\n", records.size());
+        ds << "/* PS1 segments alias the same physical RAM. A game whose PS-X EXE\n";
+        ds << " * header carries KUSEG addresses (load address and entry PC without the\n";
+        ds << " * KSEG bit) executes with a KUSEG PC, while this table is keyed by the\n";
+        ds << " * recompiler's KSEG-normalized addresses. Comparing raw values made every\n";
+        ds << " * lookup fail for such a title: 0x0001xxxx is always below 0x8001xxxx, so\n";
+        ds << " * the search collapsed and returned no entry, silently routing all game\n";
+        ds << " * code to the interpreter. Compare the 29-bit physical address instead;\n";
+        ds << " * the table is sorted by the same masked key. */\n";
         ds << "static const PsxGameDispatchEntry* psx_game_find_entry(uint32_t addr) {\n";
+        ds << "    const uint32_t want = addr & 0x1FFFFFFFu;\n";
         ds << "    uint32_t lo = 0, hi = PSX_GAME_DISPATCH_COUNT;\n";
         ds << "    while (lo < hi) {\n";
         ds << "        uint32_t mid = lo + (hi - lo) / 2;\n";
-        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr;\n";
-        ds << "        if (addr < key) hi = mid;\n";
-        ds << "        else if (addr > key) lo = mid + 1;\n";
+        ds << "        uint32_t key = k_psx_game_dispatch[mid].addr & 0x1FFFFFFFu;\n";
+        ds << "        if (want < key) hi = mid;\n";
+        ds << "        else if (want > key) lo = mid + 1;\n";
         ds << "        else return &k_psx_game_dispatch[mid];\n";
         ds << "    }\n";
         ds << "    return 0;\n";
@@ -1596,6 +1618,14 @@ int main(int argc, char** argv) {
         ds << "    if (!entry || entry->range_count == 0) return 0;\n";
         ds << "    return dirty_ram_text_native_ok_ranges_from(\n";
         ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count, addr);\n";
+        ds << "}\n\n";
+
+        ds << "/* Full-range validity for straight-line interpreter-to-AOT handoff. */\n";
+        ds << "int psx_game_text_native_ok_full(uint32_t addr) {\n";
+        ds << "    const PsxGameDispatchEntry* entry = psx_game_find_entry(addr);\n";
+        ds << "    if (!entry || entry->range_count == 0) return 0;\n";
+        ds << "    return dirty_ram_text_native_ok_ranges(\n";
+        ds << "        &k_psx_game_code_ranges[entry->range_index].lo, entry->range_count);\n";
         ds << "}\n\n";
 
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";

@@ -146,6 +146,14 @@ struct CodeGenConfig {
     // (INT32_MAX while revealed, vanilla at 4:3); empty by default.
     std::set<uint32_t> ws_cull_xclip_load_sites;
 
+    // Exact `bltz MAC0, reject`-style NCLIP/backface rejects to suppress while
+    // widescreen reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_nclip_keep_sites;
+
+    // Exact branch PCs whose reject target is suppressed while widescreen
+    // reveals extra world. 4:3 keeps the original branch predicate.
+    std::set<uint32_t> ws_cull_branch_keep_sites;
+
     // Exact, full-word-guarded comparison sites whose result is forced only
     // while widescreen reveals extra world. 4:3 evaluates the original compare.
     std::vector<PSXRecompV4::WidescreenCullKeepSite> ws_cull_keep_sites;
@@ -471,8 +479,6 @@ private:
     std::string translate_lhu(uint32_t instr);
     std::string translate_lwl(uint32_t instr);
     std::string translate_lwr(uint32_t instr);
-
-    // MIPS-I load-delay exception for LWL/LWR.
     //
     // LWL/LWR take their destination register as BOTH input (the merge base)
     // and output. Unlike every other load, they read that input late enough to
@@ -487,7 +493,7 @@ private:
     // sets these so the LWL/LWR merge operand names that temporary instead of
     // cpu->gpr[rt]. Empty temp = no forwarding in effect.
     //
-    // (The mirror case — LWL/LWR as the PRODUCER — needs nothing: those never
+    // (The mirror case -- LWL/LWR as the PRODUCER -- needs nothing: those never
     // defer, so their writeback is already immediate.)
     void set_lwlr_merge_forward(uint32_t rt, const std::string& temp) {
         lwlr_merge_reg_ = rt;
