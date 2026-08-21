@@ -5264,7 +5264,9 @@ static void handle_menu_move(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d}", id, x, y);
 }
 
-/* key is an SDL_Keycode. F10 is 0x4000003D; printable keys are their ASCII. */
+/* key is an SDL_Keycode. F10 is 0x40000043; printable keys are their ASCII.
+ * (0x4000003D, which this said until 2026-08-21, is F4 — sending it toggles
+ * nothing and reads as the overlay ignoring you.) */
 
 
 static void handle_menu_key(int id, const char *json)

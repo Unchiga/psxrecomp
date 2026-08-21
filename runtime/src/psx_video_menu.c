@@ -1220,7 +1220,11 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
         k = row_kind(s_menu, r);
         if (k == IT_ACTION) {
             if (s_menu == MENU_FILE && r == ACT_QUIT) s_quit = 1;
-            else if (s_menu == MENU_VIEW) psx_video_menu_hide();
+            /* VIEW's builtin row 0 is MENU BAR, which hides. Testing the MENU
+             * instead of the ROW here made every registered action row under
+             * VIEW hide the bar rather than fire its callback. */
+            else if (s_menu == MENU_VIEW && !row_reg(s_menu, r))
+                psx_video_menu_hide();
             else {
                 /* GAME > SAVE / LOAD STATE raises a one-shot for the host, the
                  * same hands-off way FILE > QUIT does — this module knows
@@ -1314,7 +1318,8 @@ int psx_video_menu_handle_key(int key) {
             if (k == IT_ACTION) {
                 if (s_menu == MENU_FILE && s_item[s_menu] == ACT_QUIT)
                     s_quit = 1;
-                else if (s_menu == MENU_VIEW)
+                else if (s_menu == MENU_VIEW &&
+                         !row_reg(s_menu, s_item[s_menu]))
                     psx_video_menu_hide();
                 else {
                     /* See the mouse path: raise the one-shot, then collapse so

@@ -5851,6 +5851,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            /* A title that opened its own window gets first refusal, so a
+             * click there never also reaches the game's input path. */
+            if (psx_game_run_event_hooks(&ev)) continue;
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");
@@ -10904,9 +10907,9 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
                 }
             }
             if (gc.runtime.has_default_p1_device)
-                player_device[0] = gc.runtime.default_p1_device;
+                boot.player_device[0] = gc.runtime.default_p1_device;
             if (PSX_MAX_PLAYERS >= 2 && gc.runtime.has_default_p2_device)
-                player_device[1] = gc.runtime.default_p2_device;
+                boot.player_device[1] = gc.runtime.default_p2_device;
             for (int i = 0; i < PSX_MAX_PLAYERS; ++i)
                 boot.ctrl_locked_mode[i] = boot.player_mode[i];
             boot.ctrl_lock_mode    = gc.runtime.controller_lock_mode;
@@ -12318,7 +12321,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
         g_turbo_loads_enabled = 0;
     g_frame_interpolation_blend = g_frame_interpolation_blend_default;
     mod_runtime_activate_plugins();
-    apply_netplay_local_viewport_aspect(net_cfg.enabled);
+    apply_netplay_local_viewport_aspect(boot.net_cfg.enabled);
     if (g_mod_controller_mode_override[0] >= 0)
         boot.player_mode[0] = g_mod_controller_mode_override[0];
     if (g_mod_controller_mode_override[1] >= 0)
@@ -13313,7 +13316,7 @@ CPUState cpu;
                 nrc, boot.net_cfg.local_slot, boot.net_cfg.bind_hostport, boot.net_cfg.peer_hostport);
             return 1;
         }
-        apply_netplay_local_viewport_aspect(net_cfg.enabled);
+        apply_netplay_local_viewport_aspect(boot.net_cfg.enabled);
         std::printf("psxrecomp: netplay transport=%s slot=%d input_player=%d delay=%d "
                     "force_turn=%d bind=%s peer=%s session=%u\n",
                     psx_netplay_transport_name(),
@@ -14361,7 +14364,7 @@ soft_return_lobby:
                     return 1;
                 }
             }
-            apply_netplay_local_viewport_aspect(net_cfg.enabled);
+            apply_netplay_local_viewport_aspect(boot.net_cfg.enabled);
             std::printf("psxrecomp: rematch from lobby (netplay=%d)\n",
                         boot.net_cfg.enabled ? 1 : 0);
             std::fflush(stdout);

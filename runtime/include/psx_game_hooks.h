@@ -37,10 +37,27 @@ int psx_game_add_frame_hook(PsxGameHook fn);
  * Read that number with debug_server_frame_number(). */
 int psx_game_add_vblank_hook(PsxGameHook fn);
 
+/* Sees every SDL event the runtime pumps, before the runtime interprets it.
+ * Return non-zero to CONSUME the event so it goes no further — that is what
+ * keeps a click in a title's own window out of the game's input path.
+ *
+ * The parameter is a `const SDL_Event *`. It is spelled `const void *` so this
+ * header stays free of an SDL include; cast it in the hook. Runs on the thread
+ * that pumps SDL, which is the same thread that owns any window a title
+ * created from a frame hook.
+ *
+ * A title that opens its own window needs this because only the runtime may
+ * call SDL_PollEvent: a second poller would drain the queue the runtime is
+ * reading, and neither would see a whole picture. */
+typedef int (*PsxGameEventHook)(const void *sdl_event);
+int psx_game_add_event_hook(PsxGameEventHook fn);
+
 /* Called by the runtime. Not for titles. */
 void psx_game_run_start_hooks(void);
 void psx_game_run_frame_hooks(void);
 void psx_game_run_vblank_hooks(void);
+/* Returns non-zero when a hook consumed the event. */
+int  psx_game_run_event_hooks(const void *sdl_event);
 
 #ifdef __cplusplus
 }
