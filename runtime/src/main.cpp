@@ -13259,8 +13259,14 @@ session_reboot:
                              "(PSX_ENABLE_VULKAN=OFF); using OpenGL instead.\n");
         g_video_renderer = 1;
     }
-CPUState cpu;
 #endif
+    /* Guest CPU state. OUTSIDE the Vulkan-fallback conditional above: it once
+     * sat inside that #ifndef, so any machine whose configure found a Vulkan
+     * SDK (PSX_HAVE_VULKAN=1 — see runtime.cmake's glslc probe) compiled this
+     * function with no `cpu` at all and died on every later use. Our build
+     * machines have no SDK, which is why only player-side first-run builds
+     * ever saw it. */
+    CPUState cpu;
     if (!init_runtime_devices(argv, boot, disc_path_str, rematch_session))
         return 1;
 
