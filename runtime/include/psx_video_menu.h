@@ -68,7 +68,23 @@ typedef struct PsxVideoMenuState {
 } PsxVideoMenuState;
 
 #define PSX_VM_SPEED_DEFAULT 1
-#define PSX_VM_SPEED_MAX 16
+/* 4, not 16. Speed is now audio-preserving (the pacer and the guest VBlank
+ * period scale together — see psx_set_game_speed), which holds the SPU at
+ * exactly 44.1 kHz as long as the machine can actually reach the requested
+ * frame cadence. Measured ceiling, Yu-Gi-Oh! FM in a duel, 6 s windows:
+ *
+ *   speed 4   240 VBlank/s requested, 240.8 achieved (100%)  SPU 100%, 0 underruns
+ *   speed 5   300 requested,          187.5 achieved ( 62%)  SPU  89%, 29098 underruns
+ *
+ * Past ~240 guest frames/s the emulated GPU cannot keep up (the guest submits
+ * N times the draw commands and the host presents N times per second; guest
+ * CPU cycles/s are constant by construction). The guest then falls behind real
+ * time, the SPU produces fewer samples than the sink consumes, and the audio
+ * breaks up. A ceiling nobody can reach cleanly is not a feature, so the row
+ * stops where the audio still holds. Raising it needs the present path
+ * decoupled from the VBlank rate (present every Nth frame), not a bigger
+ * number here. */
+#define PSX_VM_SPEED_MAX 4
 /* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
 #define PSX_VM_SUPERSAMPLING_MAX 4
 /* Windowed zoom bounds. 3x is the default because 1x is unreadably small on

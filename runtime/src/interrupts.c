@@ -179,6 +179,32 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
 #define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
 #define VBLANK_DEFER_STALE_CYCLES (VBLANK_CYCLES * 10ull)
+
+/* Live VBlank period. AUTHENTIC by default and identical to VBLANK_CYCLES; a
+ * game-speed feature may shorten it so the guest sees N VBlanks where hardware
+ * would give one.
+ *
+ * Why here and not in the host pacer: host pacing (GAME > SPEED) advances the
+ * whole emulated machine faster in wall-clock terms, so the SPU renders N
+ * seconds of audio per real second and the music plays fast and sharp — the
+ * documented reason FAST LOADING drives the CD sector delay instead. Shortening
+ * only the VBlank period moves the guest's FRAME cadence while every device
+ * keeps counting real guest cycles: the SPU still renders 44.1 kHz of audio per
+ * real second, so pitch is untouched by construction. Whether the music's TEMPO
+ * follows depends on whether the title's sound driver is ticked from the VBlank
+ * IRQ; that is a per-title fact and has to be measured, not assumed.
+ *
+ * Timers and the CD drive are NOT affected here: under PSX_ENABLE_BLOCK_CYCLES
+ * they are driven from the guest-cycle counter, not from this edge. */
+static uint32_t s_vblank_cycles = VBLANK_CYCLES;
+
+void interrupts_set_vblank_divisor(uint32_t mult) {
+    if (mult < 1u) mult = 1u;
+    if (mult > 4u) mult = 4u;   /* matches PSX_VM_SPEED_MAX */   /* matches PSX_VM_SPEED_MAX */
+    s_vblank_cycles = VBLANK_CYCLES / mult;
+}
+
+uint32_t interrupts_get_vblank_cycles(void) { return s_vblank_cycles; }
 static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
@@ -443,13 +469,13 @@ static void fire_vblank_edge(void) {
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */
-    cycles_since_vblank -= VBLANK_CYCLES;
+    cycles_since_vblank -= s_vblank_cycles;
     dispatch_count = 0;
     /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
                           (uint32_t)psx_get_cycle_count());
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
-                          (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
+                          (uint32_t)(psx_get_cycle_count() + s_vblank_cycles));
     psx_irq_raise(IRQ_VBLANK, 0);
     g_vblank_raise_count++;
     frame_gate_tick();
@@ -466,15 +492,15 @@ static void fire_vblank_edge(void) {
 void interrupts_service_scheduled_events(void) {
     note_sio_progress_cycle();
     if (in_exception) return;
-    while (cycles_since_vblank >= VBLANK_CYCLES) {
+    while (cycles_since_vblank >= s_vblank_cycles) {
         if (should_defer_vblank_for_sio()) return;
         fire_vblank_edge();
     }
 }
 
 uint32_t interrupts_cycles_to_vblank(void) {
-    if (cycles_since_vblank >= VBLANK_CYCLES) return 0;
-    return VBLANK_CYCLES - cycles_since_vblank;
+    if (cycles_since_vblank >= s_vblank_cycles) return 0;
+    return s_vblank_cycles - cycles_since_vblank;
 }
 
 uint32_t interrupts_get_cycles_since_vblank(void) {
@@ -950,8 +976,8 @@ uint32_t cycles_to_next_event(void) {
      * card-SIO case only pushes VBlank LATER, so this estimate stays a safe
      * under-estimate. */
     if (i_mask & (1u << IRQ_VBLANK)) {
-        uint32_t d = (cycles_since_vblank >= VBLANK_CYCLES)
-                       ? 0u : (VBLANK_CYCLES - cycles_since_vblank);
+        uint32_t d = (cycles_since_vblank >= s_vblank_cycles)
+                       ? 0u : (s_vblank_cycles - cycles_since_vblank);
         if (d < best) best = d;
     }
     uint32_t t = timers_cycles_to_irq(i_mask); if (t < best) best = t;

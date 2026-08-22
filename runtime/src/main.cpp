@@ -826,6 +826,169 @@ extern "C" void psx_frame_pacing_state(double *base_ms, int *mult,
     if (period_ms) *period_ms = g_frame_period_ms;
 }
 
+/* Game speed with the audio clock held at real time.
+ *
+ * Plain host pacing runs the whole machine faster in wall-clock terms, so the
+ * SPU renders N seconds of audio per real second: music plays fast and sharp,
+ * and nothing downstream can undo it (there is more music than time to play
+ * it). The fix is to pair the faster wall-clock cadence with a proportionally
+ * SHORTER guest VBlank period, so the two cancel in device time:
+ *
+ *   presents/sec      60 * N          (pacer period base/N)
+ *   cycles per VBlank 564480 / N      (interrupts_set_vblank_divisor)
+ *   guest cycles/sec  33.8688M        UNCHANGED  <- the SPU's clock
+ *
+ * The guest therefore experiences N times as many frames per real second while
+ * every device keeps counting real guest cycles, so audio PITCH cannot change
+ * by construction. Whether TEMPO holds depends on whether the title ticks its
+ * sound driver from the VBlank IRQ, which is a per-title fact to measure.
+ *
+ * Note the CPU budget per frame drops by N (same cycles, N times the frames).
+ * A workload-bound title (Yu-Gi-Oh! FM drops roughly one frame in three at
+ * stock) will drop more; cpu_clock is the companion knob that buys that back. */
+extern "C" void interrupts_set_vblank_divisor(uint32_t mult);
+
+/* REQUESTED is what the player picked; EFFECTIVE is what this machine can
+ * actually sustain right now. They differ only while the governor below is
+ * easing off, and the menu keeps showing the player's choice either way. */
+static int g_speed_requested = 1;
+static int g_speed_effective = 1;
+
+static void speed_apply_effective(int eff) {
+    g_frame_speed_mult = eff;
+    frame_period_refresh();
+    interrupts_set_vblank_divisor((uint32_t)eff);
+    g_speed_effective = eff;
+}
+
+static void psx_speed_governor_reset(void);
+
+extern "C" void psx_set_game_speed(int mult) {
+    if (mult < 1)  mult = 1;
+    if (mult > PSX_VM_SPEED_MAX) mult = PSX_VM_SPEED_MAX;
+    g_speed_requested = mult;
+    speed_apply_effective(mult);
+    psx_speed_governor_reset();
+}
+
+/* Last device-time rate the governor measured, as a percentage of the real
+ * 33.8688 MHz. Reported so "why did it not climb back" is answerable from the
+ * number the decision was actually made on. */
+static double g_speed_device_pct = 100.0;
+static int    g_speed_cooldown_ms = 0;
+
+extern "C" int psx_game_speed_state(int *requested, int *effective,
+                                    double *device_pct, int *cooldown_ms) {
+    if (requested)   *requested   = g_speed_requested;
+    if (effective)   *effective   = g_speed_effective;
+    if (device_pct)  *device_pct  = g_speed_device_pct;
+    if (cooldown_ms) *cooldown_ms = g_speed_cooldown_ms;
+    return g_speed_effective != g_speed_requested;
+}
+
+/* Speed governor: never let the speed setting break the audio.
+ *
+ * Speed spends the emulator's performance headroom. At 1x there is plenty; at
+ * 4x there is none, so a scene heavy enough to miss the requested VBlank
+ * cadence makes the guest fall behind real time — and a guest behind real time
+ * produces fewer than 44100 samples per real second while the host sink keeps
+ * consuming them, which is the distortion players actually hear (measured on
+ * Yu-Gi-Oh! FM: a 3594-vert campaign room at 4x delivered ~190 of 240 VBlank/s
+ * and 79% of the samples needed, while a 474-vert duel at the same setting held
+ * 100%). The ceiling is therefore a property of the SCENE, not of the title,
+ * and no fixed cap can be both safe and useful.
+ *
+ * So measure the achieved rate and ease off when it is missed, rather than
+ * guessing a safe maximum. A speed dip is a far better failure than broken
+ * sound: the player asked to go faster, not to be told how fast is allowed.
+ *
+ * Asymmetric on purpose — drop immediately on one bad window, climb back only
+ * after several good ones. Recovering eagerly would oscillate across a scene
+ * boundary, and an oscillating speed is more distracting than a slightly
+ * conservative one. */
+/* Governor state at file scope so a speed change can clear it: keeping the
+ * previous scene's cooldown and backoff after the player picks a new speed
+ * would silently ignore their choice for up to a minute. */
+static uint32_t s_gov_last_ms    = 0;
+static uint64_t s_gov_last_cyc   = 0;
+static uint32_t s_gov_retry_at   = 0;   /* no step-up before this tick */
+static uint32_t s_gov_backoff_ms = 10000u;
+static int      s_gov_good_runs  = 0;
+
+static void psx_speed_governor_reset(void) {
+    s_gov_last_ms = 0; s_gov_last_cyc = 0;
+    s_gov_retry_at = 0; s_gov_backoff_ms = 10000u; s_gov_good_runs = 0;
+    g_speed_device_pct = 100.0; g_speed_cooldown_ms = 0;
+}
+
+extern "C" void psx_speed_governor_tick(void) {
+
+    const uint32_t now = SDL_GetTicks();
+    const uint64_t cyc = psx_get_cycle_count();
+    if (s_gov_last_ms == 0) { s_gov_last_ms = now; s_gov_last_cyc = cyc; return; }
+
+    const uint32_t dt = now - s_gov_last_ms;
+    if (dt < 500u) return;                   /* evaluate twice a second */
+
+    /* DEVICE TIME is the signal, not the VBlank count.
+     *
+     * Counting VBlanks measures what we asked the machine to do, not what it
+     * managed: at speed 4 under a heavy render load the VBlank rate read a
+     * healthy 240/240 while the SPU was producing only 93% of 44100 and the
+     * sink was underrunning 4000 times a window — so a VBlank-based governor
+     * stepped UP into a starving state. Guest cycles per real second cannot lie
+     * that way: it IS the clock every device runs on, so holding it at the real
+     * 33.8688 MHz is exactly the condition that keeps the SPU at 44.1 kHz. */
+    const double rate = (double)(cyc - s_gov_last_cyc) * 1000.0 / (double)dt;
+    const double full = 33868800.0;
+    /* Advance the window ONLY after the delta is taken. Updating s_gov_last_cyc
+     * before this made (cyc - s_gov_last_cyc) identically zero, so the governor read
+     * 0% device rate forever and walked the speed down to 1x no matter how
+     * idle the machine was — a bug invisible until the rate was reported. */
+    s_gov_last_ms = now; s_gov_last_cyc = cyc;
+    g_speed_device_pct  = 100.0 * rate / full;
+    g_speed_cooldown_ms = (int32_t)(s_gov_retry_at - now) > 0
+                              ? (int)(s_gov_retry_at - now) : 0;
+
+    if (g_speed_effective > 1 && rate < full * 0.97) {
+        speed_apply_effective(g_speed_effective - 1);
+        s_gov_good_runs = 0;
+        /* Hold off probing upward for a while. Without this the governor
+         * oscillated 4<->5 every two seconds: at 4 the machine looked fine, so
+         * it climbed to 5, immediately fell short, dropped back, and repeated.
+         * A speed that hunts is worse than one that settles slightly low. */
+        s_gov_retry_at = now + s_gov_backoff_ms;
+        /* Each failed probe costs a brief audible hiccup, so stop asking so
+         * often: back off up to a minute while the answer keeps being no. Reset
+         * whenever the player picks a speed, or once we are happily running the
+         * one they asked for. */
+        if (s_gov_backoff_ms < 60000u) s_gov_backoff_ms *= 2u;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "Speed eased to %dx to keep audio clean",
+                      g_speed_effective);
+        host_osd_push(msg, 1500);
+        return;
+    }
+
+    /* Running at full device rate with room to spare, the player asked for
+     * more, and the cooldown since the last shortfall has expired. */
+    if (g_speed_effective < g_speed_requested && rate >= full * 0.995 &&
+        (int32_t)(now - s_gov_retry_at) >= 0) {
+        if (++s_gov_good_runs >= 3) {
+            speed_apply_effective(g_speed_effective + 1);
+            s_gov_good_runs = 0;
+            char msg[64];
+            std::snprintf(msg, sizeof(msg), "Speed restored to %dx",
+                          g_speed_effective);
+            host_osd_push(msg, 1200);
+            if (g_speed_effective == g_speed_requested) s_gov_backoff_ms = 10000u;
+        }
+        return;
+    }
+    if (g_speed_effective == g_speed_requested) s_gov_backoff_ms = 10000u;
+    s_gov_good_runs = 0;
+}
+
 static bool          g_mod_native_vblank_rate = false;
 static uint32_t      g_mod_native_vblank_fps = 0;
 /* Activation-time request. -1 means no enabled mod owns load acceleration. */
@@ -4032,7 +4195,7 @@ static uint64_t s_np_guest_ticks = 0;
 static uint64_t s_np_last_admit_end = 0;
 static uint64_t s_np_timing_frames = 0;
 /* §27: wall-clock gaps between successful presents (player-visible starvation). */
-static uint64_t s_present_last_ms = 0;
+static uint64_t s_present_s_gov_last_ms = 0;
 static uint32_t s_present_gaps_ms[128];
 static unsigned s_present_gaps_n = 0;
 /* §74: highest sim tick ever shown on screen. Resim frames above it are new
@@ -4056,12 +4219,12 @@ static void netplay_note_present(void) {
     if (!psx_netplay_active() || !netplay_timing_on())
         return;
     now = SDL_GetTicks64();
-    if (s_present_last_ms != 0ull && now >= s_present_last_ms) {
-        gap = (uint32_t)(now - s_present_last_ms);
+    if (s_present_s_gov_last_ms != 0ull && now >= s_present_s_gov_last_ms) {
+        gap = (uint32_t)(now - s_present_s_gov_last_ms);
         if (s_present_gaps_n < (unsigned)(sizeof(s_present_gaps_ms) / sizeof(s_present_gaps_ms[0])))
             s_present_gaps_ms[s_present_gaps_n++] = gap;
     }
-    s_present_last_ms = now ? now : 1ull;
+    s_present_s_gov_last_ms = now ? now : 1ull;
 }
 
 static int netplay_local_viewport_slot(void) {
@@ -4549,7 +4712,7 @@ static void sample_headless_pad_into_sio(int override) {
 /* §33/§35/§47: re-present last Live frame on a wall-clock cadence while guest
  * sim is frozen (short resim) or TipHold invent-cap stall (admit spin). */
 static void netplay_hold_last_present_tick(void) {
-    static uint64_t s_hold_last_ms;
+    static uint64_t s_hold_s_gov_last_ms;
     uint64_t now = SDL_GetTicks64();
     uint32_t period = (uint32_t)(g_frame_period_ms + 0.5);
     int did = 0;
@@ -4561,8 +4724,8 @@ static void netplay_hold_last_present_tick(void) {
     if (g_gl_active)
         gl_renderer_set_interpolation_suspended(1);
 #endif
-    if (s_hold_last_ms != 0ull && now >= s_hold_last_ms &&
-        (uint32_t)(now - s_hold_last_ms) < period)
+    if (s_hold_s_gov_last_ms != 0ull && now >= s_hold_s_gov_last_ms &&
+        (uint32_t)(now - s_hold_s_gov_last_ms) < period)
         return;
 #ifndef PSX_SDL_NO_RENDER
     if (g_gl_active) {
@@ -4578,7 +4741,7 @@ static void netplay_hold_last_present_tick(void) {
 #endif
     if (did) {
         netplay_note_present();
-        s_hold_last_ms = now ? now : 1ull;
+        s_hold_s_gov_last_ms = now ? now : 1ull;
     }
 }
 
@@ -5291,8 +5454,13 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
         int sp = s->speed;
         if (sp < 1) sp = 1;
         if (sp > PSX_VM_SPEED_MAX) sp = PSX_VM_SPEED_MAX;
-        g_frame_speed_mult = sp;
-        frame_period_refresh();
+        /* Both halves through ONE call. Setting the pacer alone leaves the
+         * VBlank divisor wherever it was, and the two disagreeing IS the
+         * machine's net rate: pacer 1x against divisor 2 runs everything at
+         * HALF speed and the music comes out garbled, while 3-against-2 plays
+         * it 1.5x fast. Only their ratio is audible, so they must never be
+         * settable independently. */
+        psx_set_game_speed(sp);
     }
 
     /* Disc-load acceleration (GAME > FAST LOADING).
@@ -7015,6 +7183,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 }
 
 static void sdl_vblank_present(void) {
+    /* Before the early returns below: the governor must sample every VBlank,
+     * including ones whose present is skipped, or its rate measurement would
+     * see exactly the shortfall it is meant to detect and chase its own tail. */
+    psx_speed_governor_tick();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
@@ -13610,8 +13782,7 @@ session_reboot:
             int sp = vms.speed;
             if (sp < 1) sp = 1;
             if (sp > PSX_VM_SPEED_MAX) sp = PSX_VM_SPEED_MAX;
-            g_frame_speed_mult = sp;
-            frame_period_refresh();
+            psx_set_game_speed(sp);   /* pacer AND VBlank divisor together */
         }
         /* A stored FAST LOADING choice, applied here because the disc-speed
          * block above ran before this file was read and psx_apply_video_menu_

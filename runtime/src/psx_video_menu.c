@@ -20,6 +20,13 @@
 
 #include "psx_sdl.h"
 
+/* Stringify PSX_VM_SPEED_MAX into the SPEED row's hint. Spelling the ceiling
+ * out as a literal is what left the hint reading "1 TO 16" after the ceiling
+ * moved to 4 — a menu that misstates its own range is worse than one with no
+ * hint at all. */
+#define PSX_VM_STR2(x) #x
+#define PSX_VM_STR(x)  PSX_VM_STR2(x)
+
 /* Canvas ceiling. The renderer raises ui_scale until the logical size fits, so
  * this bounds memory rather than window size. */
 #define VM_MAX_W 1280
@@ -559,9 +566,13 @@ static const char *row_hint(int m, int row) {
                    : "SOUND EFFECTS ONLY - ENTER TO TYPE";
     if (num_range(m, row, &lo, &hi)) {
         if (m == MENU_GAME && row == 0)
+            /* No longer "audio may distort": the pacer and the guest VBlank
+             * period now scale together, so device time — and with it the
+             * SPU's 44.1 kHz — is unchanged at every setting. */
             return (s_state.speed <= 1)
-                       ? "1X IS NORMAL SPEED. 1 TO 16"
-                       : "FAST FORWARD - AUDIO MAY DISTORT";
+                       ? "1X IS NORMAL SPEED. 1 TO "
+                         PSX_VM_STR(PSX_VM_SPEED_MAX)
+                       : "FASTER GAME, MUSIC STAYS NORMAL";
         return "ENTER TO TYPE A VALUE";
     }
     switch (row) {
@@ -734,7 +745,7 @@ static int row_is_slider(int m, int row) {
     { VmRegRow *r = row_reg(m, row); if (r) return r->slider ? 1 : 0; }
     if (!num_range(m, row, &lo, &hi)) return 0;
     if (m == MENU_AUDIO) return 1;
-    if (m == MENU_GAME) return 1;                 /* SPEED 1..16 */
+    if (m == MENU_GAME) return 1;                 /* SPEED: slider row */
     if (m == MENU_VIDEO && row == 4) return 1;    /* WINDOWED SCALE 1..8 */
     return 0;   /* built-in number rows are type-only unless listed above */
 }
@@ -1607,7 +1618,8 @@ int psx_video_menu_settings_save(const char *path) {
         "windowed_scale=%d  # 1..8 window zoom; needs screen=0 and scaling=1\n"
         "vsync=%d           # 0 off (lowest lag, tearing), 1 on, 2 adaptive\n"
         "supersampling=%d   # internal render scale 1..4; applies on next launch\n"
-        "speed=%d           # emulation speed multiplier, 1..16 (1 = normal)\n"
+        "speed=%d           # emulation speed multiplier, 1.."
+        PSX_VM_STR(PSX_VM_SPEED_MAX) " (1 = normal)\n"
         "fast_loads=%d      # 0 authentic, 1 fast, 2 instant disc loads\n"
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"

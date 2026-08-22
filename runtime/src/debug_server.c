@@ -6560,6 +6560,33 @@ static void handle_frame_gate(int id, const char *json)
              id, addr, extra, (unsigned long long)ticks, now);
 }
 
+/* vblank_scale mult=<1..16> — shorten the guest's VBlank PERIOD so frame-paced
+ * game logic advances N times per real second, without touching device time.
+ *
+ * This is the audio-preserving speed axis, and the distinction from GAME > SPEED
+ * is the whole point. Host pacing runs the entire machine faster in wall-clock
+ * terms, so the SPU renders N seconds of audio per real second: the music plays
+ * fast AND sharp, and no downstream resampling can undo it (there is more music
+ * than time to play it). Shortening the VBlank period instead leaves every
+ * device counting real guest cycles, so the SPU still renders 44.1 kHz per real
+ * second and PITCH cannot change by construction. Whether TEMPO holds depends on
+ * whether the title's sound driver is ticked from the VBlank IRQ — a per-title
+ * fact to be measured, which is what this command exists to measure.
+ *
+ * Report both the period and the resulting rate: "the knob did nothing" is
+ * otherwise indistinguishable between a rejected argument and a title that does
+ * not pace on VBlank at all (the frame_gate lesson). */
+static void handle_vblank_scale(int id, const char *json)
+{
+    extern void interrupts_set_vblank_divisor(uint32_t mult);
+    extern uint32_t interrupts_get_vblank_cycles(void);
+    int mult = json_get_int(json, "mult", -1);
+    if (mult >= 1) interrupts_set_vblank_divisor((uint32_t)mult);
+    uint32_t cyc = interrupts_get_vblank_cycles();
+    send_fmt("{\"id\":%d,\"ok\":true,\"vblank_cycles\":%u,\"hz\":%.2f}",
+             id, (unsigned)cyc, cyc ? 33868800.0 / (double)cyc : 0.0);
+}
+
 /* cpu_clock mult=<1..16> — run the guest CPU faster WITHOUT speeding the
  * machine. psx_cycle_count is device time (vblank, root counters, CD, SPU all
  * schedule off it), so this charges fewer device-cycles per executed
@@ -12231,6 +12258,38 @@ static void handle_frame_pacing(int id, const char *json)
              "\"period_ms\":%.4f}", id, base, mult, period);
 }
 
+/* game_speed mult=<1..16> — run the game faster with the audio clock pinned to
+ * real time: the wall-clock frame cadence and the guest VBlank period are scaled
+ * TOGETHER so they cancel in device time (see psx_set_game_speed). Reports the
+ * resulting VBlank period alongside the pacer state, because "speed did nothing"
+ * is otherwise indistinguishable between a rejected argument, a pacer that
+ * ignored it, and a title that does not pace its logic on VBlank. */
+static void handle_game_speed(int id, const char *json)
+{
+    extern void psx_set_game_speed(int mult);
+    extern void psx_frame_pacing_state(double *, int *, double *);
+    extern uint32_t interrupts_get_vblank_cycles(void);
+    extern int psx_game_speed_state(int *requested, int *effective,
+                                    double *device_pct, int *cooldown_ms);
+    int mult = json_get_int(json, "mult", -1);
+    if (mult >= 1) psx_set_game_speed(mult);
+    double base = 0.0, period = 0.0; int cur = 0;
+    psx_frame_pacing_state(&base, &cur, &period);
+    uint32_t cyc = interrupts_get_vblank_cycles();
+    int req = 0, eff = 0, cooldown = 0; double dev = 0.0;
+    const int eased = psx_game_speed_state(&req, &eff, &dev, &cooldown);
+    /* requested vs effective: the governor eases EFFECTIVE down when the
+     * machine cannot sustain the cadence, so a speed that "did not apply" is
+     * distinguishable from one the hardware could not hold. */
+    send_fmt("{\"id\":%d,\"ok\":true,\"speed_mult\":%d,\"requested\":%d,"
+             "\"effective\":%d,\"eased\":%s,\"device_pct\":%.1f,"
+             "\"cooldown_ms\":%d,\"period_ms\":%.4f,"
+             "\"vblank_cycles\":%u,\"vblank_hz\":%.2f}",
+             id, cur, req, eff, eased ? "true" : "false", dev, cooldown,
+             period, (unsigned)cyc,
+             cyc ? 33868800.0 / (double)cyc : 0.0);
+}
+
 
 
 
@@ -12336,6 +12395,7 @@ static const CmdEntry s_commands[] = {
     { "savestate_menu_state", handle_savestate_menu_state },
     { "rewind_state",      handle_rewind_state },
     { "frame_pacing",      handle_frame_pacing },
+    { "game_speed",        handle_game_speed },
     { "poke_code",         handle_poke_code },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },
@@ -12365,6 +12425,7 @@ static const CmdEntry s_commands[] = {
     { "gl_interp",         handle_gl_interp },
     { "gl_wide_fast",      handle_gl_wide_fast },
     { "frame_gate",        handle_frame_gate },
+    { "vblank_scale",      handle_vblank_scale },
     { "cpu_clock",         handle_cpu_clock },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
