@@ -12264,6 +12264,27 @@ static void handle_frame_pacing(int id, const char *json)
  * resulting VBlank period alongside the pacer state, because "speed did nothing"
  * is otherwise indistinguishable between a rejected argument, a pacer that
  * ignored it, and a title that does not pace its logic on VBlank. */
+/* audio_buffer ms=<20..240> - steady-state output buffer target, which IS the
+ * input-to-sound latency. Reports fill alongside it so a change can be watched
+ * settling, and underruns so the cost of a lower target is visible rather than
+ * inferred. */
+static void handle_audio_buffer(int id, const char *json)
+{
+    extern int psx_audio_set_target_ms(double ms);
+    extern int psx_audio_out_stats(double *, double *, uint64_t *, uint64_t *,
+                                   double *, int *, int *);
+    const int want = json_get_int(json, "ms", -1);
+    if (want >= 0) psx_audio_set_target_ms((double)want);
+    double fill = 0.0, target = 0.0, corr = 0.0;
+    uint64_t under = 0, drops = 0;
+    int legacy = 0, rate = 0;
+    psx_audio_out_stats(&fill, &target, &under, &drops, &corr, &legacy, &rate);
+    send_fmt("{\"id\":%d,\"ok\":true,\"target_ms\":%.1f,\"fill_ms\":%.1f,"
+             "\"underruns\":%llu,\"overflow_drops\":%llu,\"legacy\":%d}",
+             id, target, fill, (unsigned long long)under,
+             (unsigned long long)drops, legacy);
+}
+
 static void handle_game_speed(int id, const char *json)
 {
     extern void psx_set_game_speed(int mult);
@@ -12396,6 +12417,7 @@ static const CmdEntry s_commands[] = {
     { "rewind_state",      handle_rewind_state },
     { "frame_pacing",      handle_frame_pacing },
     { "game_speed",        handle_game_speed },
+    { "audio_buffer",      handle_audio_buffer },
     { "poke_code",         handle_poke_code },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },

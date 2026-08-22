@@ -805,6 +805,9 @@ static double        g_frame_period_ms = PSX_FRAME_PERIOD_MS;
  * it at startup). 0 base means uncapped and stays uncapped. */
 static double        g_frame_period_base_ms = PSX_FRAME_PERIOD_MS;
 static int           g_frame_speed_mult = 1;
+/* [audio] buffer_ms from game.toml; 0 leaves the bridge default (180 ms). */
+static int           g_audio_buffer_ms = 0;
+extern "C" int psx_audio_set_target_ms(double ms);
 
 /* Pacing state for the `frame_pacing` debug command: base cadence, the GAME
  * SPEED multiplier and the resulting target period. Exists because "the
@@ -10940,6 +10943,12 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
             g_fmv_skip_no_xa_hold  = gc.runtime.video_fmv_skip_no_xa_hold;
+            /* [audio] buffer_ms — held until the device is actually open
+             * (further down, in open_game_window): the DRC bridge does not
+             * exist yet at config time, so applying it here would be silently
+             * dropped and the key would look inert, which is exactly how it
+             * sat unused since it was defined. */
+            g_audio_buffer_ms  = gc.runtime.audio_buffer_ms;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             gpu_ws_set_auto_ui_squash(gc.ws_auto_ui_squash ? 1 : 0);
@@ -12986,6 +12995,12 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
     audio_trace_init();
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         (void)psx_host_audio_open(g_audio_freq);
+        /* The buffer target IS the input-to-sound latency, so a title with
+         * smooth audio production should not pay the 180 ms cushion sized for
+         * streamed-stage gaps it never has. Applied here because the bridge is
+         * only alive once the device is open. */
+        if (g_audio_buffer_ms > 0)
+            (void)psx_audio_set_target_ms((double)g_audio_buffer_ms);
     }
     /* Always register: SPU advance is guest-cycle budgeted and must not
      * depend on a successful host open (Win↔Linux aux/spu fork). Routed

@@ -284,6 +284,30 @@ int psx_audio_out_stats(double *fill_ms, double *target_ms,
     return 1;
 }
 
+/* Steady-state buffer target, i.e. how long a sound waits between the SPU
+ * producing it and the player hearing it. THIS IS THE INPUT-TO-SOUND LATENCY:
+ * at the 180 ms default a menu blip lands about a sixth of a second after the
+ * button, which reads as sluggish UI rather than as an audio setting.
+ *
+ * 180 ms is not a general safety figure — rab_config_defaults picked it for
+ * STREAMED STAGE TRANSITIONS that pause audio production for ~140 ms in
+ * another title. A game with no such pauses pays that latency for a hazard it
+ * never has, so the target belongs to the title, not to the bridge.
+ *
+ * Lowering it trades reserve for responsiveness: the ring still holds ring_ms,
+ * so the floor is underrun risk when emulation stalls, which telemetry shows
+ * directly (audio_stats out.underruns). Clamped to leave a callback of slack
+ * under the ring. */
+int psx_audio_set_target_ms(double ms)
+{
+    if (audio_legacy_mode() || !s_drc_ready) return 0;
+    const double ceiling = s_drc.cfg.ring_ms - 40.0;
+    if (ms < 20.0) ms = 20.0;
+    if (ms > ceiling) ms = ceiling;
+    s_drc.cfg.target_ms = ms;
+    return 1;
+}
+
 
 /* Audio gate state, shared with the mid-frame (VBlank-edge) pump.
  *
