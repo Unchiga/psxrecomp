@@ -418,6 +418,7 @@ def ensure_emitters(
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
 
+    _wipe_if_relocated(build_dir, progress)
     cache_file = build_dir / "CMakeCache.txt"
     gen: list[str] = []
     if ninja is not None:
@@ -979,6 +980,55 @@ def _read_cmake_cache_generator(cache_file: Path) -> str:
     return ""
 
 
+def _read_cmake_cache_var(cache_file: Path, key: str) -> str:
+    if not cache_file.is_file():
+        return ""
+    try:
+        text = cache_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    prefix = key + ":"
+    for line in text.splitlines():
+        if line.startswith(prefix) and "=" in line:
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _wipe_if_relocated(build_dir: Path, progress: "ProgressReporter") -> None:
+    """Discard a build tree that was configured somewhere else.
+
+    A CMake build tree records its own absolute path, and every FetchContent
+    subbuild under _deps records it again. Move or copy the extracted release
+    folder after a setup run - Downloads to Desktop is the one people do - and
+    the next configure dies inside a subbuild with
+
+        The current CMakeCache.txt directory <new>/_deps/psx_libchdr-subbuild/
+        CMakeCache.txt is different than the directory <old>/... where
+        CMakeCache.txt was created
+        CMake step for psx_libchdr failed: 1
+
+    which names neither the real cause nor the fix. Build trees are not
+    relocatable and there is nothing in one worth keeping, so start clean
+    instead of failing.
+    """
+    cache_file = build_dir / "CMakeCache.txt"
+    cached_dir = _read_cmake_cache_var(cache_file, "CMAKE_CACHEFILE_DIR")
+    if not cached_dir:
+        return
+    try:
+        same = Path(cached_dir).resolve() == build_dir.resolve()
+    except OSError:
+        same = False
+    if same:
+        return
+    progress.log(
+        f"Build tree was configured in {cached_dir} but now sits in "
+        f"{build_dir} - discarding it and configuring fresh."
+    )
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _cmake_configure(
     project_root: Path,
     build_dir: Path,
@@ -988,6 +1038,7 @@ def _cmake_configure(
     progress: ProgressReporter,
 ) -> None:
     build_dir.mkdir(parents=True, exist_ok=True)
+    _wipe_if_relocated(build_dir, progress)
     cache_file = build_dir / "CMakeCache.txt"
     ninja = _which_tool("ninja")
     clang_c = _which_tool("clang")
