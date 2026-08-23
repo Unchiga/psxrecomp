@@ -4358,23 +4358,6 @@ static void gl_swap_with_osd(void) {
             if (ui < 1) ui = 1;
             if (ui > 8) ui = 8;
             margin = 8 * ui;
-            if (host_osd_volume_image(&px, &ow, &oh) && px) {
-                const int dw = ow * ui, dh = oh * ui;
-                int vx = (ww > dw + margin) ? (ww - dw - margin) : margin;
-                int vy = (wh > dh) ? ((wh - dh) / 2) : margin;
-                gl_draw_osd_image(px, ow, oh, dw, dh, vx, vy, ww, wh);
-            }
-            if (psx_rewind_overlay_image(&px, &ow, &oh) && px) {
-                float slide = psx_rewind_slide();
-                int dw = ww;
-                int dh = (wh * oh) / 480;
-                int vy;
-                if (dh < 8) dh = oh;
-                vy = wh - (int)((float)dh * slide + 0.5f);
-                gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
-            }
-            if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
-                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
             /* Guest-space overlays, back to front in registration order.
              *
              * Unlike every other overlay here these belong to the GAME's
@@ -4384,7 +4367,14 @@ static void gl_swap_with_osd(void) {
              * uses, so they track the image under scaling, aspect and the
              * menu-bar inset instead of drifting away from what they label.
              *
-             * Drawn before the menu bar, which is the topmost layer. */
+             * FIRST of all the overlays, because they belong to the PICTURE:
+             * everything below this point - the volume toast, the rewind bar,
+             * the save-state menu, the menu bar, the toasts - is host UI the
+             * player summoned, and host UI must never end up underneath
+             * something the game is wearing. Drawn last, a guest overlay that
+             * happens to cover the screen (a full-screen mod panel) hid the
+             * save-state menu completely: it opened, took input, and could not
+             * be seen. */
             for (int oi = 0; oi < psx_guest_overlay_count(); oi++) {
                 const PsxGuestOverlay *ov = psx_guest_overlay_at(oi);
                 /* Re-test occlusion HERE, not where the overlay's state is
@@ -4450,6 +4440,23 @@ static void gl_swap_with_osd(void) {
                 }
                 gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
             }
+            if (host_osd_volume_image(&px, &ow, &oh) && px) {
+                const int dw = ow * ui, dh = oh * ui;
+                int vx = (ww > dw + margin) ? (ww - dw - margin) : margin;
+                int vy = (wh > dh) ? ((wh - dh) / 2) : margin;
+                gl_draw_osd_image(px, ow, oh, dw, dh, vx, vy, ww, wh);
+            }
+            if (psx_rewind_overlay_image(&px, &ow, &oh) && px) {
+                float slide = psx_rewind_slide();
+                int dw = ww;
+                int dh = (wh * oh) / 480;
+                int vy;
+                if (dh < 8) dh = oh;
+                vy = wh - (int)((float)dh * slide + 0.5f);
+                gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
+            }
+            if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
+                gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
 
             /* Menu bar last: it is the topmost UI layer. Blended, because the
              * canvas is transparent everywhere the bar/dropdown does not cover
