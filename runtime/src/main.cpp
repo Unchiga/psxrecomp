@@ -2138,7 +2138,7 @@ static std::string disc_mismatch_message(const std::filesystem::path& path,
         m += "This build needs " + want_id +
              (want_reg.empty() ? "" : " " + want_reg) +
              ", dumped from your own disc as .cue + .bin (preferred), or as "
-             ".bin / .img / .iso / .car / .chd.\n\n";
+             ".bin / .img / .iso / .car.\n\n";
         m += "Selected file:\n" + path.string();
         return m;
     }
@@ -2531,11 +2531,11 @@ static void host_change_game_disc(void) {
 
     const std::string title =
         s_picker_game_name + " — select " + s_picker_game_name +
-        " disc image (.cue / .bin / .img / .iso / .car / .chd)";
+        " disc image (.cue / .bin / .img / .iso / .car)";
     std::filesystem::path picked;
     if (!pick_runtime_file(
             title.c_str(),
-            "PS1 Disc Images (*.cue;*.bin;*.img;*.iso;*.car;*.chd)\0*.cue;*.bin;*.img;*.iso;*.car;*.chd\0All Files (*.*)\0*.*\0",
+            "PS1 Disc Images (*.cue;*.bin;*.img;*.iso;*.car)\0*.cue;*.bin;*.img;*.iso;*.car\0All Files (*.*)\0*.*\0",
             picked, "--disc"))
         return;   /* cancelled — say nothing, the player just changed their mind */
 
@@ -2600,17 +2600,17 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         (game_id.empty() ? std::string() : " (" + game_id + ")") +
         " disc image ripped from your own disc.\n\n"
         "Accepted formats: .cue (preferred, with its .bin next to it), "
-        ".bin, .img, .iso, .car (Steam), or .chd.\n\n" + step_tail);
+        ".bin, .img, .iso, .car (Steam).\n\n" + step_tail);
     std::string disc_title =
         s_picker_game_name +
         (s_bios_picker_shown ? " — Step 2 of 2: select " : " — select ") +
         s_picker_game_name +
-        " disc image (.cue / .bin / .img / .iso / .car / .chd)";
+        " disc image (.cue / .bin / .img / .iso / .car)";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
                 disc_title.c_str(),
-                "PS1 Disc Images (*.cue;*.bin;*.img;*.iso;*.car;*.chd)\0*.cue;*.bin;*.img;*.iso;*.car;*.chd\0All Files (*.*)\0*.*\0",
+                "PS1 Disc Images (*.cue;*.bin;*.img;*.iso;*.car)\0*.cue;*.bin;*.img;*.iso;*.car\0All Files (*.*)\0*.*\0",
                 picked, "--disc")) {
             return {};
         }
