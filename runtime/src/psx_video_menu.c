@@ -91,7 +91,7 @@ static const uint8_t FONT8[59][8] = {
 enum { MENU_FILE = 0, MENU_VIEW = 1, MENU_VIDEO = 2, MENU_AUDIO = 3,
        MENU_GAME = 4, MENU_CHEATS = 5, MENU_MODS = 6, MENU_COUNT = 7 };
 /* AUDIO rows. MASTER scales everything; MUSIC and SOUND are the split buses. */
-enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2 };
+enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2, AUD_SPEED_GOV = 3 };
 
 /* ---- per-title registration ---------------------------------------------
  * Rows a game registers live here rather than in the dispatch chains below,
@@ -171,6 +171,7 @@ static const char *const VSYNC_LABELS[]   = { "OFF (LOWEST LAG)", "ON (TEAR-FREE
 /* Indexed by scale-1. Cost is ~N^2 in fill rate, so the labels say so. */
 static const char *const SSAA_LABELS[]    = { "NATIVE (1X)", "2X", "3X", "4X" };
 static const char *const LOADS_LABELS[]   = { "OFF (AUTHENTIC)", "FAST", "INSTANT" };
+static const char *const SPEEDGOV_LABELS[] = { "OFF", "ON" };
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
 
 static int s_visible;    /* bar drawn; does not capture input */
@@ -214,6 +215,7 @@ static PsxVideoMenuState s_state = {
     .vol_master     = 100,
     .vol_music      = 100,
     .vol_sound      = 100,
+    .speed_governor = 0,
     .update_check   = 1,
 };
 
@@ -245,7 +247,11 @@ static int num_range(int m, int row, int *lo, int *hi) {
         *lo = PSX_VM_WINDOWED_SCALE_MIN;
         *hi = PSX_VM_WINDOWED_SCALE_MAX; return 1;
     }
-    if (m == MENU_AUDIO) { *lo = 0; *hi = 100; return 1; }   /* percent */
+    /* The three bus rows are percentages; AUTO SLOW FOR AUDIO is a toggle, and
+     * a whole-menu range here would have made it a 0..100 number. */
+    if (m == MENU_AUDIO && row != AUD_SPEED_GOV) {
+        *lo = 0; *hi = 100; return 1;                        /* percent */
+    }
     return 0;
 }
 
@@ -297,7 +303,7 @@ static int builtin_rows(int m) {
     if (m == MENU_FILE) return 3;
     if (m == MENU_VIEW) return 1;
     if (m == MENU_VIDEO) return 7;
-    if (m == MENU_AUDIO) return 3;
+    if (m == MENU_AUDIO) return 4;
     if (m == MENU_CHEATS) return 0;   /* titles fill this; empty until they do */
     if (m == MENU_GAME) return 4;
     if (m == MENU_MODS) return 0;   /* mods fill this; empty until they do */
@@ -431,7 +437,8 @@ static const char *row_label(int m, int row) {
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER) ? "MASTER"
              : (row == AUD_MUSIC)  ? "MUSIC"
-                                   : "SOUND EFFECTS";
+             : (row == AUD_SOUND)  ? "SOUND EFFECTS"
+                                   : "AUTO SLOW FOR AUDIO";
     switch (row) {
         case 0:  return "SCALING";
         case 1:  return "PRESENT FILTER";
@@ -502,6 +509,8 @@ static const char *row_value(int m, int row) {
         return lp_text(num_get(m, row));
     }
     if (m == MENU_VIEW) return "VISIBLE   F10";
+    if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
+        return SPEEDGOV_LABELS[s_state.speed_governor ? 1 : 0];
     if (m == MENU_GAME && row == 1)
         return LOADS_LABELS[(s_state.fast_loads >= 0 && s_state.fast_loads <= 2)
                                 ? s_state.fast_loads : 0];
@@ -558,6 +567,10 @@ static const char *row_hint(int m, int row) {
      * feature was previously reachable only by a key nothing advertised. */
     if (m == MENU_GAME && row == 3)
         return "STEP BACK THROUGH RECENT FRAMES - ALSO F8";
+    if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
+        return s_state.speed_governor
+                   ? "DROPS SPEED IN HEAVY SCENES TO KEEP SOUND CLEAN"
+                   : "SPEED STAYS PUT - SOUND MAY BREAK UP IF IT CANNOT KEEP UP";
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER)
                    ? "SCALES EVERYTHING - ENTER TO TYPE"
@@ -627,6 +640,12 @@ static void cycle_row(int m, int row, int delta) {
             }
             return;
         }
+    }
+    if (m == MENU_AUDIO && row == AUD_SPEED_GOV) {
+        s_state.speed_governor = s_state.speed_governor ? 0 : 1;
+        s_changed = 1;
+        s_dirty = 1;
+        return;
     }
     if (m == MENU_GAME && row == 1) {
         int v = s_state.fast_loads + delta;
@@ -1038,6 +1057,7 @@ void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out) {
     out->vol_master = s_state.vol_master;
     out->vol_music  = s_state.vol_music;
     out->vol_sound  = s_state.vol_sound;
+    out->speed_governor = s_state.speed_governor ? 1 : 0;
     out->fast_loads    = s_state.fast_loads;
     out->speed         = s_state.speed;
     out->supersampling = s_state.supersampling;
@@ -1539,6 +1559,7 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         }
         else if (!strcmp(key, "fast_loads")) out->fast_loads = (v >= 0 && v <= 2) ? v : 0;
         else if (!strcmp(key, "vol_master")) out->vol_master = (v >= 0 && v <= 100) ? v : 100;
+        else if (!strcmp(key, "speed_governor")) out->speed_governor = v ? 1 : 0;
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_sound"))  out->vol_sound  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "update_check")) out->update_check = v ? 1 : 0;
@@ -1624,6 +1645,7 @@ int psx_video_menu_settings_save(const char *path) {
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
         "vol_sound=%d       # 0..100 sound-effect bus (one-shot voices)\n"
+        "speed_governor=%d  # 1 = ease SPEED down when audio cannot keep up\n"
         "update_check=%d   # 1 = check GitHub for a newer release on launch\n",
         s_state.scaling ? 1 : 0,
         s_state.filter ? 1 : 0,
@@ -1641,6 +1663,7 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.vol_master >= 0 && s_state.vol_master <= 100) ? s_state.vol_master : 100,
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,
         (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
+        s_state.speed_governor ? 1 : 0,
         s_state.update_check ? 1 : 0);
     /* Rows a title registered, in registration order. A row with no key is
      * deliberately not written: a live cheat re-applied at startup would

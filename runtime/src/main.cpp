@@ -924,6 +924,26 @@ static void psx_speed_governor_reset(void) {
     g_speed_device_pct = 100.0; g_speed_cooldown_ms = 0;
 }
 
+/* AUDIO > AUTO SLOW FOR AUDIO. Off by default: easing is a speed change the
+ * player did not ask for, and on a machine that holds the requested cadence it
+ * never fires at all, so the safe default is to leave their choice alone and
+ * let them opt into the trade. Measuring continues either way - `game_speed`
+ * still reports device_pct, which is how "should I turn this on?" is
+ * answerable without guessing. */
+static int g_speed_governor_enabled = 0;
+
+extern "C" void psx_set_speed_governor(int on) {
+    const int want = on ? 1 : 0;
+    if (want == g_speed_governor_enabled) return;
+    g_speed_governor_enabled = want;
+    psx_speed_governor_reset();
+    /* Switching it off must hand back the speed it had eased away, or the
+     * player turns the governor off and stays stuck at whatever it had
+     * decided, with nothing left to raise it again. */
+    if (!want && g_speed_effective != g_speed_requested)
+        speed_apply_effective(g_speed_requested);
+}
+
 extern "C" void psx_speed_governor_tick(void) {
 
     const uint32_t now = SDL_GetTicks();
@@ -952,6 +972,16 @@ extern "C" void psx_speed_governor_tick(void) {
     g_speed_device_pct  = 100.0 * rate / full;
     g_speed_cooldown_ms = (int32_t)(s_gov_retry_at - now) > 0
                               ? (int)(s_gov_retry_at - now) : 0;
+
+    /* Measure always, act only when the player asked us to. Keeping the
+     * measurement running off means `game_speed` still answers "is this
+     * machine holding the cadence?", which is the question the row exists to
+     * settle - and it means turning the row on starts from a real reading
+     * rather than a stale 100%. */
+    if (!g_speed_governor_enabled) {
+        s_gov_good_runs = 0;
+        return;
+    }
 
     if (g_speed_effective > 1 && rate < full * 0.97) {
         speed_apply_effective(g_speed_effective - 1);
@@ -5465,6 +5495,10 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
          * settable independently. */
         psx_set_game_speed(sp);
     }
+    /* AUDIO > AUTO SLOW FOR AUDIO. After the speed above, because switching the
+     * governor off restores the requested speed and that has to be the speed
+     * this state actually asks for. */
+    psx_set_speed_governor(s->speed_governor);
 
     /* Disc-load acceleration (GAME > FAST LOADING).
      *
@@ -13658,7 +13692,13 @@ session_reboot:
     /* Seed the F10 menu with what the runtime actually booted with, so the
      * first thing the player sees is the truth rather than defaults. */
     {
-        PsxVideoMenuState vms;
+        /* VALUE-INITIALISED, not bare. Every member below is seeded by hand, so
+         * a member added later and not added here reads whatever was on the
+         * stack — which is precisely what happened to AUTO SLOW FOR AUDIO: it
+         * came up ON, on a machine that had never been asked for it, because
+         * nothing assigned it. Zeroing first makes an omission default to off
+         * instead of to garbage. */
+        PsxVideoMenuState vms{};
         /* Sharp-by-default: whole-pixel scaling with no smoothing on either the
          * final present or in-game textures. These are presentation choices, not
          * emulation behaviour — the frame the guest renders is unchanged. */
@@ -13799,6 +13839,10 @@ session_reboot:
             if (sp > PSX_VM_SPEED_MAX) sp = PSX_VM_SPEED_MAX;
             psx_set_game_speed(sp);   /* pacer AND VBlank divisor together */
         }
+        /* Same reason as the speed above: psx_apply_video_menu_state only fires
+         * on a CHANGE, so a stored governor choice needs seeding here or the
+         * row would read ON while nothing eased. */
+        psx_set_speed_governor(vms.speed_governor);
         /* A stored FAST LOADING choice, applied here because the disc-speed
          * block above ran before this file was read and psx_apply_video_menu_
          * state only fires on a CHANGE. Set the game divisor rather than the

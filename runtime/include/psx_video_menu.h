@@ -59,6 +59,13 @@ typedef struct PsxVideoMenuState {
     int vol_master;
     int vol_music;
     int vol_sound;
+    /* 1 = let the speed governor ease GAME > SPEED down when the machine
+     * stops sustaining the requested cadence, which is what keeps the SPU at
+     * 44.1 kHz (see psx_speed_governor_tick). OFF by default: easing is a
+     * visible speed change the player did not ask for, and on a machine that
+     * can hold the speed it never fires anyway. Turn it on to trade a dip in
+     * speed for clean audio in the heaviest scenes. */
+    int speed_governor;
     /* 1 = ask GitHub for a newer release on launch and prompt if there is
      * one. Lives here purely so it persists in menu_settings.ini with the
      * player's other choices; it is not a video option and has no row.
@@ -301,6 +308,7 @@ typedef struct PsxVideoMenuDebug {
     int logical_w, logical_h, ui_scale;
     int rows;         /* rows in the selected menu */
     int vol_master, vol_music, vol_sound;   /* audio buses, 0..100 */
+    int speed_governor;    /* AUDIO > AUTO SLOW FOR AUDIO, 0 off 1 on */
     /* The menu's OWN copy of the stored choices. Compare against the values
      * the subsystems actually hold (e.g. fast_loads vs cdrom game_divisor) to
      * tell "the ini never reached the menu" apart from "the menu has it but
