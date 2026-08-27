@@ -4612,7 +4612,20 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
      * while the presenter kept blitting it at 240 Hz — the SPEED row reading
      * two steps behind its own toast. */
     menu_prepare_for_present();
-    if (s_force_present_remaining <= 0 &&
+    /* Only safe while the WALL-CLOCK PACER owns cadence (swap interval 0).
+     * With driver vsync owning it (main.cpp present_vsync_owns_cadence: vsync
+     * on, ~60 Hz panel) the blocking swap is the ONLY thing holding 59.94 Hz,
+     * because main.cpp deliberately switches the pacer off so the two cannot
+     * double-block. Skipping the present then removes the last brake and the
+     * guest free-runs: reported as the card viewer and the overworld running
+     * fast at speed 1, cured by turning vsync off, which is exactly the pacer
+     * coming back. Those two screens because they are the ones that hold a
+     * still frame -- a duel animates, so it presents every frame and stays
+     * paced. Keeping the two mechanisms strictly XOR is the whole fix; do not
+     * relax this into "pace anyway when we skipped", which would double-block
+     * on every static->moving transition frame. */
+    if (s_swap_interval == 0 &&
+        s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_VRAM &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
@@ -4725,7 +4738,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     flush_tex_batch();
     flush_cpu_upload();
     menu_prepare_for_present();   /* before the skip test — see present_vram */
-    if (s_force_present_remaining <= 0 &&
+    /* Wall-clock pacer only -- see the note on the VRAM path's skip test. */
+    if (s_swap_interval == 0 &&
+        s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
