@@ -778,7 +778,7 @@ static int           g_fmv_skip_no_xa_hold  = 4;
  * = 30 Hz / 0.50x with the CPU idle. ~60 Hz panels may use vsync as the clock;
  * otherwise the pacer holds 59.94 Hz and present must not wait on the swap. */
 static int           g_low_latency_input = 1;
-static int           g_video_vsync        = 1;
+static int           g_video_vsync        = 0;  /* see psx_video_menu.c */
 static int           g_frame_interpolation = 0;
 static int           g_frame_interpolation_fps = 0;
 static int           g_frame_interpolation_blend =
@@ -857,11 +857,20 @@ extern "C" void interrupts_set_vblank_divisor(uint32_t mult);
 static int g_speed_requested = 1;
 static int g_speed_effective = 1;
 
+/* Defined with the other present-cadence helpers; needed here because the
+ * speed multiplier decides whether driver vsync may own the cadence at all. */
+static void apply_present_cadence(void);
+
 static void speed_apply_effective(int eff) {
     g_frame_speed_mult = eff;
     frame_period_refresh();
     interrupts_set_vblank_divisor((uint32_t)eff);
     g_speed_effective = eff;
+    /* The multiplier changes who is allowed to hold the clock, so the swap
+     * interval has to be re-applied here. Without this the renderer keeps
+     * whatever interval the last cadence decision left it with, and GAME >
+     * SPEED silently does nothing on a ~60 Hz panel with vsync on. */
+    apply_present_cadence();
 }
 
 static void psx_speed_governor_reset(void);
@@ -2894,10 +2903,48 @@ static int host_refresh_is_approx_60hz(void) {
     return g_host_refresh_hz >= 58.8 && g_host_refresh_hz <= 61.2;
 }
 
+/* Never. Kept as a function because the cadence log and the swap-interval
+ * choice both still ask the question.
+ *
+ * The idea was that on a ~60 Hz panel a blocking swap IS a 59.94 Hz clock, so
+ * the wall-clock pacer could stand down and avoid double-blocking. Measured on
+ * a 60 Hz panel, in one duel, toggling only this setting (300 presents each):
+ *
+ *   vsync ON   intervals 10..24 ms, 55% at nominal, stdev ~2.5 ms
+ *   vsync OFF  intervals 16..17 ms, 100% at nominal, stdev 0.47 ms
+ *
+ * A swap that really synchronised would QUANTISE -- 16.7 ms, else 33.3 ms on a
+ * miss, nothing between. The continuous 10..24 ms smear says it does not
+ * block at all here (windowed DWM composites instead), so the average is
+ * dragged to 60 while individual frames land anywhere. That is invisible to
+ * every aggregate -- device_pct 100, fps 60, mean 16.67 -- and plainly visible
+ * on screen, which is why it survived as long as it did.
+ *
+ * The pacer's own numbers are the other half: 99 intervals of 16 ms to 200 of
+ * 17 ms is exactly 16.667 quantised to whole ms, i.e. it is dead on target.
+ *
+ * So the pacer always holds the clock, and the swap interval stays 0. Tearing
+ * is the cost; judder on every frame was the alternative. VSYNC therefore no
+ * longer buys tear-freedom and the row needs relabelling to say so. */
 static int present_vsync_owns_cadence(void) {
+    /* Always. The tests below are kept, unreached, because they document the
+     * exact conditions this used to fire under -- and because reviving the
+     * path means re-measuring those conditions, not just deleting a line. */
+    return 0;
+
     if (g_video_vsync == 0 || g_present_vsync_disabled)
         return 0;
     if (g_frame_period_ms <= 0.0)
+        return 0;
+    /* Only at 1x. The swap paces at the PANEL's rate, which is the guest's
+     * rate only when the multiplier is 1: at 2x the guest wants 120 frames a
+     * second and a 60 Hz swap hands it 60, so GAME > SPEED runs at 1x while
+     * claiming 2x. Worse than merely slow -- speed_apply_effective has already
+     * halved cycles-per-VBlank on the promise those 120 frames arrive, so at
+     * 60 the SPU gets half its real-time cycle budget and the audio breaks up.
+     * Reported as "x2 is very slow with choppy audio" on a 60 Hz panel with
+     * vsync on. Above 1x the wall-clock pacer must hold the clock. */
+    if (g_frame_speed_mult != 1)
         return 0;
     if (g_frame_interpolation)
         return 0;

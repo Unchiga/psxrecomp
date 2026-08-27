@@ -208,7 +208,15 @@ static PsxVideoMenuState s_state = {
     .texture_filter = PSX_VM_FILTER_NEAREST,
     .screen         = PSX_VM_SCREEN_WINDOWED,
     .windowed_scale = PSX_VM_WINDOWED_SCALE_DEFAULT,
-    .vsync          = PSX_VM_VSYNC_ON,
+    /* OFF. Driver vsync is the emulator's clock only on a ~60 Hz panel, and
+     * that path has now been wrong twice for the players who default into
+     * it: first a still screen skipped its present and nothing paced the
+     * guest at all, then presenting every frame instead traded that for
+     * visible judder, because a blocking swap turns any frame overrun into
+     * a whole dropped frame where the wall-clock pacer simply absorbs it.
+     * The pacer path is the one every report calls smooth. Tearing is the
+     * cost, and it is the smaller one; ON remains a row away. */
+    .vsync          = PSX_VM_VSYNC_OFF,
     .supersampling  = 1,
     .fast_loads     = PSX_VM_LOADS_OFF,
     .speed          = PSX_VM_SPEED_DEFAULT,
