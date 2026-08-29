@@ -12402,6 +12402,8 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "fill_ram",          handle_fill_ram },
+    { "write_mem",         handle_write_mem },
+    { "unaligned_stats",   handle_unaligned_stats },
     { "ram_dump_file",     handle_ram_dump_file },
     { "gpu_state",         handle_gpu_state },
     { "menu_state",        handle_menu_state },

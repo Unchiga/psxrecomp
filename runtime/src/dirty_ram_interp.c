@@ -118,6 +118,52 @@ static inline void interp_cyc_step(CPUState *cpu, uint32_t reg_mask) {
  * Sets COP0 registers (BadVAddr, Cause, EPC, Status) and redirects PC to the
  * hardware exception vector.  Used for alignment errors caught by the
  * interpreter.  Returns 1 (control transferred). */
+/* ===== Data-access alignment: the two backends currently DISAGREE =====
+ *
+ * Compiled native code performs NO alignment check: code_generator's
+ * translate_lh/lhu/lw/sh/sw emit a bare psx_cyc_load_half/word, and
+ * psx_read_half_raw simply reads the two straddling bytes. This interpreter
+ * raises the real R3000A AdEL/AdES. Real hardware faults, so the INTERPRETER is
+ * the faithful one and the compiled path is the one that is wrong — but the
+ * split is invisible on stock code, which never does an unaligned access.
+ *
+ * It is very visible on a game MOD. Mod code always executes here (its bytes
+ * differ from the recompiled image, so it sticky-diverges to this interpreter),
+ * and community ROM hacks are built against emulators that skip the check —
+ * Yu-Gi-Oh! Enhanced Edition uses packed [u8][u16][u8] records and does
+ * `lh $s3,1($s1)` on a 4-byte stride, which faults here and nowhere else.
+ *
+ * PSX_RELAX_ALIGNMENT=1 makes this interpreter match the compiled backend, so a
+ * mod can be RUN AND MEASURED without first deciding which backend is right.
+ * It is never silent: every relaxed access is counted and reported by the
+ * `unaligned_stats` debug command. The default stays faithful.
+ *
+ * Instruction-fetch alignment (a jump to an unaligned target) is NOT relaxed —
+ * that is a genuine control-flow error, not a packed-struct idiom. */
+uint64_t g_interp_unaligned_load  = 0;
+uint64_t g_interp_unaligned_store = 0;
+uint32_t g_interp_unaligned_last_pc   = 0;
+uint32_t g_interp_unaligned_last_addr = 0;
+
+static int interp_relax_alignment(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("PSX_RELAX_ALIGNMENT");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Returns 1 when the caller must deliver the address error, 0 when the access
+ * has been waved through to match the compiled backend. */
+static int interp_align_fault(uint32_t pc, uint32_t addr, int is_store) {
+    if (!interp_relax_alignment()) return 1;
+    if (is_store) g_interp_unaligned_store++; else g_interp_unaligned_load++;
+    g_interp_unaligned_last_pc = pc;
+    g_interp_unaligned_last_addr = addr;
+    return 0;
+}
+
 static int interp_exception(CPUState *cpu, uint32_t exc_code,
                             uint32_t badvaddr, uint32_t epc_pc) {
     uint32_t sr = cpu->cop0[12];
@@ -2125,7 +2171,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x21: { /* LH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
+        if ((addr & 1) && interp_align_fault(pc, addr, 0))
+            return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
@@ -2141,7 +2188,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (addr & 3) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
+        if ((addr & 3) && interp_align_fault(pc, addr, 0))
+            return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         if (psx_ws_is_cull_plane_nx_site(pc))
             /* Side-plane normal-X: inverse-aspect scale while revealed. */
             cpu->gpr[rt] = (uint32_t)psx_ws_plane_nx(
@@ -2164,7 +2212,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x25: { /* LHU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (addr & 1) return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
+        if ((addr & 1) && interp_align_fault(pc, addr, 0))
+            return interp_exception(cpu, 4, addr, pc);  /* LoadAddressError */
         cpu->gpr[rt] = (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         psx_pgxp_load(cpu, insn, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
@@ -2187,7 +2236,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x29: { /* SH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (addr & 1) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
+        if ((addr & 1) && interp_align_fault(pc, addr, 1))
+            return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         uint16_t val  = (uint16_t)cpu->gpr[rt];
         /* Widescreen backdrop screenX squash on the interpreter path: mirrors
          * the recompiler emit at [widescreen.backdrop] x_sites. Overlay code
@@ -2210,7 +2260,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
     }
     case 0x2B: { /* SW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        if (addr & 3) return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
+        if ((addr & 3) && interp_align_fault(pc, addr, 1))
+            return interp_exception(cpu, 5, addr, pc);  /* StoreAddressError */
         g_debug_last_store_pc = pc;
         cpu->write_word(addr, cpu->gpr[rt]);
         psx_pgxp_store(cpu, insn, addr, cpu->gpr[rt]);

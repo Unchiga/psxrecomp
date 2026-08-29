@@ -127,6 +127,58 @@ void handle_write_ram(int id, const char *json)
     send_ok(id);
 }
 
+/* write_mem addr=<hex> hex=<byte string> — write a BLOB in one command.
+ *
+ * write_ram pokes one byte and fill_ram writes one repeated byte, so restoring
+ * arbitrary content meant a command per byte. That is not merely verbose: the
+ * server is pumped from the emu thread and serves one command per connection,
+ * so each round trip costs a whole frame — a 2.6 KB restore ran for 20 seconds
+ * and could not keep up with a running guest. This writes the whole blob inside
+ * one service slot.
+ *
+ * Bounded to main RAM, like fill_ram, so it cannot be aimed at MMIO. */
+static int write_mem_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+void handle_write_mem(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr"); return;
+    }
+    /* The blob can be large; take it straight out of the request text rather
+     * than copying it into a bounded stack buffer first. */
+    const char *key = strstr(json, "\"hex\"");
+    if (!key) { send_err(id, "missing hex"); return; }
+    const char *p = strchr(key + 5, '"');
+    if (!p) { send_err(id, "missing hex"); return; }
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) { send_err(id, "missing hex"); return; }
+
+    const size_t digits = (size_t)(end - p);
+    if (digits == 0 || (digits & 1u)) { send_err(id, "hex must be whole bytes"); return; }
+    const uint32_t len = (uint32_t)(digits / 2u);
+
+    const uint32_t addr = hex_to_u32(addr_str);
+    const uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys + len > 0x200000u) { send_err(id, "range outside main RAM"); return; }
+
+    for (uint32_t i = 0; i < len; i++) {
+        int hi = write_mem_nibble(p[i * 2u]);
+        int lo = write_mem_nibble(p[i * 2u + 1u]);
+        if (hi < 0 || lo < 0) { send_err(id, "bad hex digit"); return; }
+        psx_write_byte(addr + i, (uint8_t)((hi << 4) | lo));
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%u}",
+             id, addr, (unsigned)len);
+}
+
 /* geom_correction — is [video] geometry_correction / perspective_texturing
  * actually doing anything on THIS title?
  *
@@ -397,6 +449,31 @@ void handle_fill_ram(int id, const char *json)
         psx_write_byte(addr + (uint32_t)i, val);
     send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,"
              "\"val\":%u}", id, addr, len, val);
+}
+
+/* unaligned_stats — how often did the interpreter wave through a data access
+ * that real R3000A hardware would have faulted on?
+ *
+ * Zero unless PSX_RELAX_ALIGNMENT=1. Non-zero means the code being run is doing
+ * something no stock PS1 game does, and the run is NOT hardware-faithful: it is
+ * matching the compiled backend (and every mainstream emulator) instead. See
+ * the header comment on interp_align_fault in dirty_ram_interp.c. */
+void handle_unaligned_stats(int id, const char *json)
+{
+    (void)json;
+    extern uint64_t g_interp_unaligned_load;
+    extern uint64_t g_interp_unaligned_store;
+    extern uint32_t g_interp_unaligned_last_pc;
+    extern uint32_t g_interp_unaligned_last_addr;
+    const char *env = getenv("PSX_RELAX_ALIGNMENT");
+    send_fmt("{\"id\":%d,\"ok\":true,\"relaxed\":%d,"
+             "\"loads\":%llu,\"stores\":%llu,"
+             "\"last_pc\":\"0x%08X\",\"last_addr\":\"0x%08X\"}",
+             id, (env && *env && *env != '0') ? 1 : 0,
+             (unsigned long long)g_interp_unaligned_load,
+             (unsigned long long)g_interp_unaligned_store,
+             (unsigned)g_interp_unaligned_last_pc,
+             (unsigned)g_interp_unaligned_last_addr);
 }
 
 void handle_mem_words(int id, const char *json)
