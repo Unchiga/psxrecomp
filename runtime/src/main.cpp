@@ -5304,6 +5304,13 @@ extern "C" int psx_host_inject_key(int sdl_keycode) {
     return SDL_PushEvent(&ev) == 1;
 }
 
+/* See psx_host_input.h: lets a test write the settings file without driving
+ * the menu through synthetic mouse events. */
+extern "C" int psx_host_menu_settings_save(void) {
+    if (g_menu_settings_path.empty()) return 0;
+    return psx_video_menu_settings_save(g_menu_settings_path.c_str());
+}
+
 /* MODS > CARD DROPS lives in psx_card_drops.c — the mod owns its own guest
  * addresses, hook registration and results-page rendering. main.cpp only
  * registers it, ticks it, and hands it the menu setting. */
@@ -13471,6 +13478,35 @@ int main(int argc, char** argv) {
      * including BIOS instances that have no [game]-block config. */
     if (boot.cli_debug_port >= 0) boot.debug_port      = (uint16_t)boot.cli_debug_port;
     if (boot.cli_renderer   >= 0) g_video_renderer = boot.cli_renderer;
+    /* menu_settings.ini `renderer`, when the command line did not ask. Read
+     * HERE because the backend is chosen in init_runtime_devices() below and
+     * cannot be changed afterwards -- the other read of this file (for
+     * supersampling) happens later still, which is too late for this.
+     *
+     * File-only by design; there is no menu row. See PsxVideoMenuState. */
+    if (boot.cli_renderer < 0) {
+        PsxVideoMenuState vms{};
+        vms.renderer = PSX_VM_RENDERER_UNSET;
+        const std::string mspath =
+            sidecar_cfg_path(argv[0], "menu_settings.ini").string();
+        if (psx_video_menu_settings_load(mspath.c_str(), &vms) &&
+            vms.renderer != PSX_VM_RENDERER_UNSET &&
+            vms.renderer != g_video_renderer) {
+            std::fprintf(stdout,
+                         "psxrecomp: renderer %s from menu_settings.ini "
+                         "(game config asked for %s)\n",
+                         vms.renderer == 2 ? "vulkan" :
+                         vms.renderer == 1 ? "opengl" : "software",
+                         g_video_renderer == 2 ? "vulkan" :
+                         g_video_renderer == 1 ? "opengl" : "software");
+            if (vms.renderer == 2)
+                std::fprintf(stdout,
+                             "psxrecomp: NOTE Vulkan does not composite the F10 "
+                             "menu or any guest-space overlay this build draws; "
+                             "toasts and the save-state menu do appear.\n");
+            g_video_renderer = vms.renderer;
+        }
+    }
     if (boot.cli_window_title)    boot.window_title     = boot.cli_window_title;
     if (boot.cli_memcard_dir) {
         boot.memcard_dir = std::filesystem::path(boot.cli_memcard_dir);
@@ -13791,6 +13827,13 @@ session_reboot:
          * nothing assigned it. Zeroing first makes an omission default to off
          * instead of to garbage. */
         PsxVideoMenuState vms{};
+        /* NOT zero. Zero is SOFTWARE, and this struct is what the menu keeps
+         * and writes back on every change — so leaving it at the value-
+         * initialised 0 would make the first menu tweak write `renderer=0`
+         * and force software rendering on the next launch, for a player who
+         * never asked for it. UNSET means "no override", which is the only
+         * safe thing for a key the menu has no row for. */
+        vms.renderer       = PSX_VM_RENDERER_UNSET;
         /* Sharp-by-default: whole-pixel scaling with no smoothing on either the
          * final present or in-game textures. These are presentation choices, not
          * emulation behaviour — the frame the guest renders is unchanged. */

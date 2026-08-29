@@ -217,6 +217,9 @@ static PsxVideoMenuState s_state = {
      * The pacer path is the one every report calls smooth. Tearing is the
      * cost, and it is the smaller one; ON remains a row away. */
     .vsync          = PSX_VM_VSYNC_OFF,
+    /* UNSET, so an absent key leaves game.toml's choice alone rather than
+     * this default silently becoming an override. */
+    .renderer       = PSX_VM_RENDERER_UNSET,
     .supersampling  = 1,
     .fast_loads     = PSX_VM_LOADS_OFF,
     .speed          = PSX_VM_SPEED_DEFAULT,
@@ -1571,6 +1574,12 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "vol_music"))  out->vol_music  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "vol_sound"))  out->vol_sound  = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "update_check")) out->update_check = v ? 1 : 0;
+        /* Absent key leaves whatever the caller seeded (game.toml). Only a
+         * value actually present here overrides it. */
+        else if (!strcmp(key, "renderer"))
+            out->renderer = (v >= PSX_VM_RENDERER_SOFTWARE &&
+                             v <= PSX_VM_RENDERER_VULKAN)
+                            ? v : PSX_VM_RENDERER_UNSET;
         else {
             /* Rows a title registered. Clamped to the row's own bounds so a
              * hand-edited file cannot push a value past what the row accepts. */
@@ -1632,6 +1641,29 @@ void psx_video_menu_apply_restored(void) {
     s_applying_restored = 0;
 }
 
+/* The renderer line, written separately from the block below.
+ *
+ * The menu rewrites this whole file every time a row changes, so a key it does
+ * not own has to be round-tripped deliberately or the next menu tweak silently
+ * reverts it. It is emitted COMMENTED when unset: that documents the option
+ * for anyone reading the file without making the value an active override,
+ * which is what writing a real default here would do -- it would override
+ * game.toml on every title, not just one that asked for it. */
+static void write_renderer_line(FILE *f, int renderer) {
+    if (renderer >= PSX_VM_RENDERER_SOFTWARE &&
+        renderer <= PSX_VM_RENDERER_VULKAN)
+        fprintf(f, "renderer=%d        # 0 software, 1 opengl, 2 vulkan"
+                   " (see the note below)\n", renderer);
+    else
+        fprintf(f, "# renderer=1      # 0 software, 1 opengl, 2 vulkan;"
+                   " omit to use the game's own setting\n");
+    fprintf(f, "#                  # VULKAN IS EXPERIMENTAL: this F10 menu and\n"
+               "#                  # anything the build draws over the game are\n"
+               "#                  # NOT shown under it (toasts and the save-\n"
+               "#                  # state menu are). Takes effect on next\n"
+               "#                  # launch; --renderer still wins.\n");
+}
+
 int psx_video_menu_settings_save(const char *path) {
     FILE *f;
     if (!path) return 0;
@@ -1673,6 +1705,7 @@ int psx_video_menu_settings_save(const char *path) {
         (s_state.vol_sound  >= 0 && s_state.vol_sound  <= 100) ? s_state.vol_sound  : 100,
         s_state.speed_governor ? 1 : 0,
         s_state.update_check ? 1 : 0);
+    write_renderer_line(f, s_state.renderer);
     /* Rows a title registered, in registration order. A row with no key is
      * deliberately not written: a live cheat re-applied at startup would
      * overwrite the player's real save. */

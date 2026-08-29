@@ -27,6 +27,17 @@ int psx_host_inject_mouse_move(int win_x, int win_y);
 /* key is an SDL_Keycode. Returns 1 when the event was queued. */
 int psx_host_inject_key(int sdl_keycode);
 
+/* Write menu_settings.ini now, exactly as a menu change would.
+ *
+ * Persistence is otherwise only reachable by driving the menu with synthetic
+ * mouse events, which makes "does this key survive a settings write" cost a
+ * hunt for a row's pixel coordinates. That is a test the file format earns
+ * every time a key is added to it: the menu rewrites the WHOLE file on every
+ * change, so any key the menu does not itself own is one seeding mistake away
+ * from being silently reverted -- or, worse, written with a default nobody
+ * chose. Returns 1 when the file was written. */
+int psx_host_menu_settings_save(void);
+
 /* Writes SDL's joystick/gamepad enumeration plus per-player routing into out
  * as JSON object members (no enclosing braces). Returns bytes written. */
 int psx_host_pad_devices_json(char *out, int cap);

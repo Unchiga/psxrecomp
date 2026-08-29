@@ -72,7 +72,24 @@ typedef struct PsxVideoMenuState {
      * Set update_check=0 in that file to stop the check entirely - no
      * request is made at all, not merely a suppressed prompt. */
     int update_check;
+    /* 0 software, 1 opengl, 2 vulkan. Read from menu_settings.ini at startup
+     * and applied before the window exists; --renderer on the command line
+     * still wins. There is deliberately NO menu row for this.
+     *
+     * Two reasons it is a file-only control. It cannot be applied live — the
+     * backend is chosen when the window and context come up — so a row would
+     * be one of those controls that silently does nothing until restart. And
+     * Vulkan does not composite this menu: picking it from the
+     * menu would make the menu itself disappear, with no way back except
+     * editing this file, which is a trap rather than a setting.
+     *
+     * -1 means "not present in the file": leave whatever game.toml chose. */
+    int renderer;
 } PsxVideoMenuState;
+
+/* menu_settings.ini `renderer` values. */
+enum { PSX_VM_RENDERER_UNSET = -1, PSX_VM_RENDERER_SOFTWARE = 0,
+       PSX_VM_RENDERER_OPENGL = 1, PSX_VM_RENDERER_VULKAN = 2 };
 
 #define PSX_VM_SPEED_DEFAULT 1
 /* 4, not 16. Speed is now audio-preserving (the pacer and the guest VBlank

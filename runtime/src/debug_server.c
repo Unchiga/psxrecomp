@@ -5269,6 +5269,16 @@ static void handle_menu_move(int id, const char *json)
  * nothing and reads as the overlay ignoring you.) */
 
 
+/* menu_settings_save — write menu_settings.ini now, as a menu change would.
+ * Persistence is otherwise only reachable by driving the menu with synthetic
+ * mouse events; this makes "does my key survive a settings write" one call. */
+static void handle_menu_settings_save(int id, const char *json)
+{
+    (void)json;
+    if (!psx_host_menu_settings_save()) { send_err(id, "save failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"saved\":true}", id);
+}
+
 static void handle_menu_key(int id, const char *json)
 {
     int key = json_get_int(json, "key", -1);
@@ -12414,6 +12424,7 @@ static const CmdEntry s_commands[] = {
     { "menu_click",        handle_menu_click },
     { "menu_move",         handle_menu_move },
     { "menu_key",          handle_menu_key },
+    { "menu_settings_save", handle_menu_settings_save },
     { "savestate_input_trace", handle_savestate_input_trace },
     { "savestate_menu_state", handle_savestate_menu_state },
     { "rewind_state",      handle_rewind_state },
