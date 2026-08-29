@@ -20,6 +20,9 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 extern char** environ;
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h> /* _NSGetExecutablePath: macOS has no /proc */
+#  endif
 #endif
 
 /* Forward decls — used by toolchain cache helpers before their definitions. */
@@ -371,6 +374,36 @@ static int find_on_path(const char* name, char* out, size_t cap) {
 #endif
     return 0;
 }
+
+#if !defined(_WIN32)
+/* Absolute path of an executable on PATH.
+ *
+ * find_on_path() answers only "does it exist" and writes the bare NAME back.
+ * That suits callers that go on to exec through a shell, but not
+ * cmake_path_runs(), whose first act is path_is_file() -- handed "cc" it
+ * fails, and the failure surfaces as a broken toolchain. */
+static int resolve_on_path_abs(const char* name, char* out, size_t cap) {
+    char cmd[640];
+    FILE* pipe;
+    size_t n;
+    if (!name || !out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    snprintf(cmd, sizeof(cmd), "command -v %s 2>/dev/null", name);
+    pipe = popen(cmd, "r");
+    if (!pipe)
+        return 0;
+    if (!fgets(out, (int)cap, pipe)) {
+        pclose(pipe);
+        return 0;
+    }
+    pclose(pipe);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = '\0';
+    return out[0] == '/' && path_is_file(out);
+}
+#endif
 
 /* resolve_toolchain_bin is defined later; pack python lives beside bin/. */
 static int resolve_toolchain_bin(char* out, size_t cap);
@@ -2697,6 +2730,7 @@ static int toolchain_bin_compiler_works(const char* bin) {
     char clang[1200], lld[1200], src[1400], exe[1400], cmd[4096];
     FILE* f;
     int ok;
+    int use_system_cc = 0;
     if (!bin || !bin[0])
         return 0;
 #if defined(_WIN32)
@@ -2708,9 +2742,22 @@ static int toolchain_bin_compiler_works(const char* bin) {
             return 0;
     }
 #else
-    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang))
-        return 0;
-    if (!join_path(lld, sizeof(lld), bin, "ld.lld") || !path_is_file(lld))
+    /* A pack of kind "cmake-ninja-system-clang" -- which is what the macOS
+     * pack is -- ships cmake, ninja and ccache and deliberately NO compiler,
+     * because it is built to drive the host's own clang. Requiring bin/clang
+     * and bin/ld.lld here declares such a pack broken, and the caller reports
+     * that as "Extracted toolchain but cmake.exe is missing", so a correct
+     * macOS install fails setup while pointing at the wrong thing entirely.
+     * Fall back to the system compiler the pack means to use. */
+    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang)) {
+        if (!resolve_on_path_abs("cc", clang, sizeof(clang)) &&
+            !resolve_on_path_abs("clang", clang, sizeof(clang)) &&
+            !resolve_on_path_abs("gcc", clang, sizeof(clang)))
+            return 0;
+        use_system_cc = 1;
+    }
+    if (!use_system_cc &&
+        (!join_path(lld, sizeof(lld), bin, "ld.lld") || !path_is_file(lld)))
         return 0;
 #endif
     if (!cmake_path_runs(clang))
@@ -2747,10 +2794,16 @@ static int toolchain_bin_compiler_works(const char* bin) {
 #else
     /* Prefer the pack linker explicitly so PATH cannot hide a broken lld. */
     (void)lld; /* used via -fuse-ld when present; path already validated */
-    snprintf(cmd, sizeof(cmd),
-             "env PATH=\"%s:$PATH\" \"%s\" -fuse-ld=lld \"%s\" -o \"%s\" "
-             ">/dev/null 2>&1",
-             bin, clang, src, exe);
+    if (use_system_cc)
+        /* System compiler: it owns its own linker, and -fuse-ld=lld would
+         * fail on a host that has no lld at all. */
+        snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\" -o \"%s\" >/dev/null 2>&1",
+                 clang, src, exe);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "env PATH=\"%s:$PATH\" \"%s\" -fuse-ld=lld \"%s\" -o \"%s\" "
+                 ">/dev/null 2>&1",
+                 bin, clang, src, exe);
 #endif
     ok = run_cmd_exit_zero(cmd);
 #if defined(_WIN32)
@@ -3597,7 +3650,22 @@ static int host_self_exe_path(char* out, size_t cap) {
             snprintf(out, cap, "%s", appimg);
             return 1;
         }
-        char* rp = realpath("/proc/self/exe", NULL);
+        char* rp;
+#if defined(__APPLE__)
+        /* macOS has no /proc, so the Linux spelling below resolves to nothing
+         * and the caller reports "relaunch requested but no path" -- after a
+         * first-run build that fully succeeded, leaving the player with a
+         * built game and no way in. Ask dyld for this image instead. */
+        {
+            char self[4096];
+            uint32_t n = (uint32_t)sizeof(self);
+            if (_NSGetExecutablePath(self, &n) != 0)
+                return 0;
+            rp = realpath(self, NULL);
+        }
+#else
+        rp = realpath("/proc/self/exe", NULL);
+#endif
         if (!rp)
             return 0;
         snprintf(out, cap, "%s", rp);
