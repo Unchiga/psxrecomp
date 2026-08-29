@@ -3515,7 +3515,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         return 0;
     }
     int lazy_loaded = 0;
-retry_candidates:
+/* The null statement matters: C17 and earlier require a label to be followed by
+ * a STATEMENT, and the next line is a declaration. GCC and C23 compilers accept
+ * the declaration directly, so this only breaks on a strict C17 front end --
+ * Apple Clang on macOS reports "expected expression" here and then a cascade of
+ * "use of undeclared identifier 'head'". */
+retry_candidates: ;
     int head = idx_head(phys);
     int loaded_range_ci = -1;
     int lazy_exact = 0;
