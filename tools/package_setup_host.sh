@@ -41,6 +41,11 @@ DISPLAY_NAME=""
 RECOMPILER_BUILD="build-recompiler"
 VERSION_ENV="RELEASE_VERSION"
 DISC_HINT="your legally owned game disc"
+# A title that ships OpenBIOS uses it and nothing else -- setup never adopts a
+# retail dump for one, so telling the player a dump is "optional" invites them
+# to supply a file that is then silently ignored. Opt-in, because titles that
+# genuinely need a retail image still exist.
+OPENBIOS_ONLY=0
 PROJECT_FILES=()
 PROJECT_DIRS=()
 PROJECT_EXCLUDES=()
@@ -73,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --root) ROOT="${2:?}"; shift 2 ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
     --no-embed-toolchain) EMBED_TOOLCHAIN=0; shift ;;
+    --openbios-only) OPENBIOS_ONLY=1; shift ;;
     *)
       echo "error: unknown arg: $1" >&2
       usage
@@ -370,6 +376,12 @@ else
   STEP4="Nothing else. It does the rest by itself."
 fi
 
+if [[ "${OPENBIOS_ONLY}" -eq 1 ]]; then
+  BIOS_HINT=" This build uses the OpenBIOS image it ships with; a retail BIOS dump is neither needed nor accepted."
+else
+  BIOS_HINT=" A retail SCPH-1001 BIOS dump is optional; otherwise OpenBIOS is regenerated locally."
+fi
+
 cat >"${STAGE}/README-SETUP.txt" <<EOF
 ${DISPLAY_NAME} ${VERSION} — setup package
 Platform: ${ARTIFACT}
@@ -381,8 +393,7 @@ BIOS dumps, pre-generated game C, or a portable cmake/clang pack. Emitters
 Standalone:
 1. Run ${EXE_BASENAME}. Nothing needs installing first -- the setup brings
    its own compiler and its own Python, and uses yours if you have them.
-2. Provide ${DISC_HINT} (and optional retail SCPH-1001 BIOS; otherwise
-   OpenBIOS is regenerated locally).
+2. Provide ${DISC_HINT}.${BIOS_HINT}
 3. ${STEP4}
 
 THE FIRST RUN TAKES A WHILE - LET IT FINISH.
