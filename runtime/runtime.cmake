@@ -296,6 +296,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_debug_commands.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_guest_overlay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ui_font.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ui_draw.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_input_config.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_host_audio.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_post_load_probe.c
@@ -1298,6 +1300,31 @@ function(psxrecomp_add_runtime_target target)
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}")
         endif()
 
+    # UI font notices. Inter (SIL OFL 1.1) and Material Symbols (Apache 2.0)
+    # are COMPILED INTO the binary as subset C arrays -- there is no font file
+    # for a player to find -- so both licences have to ride alongside the
+    # executable the same way the BIOS notice does, or the build ships
+    # redistributable fonts with nothing saying so. FATAL rather than a warning:
+    # a missing notice is a licence problem, not a cosmetic one, and it is
+    # exactly the kind of thing that goes unnoticed until a release is out.
+    set(_psxrt_font_licenses
+        "${PSXRECOMP_ROOT}/runtime/third_party/fonts/Inter-OFL.txt"
+        "${PSXRECOMP_ROOT}/runtime/third_party/fonts/MaterialSymbols-LICENSE.txt")
+    foreach(_lic IN LISTS _psxrt_font_licenses)
+        if(NOT EXISTS "${_lic}")
+            message(FATAL_ERROR "UI font licence notice is missing: ${_lic}")
+        endif()
+        get_filename_component(_lic_name "${_lic}" NAME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:${target}>/licenses"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_lic}" "$<TARGET_FILE_DIR:${target}>/licenses/${_lic_name}"
+            COMMENT "Staging UI font notice ${_lic_name}"
+            VERBATIM)
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_lic}")
+    endforeach()
+
     # Framework-owned mod catalog (loading speed). These target game_id "*" and
     # are emulator features rather than per-disc content, so every game gets
     # them without carrying a copy of the manifests. Staged BEFORE the game's
@@ -1940,3 +1967,50 @@ function(psxrecomp_add_game_runtime target)
         target_include_directories(${_psxg_t} PRIVATE ${_psxg_inc})
     endforeach()
 endfunction()
+
+# menu_preview: render a host overlay to a PNG with no window and no guest --
+# the F10 menu, a toast, or the save-state slot browser.
+#
+# The debug server's `screenshot` resolves native VRAM BEFORE anything is
+# composited, so it cannot see any of them -- which left "does it look right"
+# answerable only by asking a human to look at the window. This builds the same
+# modules the runtime links and writes the exact ARGB image the renderers
+# composite, so a layout change can be checked without a game running. Rides on PSX_DEBUG_TOOLS because it is a debug tool and that
+# flag is already what separates a dev tree from a release one.
+#
+# Guarded on the target name: runtime.cmake is included by BOTH the framework
+# tree and every game tree, and two definitions of one target is a configure
+# error rather than a warning.
+if(PSX_DEBUG_TOOLS AND NOT TARGET menu_preview)
+    add_executable(menu_preview
+        ${PSXRECOMP_ROOT}/runtime/tests/menu_preview.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_ui_font.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_ui_draw.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+        ${PSXRECOMP_ROOT}/runtime/src/host_osd.c)
+    target_include_directories(menu_preview PRIVATE
+        ${PSXRECOMP_ROOT}/runtime/include ${PSX_SDL_INCLUDE_DIRS})
+    # psx_video_menu.c needs SDL only for the SDLK_* keycodes and host_osd.c
+    # only for its clock, so take the headers WITHOUT linking the library: a
+    # preview tool that needs SDL3.dll beside it to start is a preview tool
+    # nobody runs. PSX_SDL_INCLUDE_DIRS is empty on the FetchContent path,
+    # where the include dirs live on the imported target instead.
+    if(TARGET SDL3::SDL3)
+        target_include_directories(menu_preview PRIVATE
+            $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
+    elseif(TARGET SDL3::SDL3-static)
+        target_include_directories(menu_preview PRIVATE
+            $<TARGET_PROPERTY:SDL3::SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>)
+    endif()
+    # PSX_SDL_NO_RENDER drops host_osd.c's SDL_Renderer path, which is the only
+    # part of these modules that needs SDL to LINK rather than merely to
+    # compile -- and per the note above this tool links no SDL at all.
+    # menu_preview.c stubs the two symbols that survive that.
+    target_compile_definitions(menu_preview PRIVATE
+        SDL_MAIN_HANDLED PSX_SDL_NO_RENDER=1
+        $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>)
+    if(NOT MSVC)
+        target_link_libraries(menu_preview PRIVATE m)
+    endif()
+endif()

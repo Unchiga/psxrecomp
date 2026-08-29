@@ -3292,7 +3292,7 @@ static void open_player(PlayerInput& p, int self_slot) {
              * turned "XInput Controller #1" into "XInput Controll", which
              * reads as a misspelling rather than a truncation. */
             char shortname[24];
-            const char *src = name ? name : "CONTROLLER";
+            const char *src = name ? name : "Controller";
             {
                 const size_t budget = 14;
                 size_t n = std::strlen(src);
@@ -3308,7 +3308,10 @@ static void open_player(PlayerInput& p, int self_slot) {
                 }
             }
             char toast[96];
-            std::snprintf(toast, sizeof(toast), "PORT %d: %s",
+            /* Mixed case, like every other toast. The strip renders real
+             * lower case now; shouting was a limitation of the 8x8 sheet,
+             * which had no lower case to draw. */
+            std::snprintf(toast, sizeof(toast), "Port %d: %s",
                           self_slot + 1, shortname);
             /* The boot-time open runs before SDL_CreateWindow, so a toast
              * pushed now would expire unseen. Stash it and let the window
@@ -3452,7 +3455,7 @@ static void auto_adopt_p1_gamepad(void) {
         /* The loop below closes the stale handle (kind != 2). */
         set_player_device(p, "keyboard", p.mode);
         g_p1_auto_adopted = false;
-        host_osd_push("PORT 1: CONTROLLER REMOVED - KEYBOARD", 2500);
+        host_osd_push("Port 1: controller removed — keyboard", 2500);
     }
 #endif
 }
@@ -5332,10 +5335,11 @@ static bool              g_last_applied_valid = false;
  *    drawable must be TALLER than N x native_h by that strip. Size it to
  *    N x native_h alone and the integer snap drops to N-1 the moment the bar
  *    is up, which reads as "the scale option is off by one".
- * 2. The strip's height is itself a function of the drawable height
- *    (psx_video_menu_ui_scale is drawable_h / 480), so the two are mutually
- *    dependent. Solve by iterating; the ui scale moves in whole steps, so it
- *    settles in one or two passes rather than oscillating.
+ * 2. The strip's height is itself a function of the drawable height (the bar
+ *    is a fixed fraction of it), so the two are mutually dependent. Solve by
+ *    iterating; the height it converges to is a rounded fraction of a height
+ *    that is itself growing by whole guest rows, so it settles in one or two
+ *    passes rather than oscillating.
  * 3. SDL window size is in LOGICAL units while the letterbox works in
  *    drawable pixels, and this is not 1:1 on a high-DPI display (150% here
  *    gives a drawable half again the window size). Convert with the ratio the
@@ -5366,8 +5370,7 @@ static void psx_apply_windowed_scale(const PsxVideoMenuState *s) {
     int want_w = nw * n;
     int want_h = nh * n;
     for (int i = 0; i < 4; i++) {
-        const int bar = psx_video_menu_bar_height() *
-                        psx_video_menu_ui_scale(want_w, want_h);
+        const int bar = psx_video_menu_bar_h_px(want_w, want_h);
         const int h = nh * n + bar;
         if (h == want_h) break;
         want_h = h;

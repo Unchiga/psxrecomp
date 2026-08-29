@@ -76,12 +76,13 @@ typedef struct PsxVideoMenuState {
      * and applied before the window exists; --renderer on the command line
      * still wins. There is deliberately NO menu row for this.
      *
-     * Two reasons it is a file-only control. It cannot be applied live — the
+     * It is a file-only control because it cannot be applied live — the
      * backend is chosen when the window and context come up — so a row would
-     * be one of those controls that silently does nothing until restart. And
-     * Vulkan does not composite this menu: picking it from the
-     * menu would make the menu itself disappear, with no way back except
-     * editing this file, which is a trap rather than a setting.
+     * be one of those controls that silently does nothing until restart.
+     * (Vulkan not compositing this menu used to be the second reason, and the
+     * sharper one: picking it from the menu made the menu itself disappear,
+     * with no way back except editing this file. vk_overlay_pass fixed that,
+     * so only the restart-only argument still stands.)
      *
      * -1 means "not present in the file": leave whatever game.toml chose. */
     int renderer;
@@ -162,10 +163,13 @@ void psx_video_menu_hide(void);      /* bar off */
 void psx_video_menu_collapse(void);  /* close the dropdown, keep the bar */
 void psx_video_menu_close(void);     /* alias of collapse (legacy callers) */
 
-/* Renderer tells the menu how big its canvas should be, in LOGICAL pixels, and
- * the integer factor it will be magnified by. Drawing at an integer multiple is
- * what keeps the 8x8 glyphs crisp; stretching a fixed canvas to an arbitrary
- * window size makes the text uneven. */
+/* Renderer tells the menu how big its canvas should be, in pixels, and the
+ * whole-number factor it will be magnified by. That factor is 1 for every
+ * window up to the module's canvas cap: text is rasterised from a real
+ * typeface at the size it will be shown at, so the canvas is authored at
+ * window resolution and a bigger display gets more detail. Magnification
+ * returns only past the cap (see psx_video_menu_ui_scale), where it keeps the
+ * bar full width instead of running out of canvas. */
 void psx_video_menu_set_layout(int logical_w, int logical_h, int ui_scale);
 
 /* Mouse input, in WINDOW pixels (the module divides by ui_scale itself).
@@ -284,21 +288,37 @@ int  psx_video_menu_is_restoring(void);
 int  psx_video_menu_get_row(int row_handle);
 void psx_video_menu_set_row(int row_handle, int value);
 
-/* Bar height in LOGICAL pixels (multiply by the ui scale for drawable px).
- * The renderer reserves this strip at the top so the game is letterboxed
- * BELOW the bar rather than hidden underneath it. */
+/* Bar height in DESIGN UNITS: a 480-tall screen's worth. The menu lays itself
+ * out in these and scales them by the canvas height, so this is a PROPORTION,
+ * not a pixel count, and multiplying it by the ui scale no longer gives
+ * drawable pixels — use psx_video_menu_bar_h_px for that. It stays exported
+ * because psx_savestate_menu.c authors its own panel on a 640x480 canvas, the
+ * same reference, and needs to know how much of it the bar covers. */
 int  psx_video_menu_bar_height(void);
 
-/* Canonical integer magnification for a given drawable size, and the bar's
- * height in those drawable pixels (0 when hidden). Defined HERE, not in a
- * renderer, so every backend reserves exactly the strip that gets drawn —
- * two copies of this formula would drift the moment either changed. */
+/* Canonical whole-number magnification for a given drawable size, and the
+ * bar's height in those drawable pixels. Defined HERE, not in a renderer, so
+ * every backend reserves exactly the strip that gets drawn — two copies of
+ * this formula would drift the moment either changed.
+ *
+ * _bar_h_px always reports the strip; _bar_px reports 0 while the bar is
+ * hidden. Reserve space with the former (the letterbox is sized once, so F10
+ * uncovers the strip instead of rescaling the picture) and composite with the
+ * latter. */
 int  psx_video_menu_ui_scale(int drawable_w, int drawable_h);
+int  psx_video_menu_bar_h_px(int drawable_w, int drawable_h);
 int  psx_video_menu_bar_px(int drawable_w, int drawable_h);
 
 int  psx_video_menu_needs_present(void);
 
 /* Overlay pixels, split by which thread is asking.
+ *
+ * The reported height is only the rows that carry anything -- the canvas is as
+ * wide as the window, and both backends re-upload every reported row each
+ * presented frame, so handing back the whole buffer would spend megabytes a
+ * frame on transparent pixels. The image always starts at the TOP-LEFT of the
+ * window, so a renderer draws it at (0,0) scaled by ui_scale and must NOT
+ * stretch it to the full window height.
  *
  * _overlay_image redraws when dirty and must therefore only be called from the
  * thread that owns this module's state (the emu thread). The frame-

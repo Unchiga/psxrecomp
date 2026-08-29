@@ -4352,12 +4352,17 @@ static void gl_swap_with_osd(void) {
         if (ww > 0 && wh > 0) {
             const uint32_t *px = NULL;
             int ow = 0, oh = 0;
-            /* OSD authored for ~480-tall present; grow with drawable height. */
+            /* MARGINS are authored for a ~480-tall present and grow with the
+             * drawable; the OSD's own IMAGES no longer are. host_osd
+             * rasterises them at the size they will occupy (antialiased text,
+             * see host_osd.c), so they are blitted 1:1 below rather than
+             * magnified here — magnifying them now would square the scale. */
             int ui = wh / 480;
             int margin;
             if (ui < 1) ui = 1;
             if (ui > 8) ui = 8;
             margin = 8 * ui;
+            host_osd_set_layout(ww, wh);
             /* Guest-space overlays, back to front in registration order.
              *
              * Unlike every other overlay here these belong to the GAME's
@@ -4441,10 +4446,10 @@ static void gl_swap_with_osd(void) {
                 gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
             }
             if (host_osd_volume_image(&px, &ow, &oh) && px) {
-                const int dw = ow * ui, dh = oh * ui;
-                int vx = (ww > dw + margin) ? (ww - dw - margin) : margin;
-                int vy = (wh > dh) ? ((wh - dh) / 2) : margin;
-                gl_draw_osd_image(px, ow, oh, dw, dh, vx, vy, ww, wh);
+                int vx = (ww > ow + margin) ? (ww - ow - margin) : margin;
+                int vy = (wh > oh) ? ((wh - oh) / 2) : margin;
+                /* Opaque, so the plain overwrite still applies. */
+                gl_draw_osd_image(px, ow, oh, ow, oh, vx, vy, ww, wh);
             }
             if (psx_rewind_overlay_image(&px, &ow, &oh) && px) {
                 float slide = psx_rewind_slide();
@@ -4455,6 +4460,11 @@ static void gl_swap_with_osd(void) {
                 vy = wh - (int)((float)dh * slide + 0.5f);
                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
             }
+            /* The slot browser sizes its canvas to the window now, so this
+             * stretch is 1:1 unless its allocation fell back to the smaller
+             * static buffer — in which case stretching is exactly the old
+             * behaviour and still the right thing to do. */
+            psx_savestate_menu_set_layout(ww, wh);
             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
 
@@ -4492,8 +4502,11 @@ static void gl_swap_with_osd(void) {
              * top-left is exactly where the bar itself sits. */
             if (host_osd_image(&px, &ow, &oh) && px) {
                 const int bar = psx_video_menu_bar_px(ww, wh);
-                gl_draw_osd_image(px, ow, oh, ow * ui, oh * ui,
-                                  margin, bar + margin, ww, wh);
+                /* BLENDED, unlike the volume bar beside it: the toast is a
+                 * rounded translucent pill now, and an opaque overwrite would
+                 * stamp its transparent corners onto the frame as black. */
+                gl_draw_osd_image_ex(px, ow, oh, ow, oh,
+                                     margin, bar + margin, ww, wh, 1);
             }
         }
     }

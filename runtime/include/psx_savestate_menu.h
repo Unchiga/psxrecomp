@@ -10,14 +10,31 @@ extern "C" {
 void psx_savestate_menu_set_state(int open, int selected_slot);
 void psx_savestate_menu_note_slots_changed(void);
 int  psx_savestate_menu_needs_present(void);
+
+/* Size the panel's canvas to the surface it will be stretched across.
+ *
+ * The panel used to author one fixed 640x480 image whatever the window was,
+ * which is why its text was soft: a 3x stretch of an 8x8 bitmap sheet. It now
+ * lays itself out in units of 1/480 of the canvas HEIGHT and rasterises at
+ * whatever size it is given, so text comes out at the window's own resolution.
+ * Call this before _overlay_image; a caller that does not gets the last size
+ * it was told, or 640x480 if it was never told one.
+ *
+ * The reported canvas can still come back SMALLER than requested -- it is
+ * clamped to what was actually allocated, and the fallback buffer is smaller
+ * than a 4K window. Composite it stretched to the full surface either way,
+ * which is what every backend already did. */
+void psx_savestate_menu_set_layout(int surface_w, int surface_h);
+
 int  psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h);
 
 /* Close button (the X in the panel's top-right corner).
  *
  * Coordinates are DRAWABLE pixels, together with the drawable size the panel
- * was stretched across — this module owns a fixed 640x480 canvas and has no
- * idea how big the window is, so the caller supplies that and the mapping
- * happens here, next to the geometry it has to agree with.
+ * was stretched across. The canvas now tracks the window (see
+ * psx_savestate_menu_set_layout), but it is not guaranteed to EQUAL it, so the
+ * caller still supplies the surface size and the mapping still happens here,
+ * next to the geometry it has to agree with.
  *
  * _hit_close reports whether a click landed on the button; _hover updates the
  * highlight (and marks the canvas dirty only when the state actually changes,

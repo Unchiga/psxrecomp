@@ -1,24 +1,51 @@
-/* Top menu bar overlay: FILE / VIDEO / GAME.
+/* Top menu bar overlay: FILE / VIEW / VIDEO / AUDIO / GAME / CHEATS / MODS.
  *
- * Rendered into an ARGB canvas sized in LOGICAL pixels by the renderer, which
- * then magnifies it by an INTEGER factor. Drawing at an integer multiple is
- * what keeps the 8x8 glyphs crisp - stretching one fixed-size canvas across an
- * arbitrary window makes the text uneven. Transparent everywhere the bar and
- * the open dropdown do not cover, so the game stays visible underneath (the
- * presenter blends this layer; see gl_draw_osd_image_ex).
+ * Rendered into an ARGB canvas that the presenter blends over the frame, so
+ * the game stays visible wherever the bar and the open dropdown do not cover
+ * (see gl_draw_osd_image_ex and vk_overlay_pass).
  *
- * The 8x8 glyph set is the same public-domain font8x8_basic 32..90 subset the
- * save-state menu uses. It is duplicated rather than shared so this module has
- * no coupling to the save-state UI; both are small and independently drawable.
- * Consequence: labels are uppercase-only (anything outside 32..90 draws '?'). */
+ * WHAT CHANGED, AND WHY IT MATTERS TO ANYONE EDITING THIS
+ *
+ * The canvas used to be authored small -- capped at 1280x720 -- and magnified
+ * by a WHOLE NUMBER, because the text was an 8x8 bitmap sheet and a fractional
+ * stretch made its stems uneven. That constraint is gone: text now comes from
+ * a real typeface rasterised by stb_truetype at the exact pixel size wanted
+ * (psx_ui_font.c), so the canvas is authored at the window's own resolution
+ * and a bigger display gets more DETAIL instead of bigger blocks.
+ *
+ * Two consequences to keep straight:
+ *
+ *  - Layout is written in DESIGN UNITS, not pixels. One design unit is 1/480
+ *    of the canvas height, so the UI keeps the same proportion of the screen
+ *    at every window size. S(x) converts; s_unit holds the factor. Never write
+ *    a raw pixel count into layout code -- it will be right on one monitor.
+ *  - psx_video_menu_ui_scale() now returns 1 for every window up to the canvas
+ *    cap. It is NOT dead: past the cap it goes back to whole-number
+ *    magnification, which is what keeps an 8K display readable instead of
+ *    showing a bar across the left third of the screen. Canvas-to-screen is
+ *    that factor; design-to-canvas is s_unit; the product is what the player
+ *    sees, and psx_video_menu_bar_px() is the one place that multiplies them.
+ *
+ * redraw() still runs ONLY when s_dirty, which is what makes a 4K canvas
+ * affordable, and it clears only the box it drew last time rather than the
+ * whole buffer -- a full 33 MB memset per pointer move during a slider drag is
+ * milliseconds of the frame budget for no reason.
+ *
+ * Labels are mixed case now. Rows registered by titles (psx_video_menu_add_*)
+ * are drawn exactly as given: an all-caps string from a game or a mod renders
+ * as emphasis rather than as damage, and quietly case-folding somebody else's
+ * label would mangle "VSYNC" and "3D" for a cosmetic gain. */
 
 #include "psx_video_menu.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "psx_sdl.h"
+#include "psx_ui_font.h"
 
 /* Stringify PSX_VM_SPEED_MAX into the SPEED row's hint. Spelling the ceiling
  * out as a literal is what left the hint reading "1 TO 16" after the ceiling
@@ -27,61 +54,75 @@
 #define PSX_VM_STR2(x) #x
 #define PSX_VM_STR(x)  PSX_VM_STR2(x)
 
-/* Canvas ceiling. The renderer raises ui_scale until the logical size fits, so
- * this bounds memory rather than window size. */
-#define VM_MAX_W 1280
-#define VM_MAX_H 720
+/* Canvas ceiling. Sized for a 4K window drawn 1:1; past it the renderer goes
+ * back to whole-number magnification (psx_video_menu_ui_scale), so the bar
+ * stays full width and readable on an 8K panel instead of running out of
+ * canvas. Allocated once at init and never moved, because the presentation
+ * thread reads this buffer while the emu thread owns everything else. */
+#define VM_MAX_W 3840
+#define VM_MAX_H 2160
+/* Static fallback, used when the 33 MB allocation fails. Same size as the old
+ * fixed canvas, so the worst case is exactly the UI this replaced rather than
+ * no menu at all -- and the menu is how a player undoes a bad setting. */
+#define VM_FB_W 1280
+#define VM_FB_H 720
 
-#define VM_BAR_H     22
-#define VM_TITLE_X0  10
-#define VM_TITLE_PAD 14
-#define VM_ROW_H     20
-#define VM_ROWS_Y0   (VM_BAR_H + 6)
+/* ---- layout, in DESIGN UNITS (1 unit = 1/480 of canvas height) ------------
+ *
+ * Chosen against a 1080p window (s_unit = 2.25), where these land at: 50 px
+ * bar, 43 px rows, 23 px text. Anything here that reads like a magic number is
+ * a proportion, not a pixel count -- see the file header. */
+#define VM_BAR_H        22.0f   /* menu bar strip */
+#define VM_BAR_PAD_X     7.0f   /* inset before the first title */
+#define VM_TITLE_PAD    11.0f   /* horizontal padding inside a title chip */
+#define VM_TITLE_GAP     1.0f   /* between chips */
+#define VM_TITLE_R       6.0f   /* chip corner radius */
+#define VM_PANEL_GAP     3.0f   /* bar bottom -> panel top */
+#define VM_PANEL_PAD     6.0f   /* panel inner padding */
+#define VM_PANEL_R       9.0f
+#define VM_ROW_H        19.0f
+#define VM_ROW_R         7.0f   /* active-row pill radius */
+#define VM_ROW_PAD_X     9.0f   /* text inset inside a row */
+#define VM_SEP_H        10.0f   /* band holding the hairline between groups */
+#define VM_HINT_GAP      3.0f   /* rows -> hint rule */
+#define VM_HINT_H       15.0f   /* hint strip */
+#define VM_VALUE_GAP    16.0f   /* minimum label-to-value gutter */
+#define VM_PANEL_MIN_W 150.0f
+#define VM_SLIDER_W    104.0f   /* drag track on volume / speed / zoom rows */
+#define VM_SLIDER_H      4.0f
+#define VM_SLIDER_KNOB   6.0f   /* knob radius */
+#define VM_CARET         3.5f   /* half-size of the cycle arrows */
+#define VM_SHADOW        9.0f   /* how far the panel's shadow reaches */
 
-#define COL_BAR      0xF01A1F2Bu
-#define COL_BAR_EDGE 0xFF2E3648u
-#define COL_PANEL    0xF81A1F2Bu
-#define COL_PANEL_ED 0xFF3A4352u
-#define COL_TEXT     0xFFD5DAE4u
-#define COL_DIM      0xFF7F8796u
-#define COL_ACCENT   0xFFFFD24Du
-#define COL_SEL_BG   0xFF303746u
-#define COL_HOVER_BG 0xFF262D3Bu
-#define COL_TITLE_BG 0xFF303746u
+/* Text sizes, also design units. Two weights: the bar and a selected row are
+ * SEMIBOLD so the active thing reads as active at a glance, which is work the
+ * old UI could only do with colour. */
+#define VM_FS_ICON      13.0f   /* icons read small; sized above the text */
+#define VM_ICON_GAP      5.0f   /* icon -> title text */
+#define VM_FS_TITLE     10.0f
+#define VM_FS_ROW       10.0f
+#define VM_FS_HINT       8.8f
 
-/* Public-domain 8x8 ASCII 32..90 subset from font8x8_basic. */
-static const uint8_t FONT8[59][8] = {
-    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
-    {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
-    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
-    {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
-    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
-    {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
-    {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
-    {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
-    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
-    {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
-    {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
-    {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
-    {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
-    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
-    {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
-    {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
-    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, {0x7F,0x06,0x06,0x3E,0x06,0x06,0x7F,0x00},
-    {0x7F,0x06,0x06,0x3E,0x06,0x06,0x06,0x00}, {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
-    {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
-    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
-    {0x06,0x06,0x06,0x06,0x06,0x06,0x7F,0x00}, {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
-    {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
-    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x06,0x00}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
-    {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
-    {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
-    {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
-    {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
-    {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},
-};
+/* ---- palette -------------------------------------------------------------
+ *
+ * Dark navy panel, muted-blue fill behind the active row, bright blue for its
+ * text, light grey idle, separators barely there. Alpha is real: the bar and
+ * panel are translucent so the game reads through them, which is why the row
+ * pill is drawn as a solid over that rather than as a colour swap. */
+#define COL_BAR        0xE8141826u
+#define COL_BAR_EDGE   0x40FFFFFFu   /* hairline under the bar */
+#define COL_PANEL      0xF21E2233u
+#define COL_PANEL_ED   0x24FFFFFFu
+#define COL_SEP        0x1EFFFFFFu   /* group separator inside the panel */
+#define COL_TEXT       0xFFC9CFDDu   /* idle label */
+#define COL_DIM        0xFF7C8598u   /* value, hint */
+#define COL_ACCENT     0xFF7FA6FFu   /* active text */
+#define COL_SEL_BG     0xFF2C3B60u   /* muted blue fill behind the active row */
+#define COL_HOVER_BG   0x14FFFFFFu
+#define COL_TRACK      0x66101420u   /* slider groove */
+#define COL_TICK       0x59FFFFFFu   /* stop marks under a short-range track */
+#define COL_SHADOW     0x66000000u   /* lifts the dropdown off the game */
+#define COL_EDIT_BG    0xF00E1119u   /* inline numeric field */
 
 /* ---- menu model ---------------------------------------------------------- */
 
@@ -152,26 +193,30 @@ enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
 enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT = 2 };
 
 #define VM_EDIT_MAX 5   /* digits; 32767 is the widest useful value */
+/* Named once: panel_rect reserves width for it so the panel cannot resize
+ * the moment a field opens, and row_hint prints it. Two copies of the
+ * string is two chances for the reservation to stop matching the text. */
+#define VM_EDIT_HINT "Type digits   Enter apply   Esc cancel"
 /* Draw a notch per step at or below this many steps. Above it the ticks
  * would be sub-pixel and just muddy the track (a 0..100 volume). */
 #define VM_SLIDER_TICK_MAX 16
 
 
-static const char *const SCALING_LABELS[] = { "FILL WINDOW", "INTEGER" };
-static const char *const FILTER_LABELS[]  = { "NEAREST (SHARP)", "LINEAR (SMOOTH)" };
-static const char *const TEXFILTER_LABELS[] = { "NEAREST (SHARP)", "BILINEAR" };
-static const char *const SCREEN_LABELS[]  = { "WINDOWED", "BORDERLESS", "EXCLUSIVE" };
+static const char *const SCALING_LABELS[] = { "Fill window", "Whole pixels" };
+static const char *const FILTER_LABELS[]  = { "Nearest \xe2\x80\x94 sharp", "Linear \xe2\x80\x94 smooth" };
+static const char *const TEXFILTER_LABELS[] = { "Nearest \xe2\x80\x94 sharp", "Bilinear" };
+static const char *const SCREEN_LABELS[]  = { "Windowed", "Borderless", "Exclusive" };
 /* Windowed zoom, indexed by scale-1. */
-static const char *const WSCALE_LABELS[]  = { "1X", "2X", "3X", "4X",
-                                              "5X", "6X", "7X", "8X" };
+static const char *const WSCALE_LABELS[]  = { "1x", "2x", "3x", "4x",
+                                              "5x", "6x", "7x", "8x" };
 /* Index order is the cycle order, not the SDL swap interval: the host maps
  * 0/1/2 -> swap interval 0/1/-1 (see psx_apply_video_menu_state). */
-static const char *const VSYNC_LABELS[]   = { "OFF (LOWEST LAG)", "ON (TEAR-FREE)",
-                                              "ADAPTIVE" };
+static const char *const VSYNC_LABELS[]   = { "Off \xe2\x80\x94 lowest lag", "On \xe2\x80\x94 tear-free",
+                                              "Adaptive" };
 /* Indexed by scale-1. Cost is ~N^2 in fill rate, so the labels say so. */
-static const char *const SSAA_LABELS[]    = { "NATIVE (1X)", "2X", "3X", "4X" };
-static const char *const LOADS_LABELS[]   = { "OFF (AUTHENTIC)", "FAST", "INSTANT" };
-static const char *const SPEEDGOV_LABELS[] = { "OFF", "ON" };
+static const char *const SSAA_LABELS[]    = { "Native (1x)", "2x", "3x", "4x" };
+static const char *const LOADS_LABELS[]   = { "Off \xe2\x80\x94 authentic", "Fast", "Instant" };
+static const char *const SPEEDGOV_LABELS[] = { "Off", "On" };
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
 
 static int s_visible;    /* bar drawn; does not capture input */
@@ -188,7 +233,9 @@ static int s_savestate;
 static int s_rewind;
 static int s_pick_disc;
 
-static int s_lw = 640, s_lh = 480, s_ui = 1;   /* logical size + magnification */
+/* Canvas size in pixels, and the whole-number factor the renderer will
+ * magnify it by (1 for every window up to the canvas cap). */
+static int s_lw = 640, s_lh = 480, s_ui = 1;
 static int s_hover_menu = -1, s_hover_row = -1;
 /* Hover-to-open dwell: which title the pointer is resting on, and since when.
  * s_now_ms is fed by psx_video_menu_tick so this module still owns no clock. */
@@ -234,8 +281,6 @@ static PsxVideoMenuState s_state = {
 static int  s_editing;
 static char s_edit_buf[VM_EDIT_MAX + 1];
 static int  s_edit_len;
-
-static uint32_t s_canvas[VM_MAX_W * VM_MAX_H];
 
 /* ---- numeric options -----------------------------------------------------
  * Everything needed to make a row typeable lives in these three functions, so
@@ -298,16 +343,37 @@ static void num_set(int m, int row, int v) {
 }
 
 static const char *menu_title(int m) {
-    if (m == MENU_FILE) return "FILE";
-    if (m == MENU_VIEW) return "VIEW";
-    if (m == MENU_VIDEO) return "VIDEO";
-    if (m == MENU_AUDIO) return "AUDIO";
-    if (m == MENU_GAME) return "GAME";
-    if (m == MENU_CHEATS) return "CHEATS";
-    if (m == MENU_MODS) return "MODS";
+    if (m == MENU_FILE) return "File";
+    if (m == MENU_VIEW) return "View";
+    if (m == MENU_VIDEO) return "Video";
+    if (m == MENU_AUDIO) return "Audio";
+    if (m == MENU_GAME) return "Game";
+    if (m == MENU_CHEATS) return "Cheats";
+    if (m == MENU_MODS) return "Mods";
     if (m >= MENU_COUNT && m < s_menu_total && s_menu_extra_title[m])
         return s_menu_extra_title[m];
-    return "MODS";
+    return "Mods";
+}
+
+/* The icon beside a top-level title.
+ *
+ * Framework menus get a specific one; anything a TITLE registered gets the
+ * generic "tune", because this module cannot know what a game's own menu is
+ * about and must not pretend to. That is the same reason there is no icon
+ * argument on psx_video_menu_add_menu: an icon nobody can choose sensibly is
+ * better left as one honest default than as a required guess at registration
+ * time. */
+static unsigned menu_icon(int m) {
+    switch (m) {
+        case MENU_FILE:   return PSX_UI_ICON_FOLDER;
+        case MENU_VIEW:   return PSX_UI_ICON_EYE;
+        case MENU_VIDEO:  return PSX_UI_ICON_MONITOR;
+        case MENU_AUDIO:  return PSX_UI_ICON_VOLUME;
+        case MENU_GAME:   return PSX_UI_ICON_GAMEPAD;
+        case MENU_CHEATS: return PSX_UI_ICON_BOLT;
+        case MENU_MODS:   return PSX_UI_ICON_EXTENSION;
+        default:          return PSX_UI_ICON_TUNE;
+    }
 }
 
 static int builtin_rows(int m) {
@@ -436,28 +502,28 @@ static void edit_nudge(int delta) {
 static const char *row_label(int m, int row) {
     { VmRegRow *r = row_reg(m, row); if (r) return r->label; }
     if (m == MENU_FILE)
-        return (row == 0) ? "CLOSE MENU"
-             : (row == 1) ? "CHANGE GAME DISC"
-                          : "QUIT";
-    if (m == MENU_VIEW) return "MENU BAR";
+        return (row == 0) ? "Close menu"
+             : (row == 1) ? "Change game disc"
+                          : "Quit";
+    if (m == MENU_VIEW) return "Menu bar";
     if (m == MENU_GAME)
-        return (row == 0) ? "SPEED"
-             : (row == 1) ? "FAST LOADING"
-             : (row == 2) ? "SAVE / LOAD STATE"
-                          : "REWIND";
+        return (row == 0) ? "Speed"
+             : (row == 1) ? "Fast loading"
+             : (row == 2) ? "Save / load state"
+                          : "Rewind";
     if (m == MENU_AUDIO)
-        return (row == AUD_MASTER) ? "MASTER"
-             : (row == AUD_MUSIC)  ? "MUSIC"
-             : (row == AUD_SOUND)  ? "SOUND EFFECTS"
-                                   : "AUTO SLOW FOR AUDIO";
+        return (row == AUD_MASTER) ? "Master"
+             : (row == AUD_MUSIC)  ? "Music"
+             : (row == AUD_SOUND)  ? "Sound effects"
+                                   : "Auto slow for audio";
     switch (row) {
-        case 0:  return "SCALING";
-        case 1:  return "PRESENT FILTER";
-        case 2:  return "TEXTURE FILTER";
-        case 3:  return "SCREEN";
-        case 4:  return "WINDOWED SCALE";
-        case 5:  return "VSYNC";
-        default: return "RESOLUTION";
+        case 0:  return "Scaling";
+        case 1:  return "Present filter";
+        case 2:  return "Texture filter";
+        case 3:  return "Screen";
+        case 4:  return "Windowed scale";
+        case 5:  return "VSync";
+        default: return "Resolution";
     }
 }
 
@@ -513,13 +579,13 @@ static const char *row_value(int m, int row) {
             const char *d = lp_text(num_get(m, row));
             int i = 0;
             while (d[i] && i < (int)sizeof(zbuf) - 2) { zbuf[i] = d[i]; i++; }
-            zbuf[i] = 'X';
+            zbuf[i] = 'x';
             zbuf[i + 1] = '\0';
             return zbuf;
         }
         return lp_text(num_get(m, row));
     }
-    if (m == MENU_VIEW) return "VISIBLE   F10";
+    if (m == MENU_VIEW) return "Visible   F10";
     if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
         return SPEEDGOV_LABELS[s_state.speed_governor ? 1 : 0];
     if (m == MENU_GAME && row == 1)
@@ -558,80 +624,97 @@ static const char *row_hint(int m, int row) {
         }
     }
     if (s_editing && m == s_menu && row == s_item[s_menu])
-        return "TYPE DIGITS  ENTER APPLY  ESC CANCEL";
+        return VM_EDIT_HINT;
     if (m == MENU_FILE)
-        return (row == 0) ? "CLOSE THIS MENU"
-             : (row == 1) ? "PICK YOUR DISC AGAIN IF IT MOVED  (APPLIES ON RESTART)"
-                          : "EXIT THE GAME";
-    if (m == MENU_VIEW) return "PRESS F10 ANY TIME TO SHOW OR HIDE";
+        return (row == 0) ? "Close this menu"
+             : (row == 1) ? "Pick your disc again if it moved \xe2\x80\x94 applies on restart"
+                          : "Exit the game";
+    if (m == MENU_VIEW) return "Press F10 any time to show or hide";
     if (m == MENU_GAME && row == 1)
         return s_state.fast_loads == PSX_VM_LOADS_OFF
-                   ? "REAL DRIVE TIMING"
+                   ? "Real drive timing"
              : s_state.fast_loads == PSX_VM_LOADS_FAST
-                   ? "SHORTER LOADS - GAME SPEED UNCHANGED"
-                   : "FASTEST - BACK OFF IF A LOAD STALLS";
+                   ? "Shorter loads \xe2\x80\x94 game speed unchanged"
+                   : "Fastest \xe2\x80\x94 back off if a load stalls";
     /* Says the quiet part out loud: the overlay this opens freezes the guest,
      * which is expected from a hotkey but surprising from a menu row. */
     if (m == MENU_GAME && row == 2)
-        return "PAUSES THE GAME UNTIL YOU PICK A SLOT";
+        return "Pauses the game until you pick a slot";
     /* Names the hotkey as well as the effect: the row exists because the
      * feature was previously reachable only by a key nothing advertised. */
     if (m == MENU_GAME && row == 3)
-        return "STEP BACK THROUGH RECENT FRAMES - ALSO F8";
+        return "Step back through recent frames \xe2\x80\x94 also F8";
     if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
         return s_state.speed_governor
-                   ? "DROPS SPEED IN HEAVY SCENES TO KEEP SOUND CLEAN"
-                   : "SPEED STAYS PUT - SOUND MAY BREAK UP IF IT CANNOT KEEP UP";
+                   ? "Drops speed in heavy scenes to keep sound clean"
+                   : "Speed stays put \xe2\x80\x94 sound may break up if it cannot keep up";
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER)
-                   ? "SCALES EVERYTHING - ENTER TO TYPE"
+                   ? "Scales everything \xe2\x80\x94 Enter to type"
              : (row == AUD_MUSIC)
-                   ? "BGM AND CD AUDIO - ENTER TO TYPE"
-                   : "SOUND EFFECTS ONLY - ENTER TO TYPE";
+                   ? "BGM and CD audio \xe2\x80\x94 Enter to type"
+                   : "Sound effects only \xe2\x80\x94 Enter to type";
     if (num_range(m, row, &lo, &hi)) {
         if (m == MENU_GAME && row == 0)
             /* No longer "audio may distort": the pacer and the guest VBlank
              * period now scale together, so device time — and with it the
              * SPU's 44.1 kHz — is unchanged at every setting. */
             return (s_state.speed <= 1)
-                       ? "1X IS NORMAL SPEED. 1 TO "
+                       ? "1x is normal speed. 1 to "
                          PSX_VM_STR(PSX_VM_SPEED_MAX)
-                       : "FASTER GAME, MUSIC STAYS NORMAL";
-        return "ENTER TO TYPE A VALUE";
+                       : "Faster game, music stays normal";
+        return "Enter to type a value";
     }
     switch (row) {
         case 0:
             return s_state.scaling
-                ? "WHOLE PIXELS - SHARP, MAY BORDER"
-                : "FILLS WINDOW - UNEVEN PIXELS";
+                ? "Whole pixels \xe2\x80\x94 sharp, may border"
+                : "Fills the window \xe2\x80\x94 uneven pixels";
         case 1:
             return s_state.filter
-                ? "SMOOTHS THE WHOLE IMAGE"
-                : "NO SMOOTHING - CRISP PIXELS";
+                ? "Smooths the whole image"
+                : "No smoothing \xe2\x80\x94 crisp pixels";
         case 2:
             return s_state.texture_filter
-                ? "SMOOTHS IN-GAME TEXTURES ONLY"
-                : "RAW TEXELS - ORIGINAL LOOK";
+                ? "Smooths in-game textures only"
+                : "Raw texels \xe2\x80\x94 the original look";
         case 3:
-            return "ALT+ENTER ALSO TOGGLES";
+            return "Alt+Enter also toggles";
         /* Names the precondition instead of silently doing nothing. A row
          * that ignores you without saying why reads as broken. */
         case 4:
             return (s_state.screen != PSX_VM_SCREEN_WINDOWED)
-                ? "NEEDS SCREEN = WINDOWED"
+                ? "Needs Screen = Windowed"
                 : (s_state.scaling != PSX_VM_SCALING_INTEGER
-                       ? "NEEDS SCALING = INTEGER"
-                       : "RESIZES THE WINDOW TO WHOLE PIXELS");
+                       ? "Needs Scaling = Whole pixels"
+                       : "Resizes the window to whole pixels");
         case 5:
             return s_state.vsync == PSX_VM_VSYNC_OFF
-                ? "LOWEST INPUT LAG - MAY TEAR"
+                ? "Lowest input lag \xe2\x80\x94 may tear"
                 : (s_state.vsync == PSX_VM_VSYNC_ADAPTIVE
-                       ? "TEAR-FREE, TEARS IF A FRAME IS LATE"
-                       : "TEAR-FREE - ADDS UP TO ONE REFRESH");
+                       ? "Tear-free, tears if a frame is late"
+                       : "Tear-free \xe2\x80\x94 adds up to one refresh");
         default:
             return s_state.supersampling <= 1
-                ? "SHARPER 3D. TAKES EFFECT ON RESTART"
-                : "SHARPER 3D - COSTS FILL RATE. ON RESTART";
+                ? "Sharper 3D. Takes effect on restart"
+                : "Sharper 3D \xe2\x80\x94 costs fill rate. On restart";
+    }
+}
+
+/* How many values an option row cycles through; 1 or 0 means it does not
+ * cycle. Mirrors cycle_row -- the arrows drawn beside a value are a promise
+ * that left/right do something, so the two have to agree row for row. */
+static int row_choices(int m, int row) {
+    { VmRegRow *r = row_reg(m, row);
+      if (r) return (r->kind == PSX_VM_ROW_OPTION) ? r->choice_count : 0; }
+    if (m == MENU_AUDIO) return (row == AUD_SPEED_GOV) ? 2 : 0;
+    if (m == MENU_GAME)  return (row == 1) ? 3 : 0;
+    if (m != MENU_VIDEO) return 0;
+    switch (row) {
+        case 0: case 1: case 2: return 2;
+        case 3: case 5:         return 3;
+        case 4:                 return 0;   /* number row, has a slider */
+        default:                return PSX_VM_SUPERSAMPLING_MAX;
     }
 }
 
@@ -710,26 +793,170 @@ static void cycle_row(int m, int row, int delta) {
     s_dirty = 1;
 }
 
+/* ---- scale, faces, canvas ------------------------------------------------ */
+
+/* Design unit -> canvas pixel. Derived from the canvas HEIGHT alone: the UI
+ * should be the same fraction of the screen on a 16:10 panel as on a 21:9 one,
+ * and only the height is common to both. */
+static float s_unit = 1.0f;
+
+/* Rounded to whole pixels. Layout that lands on half-pixels puts a row's
+ * highlight one pixel off from the row it highlights, once per frame, in a
+ * different direction depending on where it started. */
+static int S(float design) {
+    int v = (int)(design * s_unit + 0.5f);
+    return v;
+}
+
+static float unit_for(int canvas_h) {
+    float u = (float)canvas_h / 480.0f;
+    if (u < 1.0f) u = 1.0f;
+    if (u > 8.0f) u = 8.0f;
+    return u;
+}
+
+static const PsxUiFace *face_title(void) {
+    return psx_ui_font_face(VM_FS_TITLE * s_unit, PSX_UI_FONT_SEMIBOLD);
+}
+static const PsxUiFace *face_row(int selected) {
+    return psx_ui_font_face(VM_FS_ROW * s_unit,
+                            selected ? PSX_UI_FONT_SEMIBOLD
+                                     : PSX_UI_FONT_REGULAR);
+}
+static const PsxUiFace *face_hint(void) {
+    return psx_ui_font_face(VM_FS_HINT * s_unit, PSX_UI_FONT_REGULAR);
+}
+static const PsxUiFace *face_icon(void) {
+    return psx_ui_font_face(VM_FS_ICON * s_unit, PSX_UI_FONT_ICONS);
+}
+
+/* Width an icon occupies in the bar, gap included, or 0 when the icon face
+ * could not be baked -- in which case the titles simply close up and the bar
+ * still works. Measured from the face rather than assumed square, so a
+ * different icon set would not silently overlap the text. */
+static int icon_slot_w(void) {
+    char buf[5];
+    const PsxUiFace *fi = face_icon();
+    int w;
+    if (!fi) return 0;
+    w = psx_ui_font_text_w(fi, psx_ui_font_utf8(PSX_UI_ICON_TUNE, buf));
+    return w > 0 ? w + S(VM_ICON_GAP) : 0;
+}
+
+/* The canvas. Allocated once (psx_video_menu_init) at the full cap and never
+ * reallocated: psx_video_menu_overlay_image_ro hands this pointer to the
+ * presentation thread, so moving it under that thread is a use-after-free, not
+ * a resize. s_cap_* record what actually came back, and ui_scale below reads
+ * them, so a failed allocation degrades to the old magnified 1280x720 UI
+ * rather than to a bar that covers a third of the window. */
+static uint32_t  s_canvas_fb[VM_FB_W * VM_FB_H];
+static uint32_t *s_canvas    = s_canvas_fb;
+static int       s_cap_w     = VM_FB_W;
+static int       s_cap_h     = VM_FB_H;
+
+static void canvas_alloc(void) {
+    uint32_t *p;
+    if (s_canvas != s_canvas_fb) return;          /* already have the big one */
+    p = (uint32_t *)malloc((size_t)VM_MAX_W * (size_t)VM_MAX_H * sizeof(uint32_t));
+    if (!p) return;
+    s_canvas = p;
+    s_cap_w  = VM_MAX_W;
+    s_cap_h  = VM_MAX_H;
+}
+
+/* Bounding box of everything the last redraw() touched, so the next one clears
+ * that instead of the whole canvas. Empty (w == 0) means nothing to clear. */
+static int s_dirty_x, s_dirty_y, s_dirty_w, s_dirty_h;
+
+/* Rows of the canvas that actually carry anything, which is what the accessors
+ * report as its height.
+ *
+ * This is a bandwidth control, not a cosmetic one. Both backends re-upload the
+ * whole reported canvas every presented frame (glTexSubImage2D / the Vulkan
+ * staging copy), and the canvas is now the width of the window -- so reporting
+ * all 1080 rows would mean 8 MB a frame at 1080p and 33 MB at 4K, for a strip
+ * of menu bar over a mostly-empty buffer. The drawn region always starts at
+ * row 0, so a prefix is all anyone needs: during play that is the ~50 px bar
+ * alone, which is LESS traffic than the old magnified canvas cost. It grows
+ * while a dropdown is open, which is exactly when nobody is playing. */
+static int s_used_h = 1;
+
+static void mark_drawn(int x, int y, int w, int h) {
+    int x1, y1;
+    if (w <= 0 || h <= 0) return;
+    if (s_dirty_w <= 0) { s_dirty_x = x; s_dirty_y = y; s_dirty_w = w; s_dirty_h = h; return; }
+    x1 = s_dirty_x + s_dirty_w; y1 = s_dirty_y + s_dirty_h;
+    if (x < s_dirty_x) s_dirty_x = x;
+    if (y < s_dirty_y) s_dirty_y = y;
+    if (x + w > x1) x1 = x + w;
+    if (y + h > y1) y1 = y + h;
+    s_dirty_w = x1 - s_dirty_x;
+    s_dirty_h = y1 - s_dirty_y;
+}
+
 /* ---- geometry (shared by drawing and hit-testing) ------------------------ */
 
-static int text_w(const char *s, int scale) {
-    int n = 0;
-    if (!s) return 0;
-    while (s[n]) n++;
-    return n * 8 * scale;
+static int text_w(const char *s, const PsxUiFace *f) {
+    return psx_ui_font_text_w(f, s);
+}
+
+/* Width of a title's chip: padding, icon slot, gap, label. */
+static int title_w(int m) {
+    return S(VM_TITLE_PAD) * 2 + icon_slot_w() +
+           text_w(menu_title(m), face_title());
 }
 
 static int title_x(int m) {
-    int x = VM_TITLE_X0, i;
-    for (i = 0; i < m; i++)
-        x += text_w(menu_title(i), 1) + VM_TITLE_PAD * 2;
+    int x = S(VM_BAR_PAD_X), i;
+    for (i = 0; i < m; i++) x += title_w(i) + S(VM_TITLE_GAP);
     return x;
 }
 
-static void panel_rect(int m, int *px, int *pw, int *ph) {
+/* Rows a menu owns itself, which is also where the group separator goes. A
+ * menu with no built-in rows (CHEATS, MODS) or none registered gets no rule:
+ * a separator with nothing on one side of it is just a stray line. */
+static int has_sep(int m) {
+    return builtin_rows(m) > 0 && reg_count_for(m) > 0;
+}
+
+/* Top edge of row `row`'s band, relative to the canvas. One function so
+ * drawing and hit-testing cannot drift -- they did not share this before, and
+ * the separator makes the mapping non-linear. */
+static int rows_y0(void) {
+    return S(VM_BAR_H) + S(VM_PANEL_GAP) + S(VM_PANEL_PAD);
+}
+
+static int row_y(int m, int row) {
+    int y = rows_y0() + row * S(VM_ROW_H);
+    if (has_sep(m) && row >= builtin_rows(m)) y += S(VM_SEP_H);
+    return y;
+}
+
+/* Bottom of the last row's band. */
+static int rows_y1(int m) {
     int rows = menu_rows(m);
-    int x = title_x(m) - VM_TITLE_PAD;
+    return rows > 0 ? row_y(m, rows - 1) + S(VM_ROW_H) : rows_y0();
+}
+
+/* Space a slider's numeric readout needs to its right. Widest built-in value
+ * is a 0..100 volume; the padding either side is what keeps it off the panel
+ * edge. Shared by the measure pass and the track's own placement so the two
+ * cannot disagree. */
+static int row_is_slider(int m, int row);
+static int row_choices(int m, int row);
+
+static int slider_readout_w(const PsxUiFace *f) {
+    return text_w("100", f) + S(VM_ROW_PAD_X) * 2;
+}
+
+static void panel_rect(int m, int *px, int *pw, int *ph) {
+    const PsxUiFace *fl = face_row(1);   /* SEMIBOLD: the widest a row gets */
+    const PsxUiFace *fh = face_hint();
+    int rows = menu_rows(m);
+    int x = title_x(m);
     int w = 0, i, has_number = 0, lo, hi;
+    int pad = S(VM_ROW_PAD_X), inner = S(VM_PANEL_PAD);
+
     /* MEASURE the content instead of guessing a per-menu constant. The old
      * fixed widths (420/340/300/230) did not actually fit their menus: a value
      * or a hint longer than the guess simply ran past the panel edge and was
@@ -738,26 +965,40 @@ static void panel_rect(int m, int *px, int *pw, int *ph) {
     for (i = 0; i < rows; i++) {
         const char *v = row_value(m, i);
         const char *h = row_hint(m, i);
-        int need = 12 + text_w(row_label(m, i), 1);
-        if (v) need += 24 + text_w(v, 1);
-        need += 12;
+        int need = inner * 2 + pad * 2 + text_w(row_label(m, i), fl);
+        /* A slider row's right-hand side is the track plus a numeric readout,
+         * NOT the value string's width -- measuring the string is how "Speed"
+         * ended up ellipsised to nothing while its slider had room to spare. */
+        if (row_is_slider(m, i))
+            need += S(VM_VALUE_GAP) + S(VM_SLIDER_W) + slider_readout_w(fl);
+        else if (v && *v) {
+            need += S(VM_VALUE_GAP) + text_w(v, fl);
+            /* Room for the cycle arrows on every row that can show them, not
+             * just the one selected now -- reserved here, the panel keeps its
+             * width as the selection moves instead of breathing in and out. */
+            if (row_choices(m, i) > 1) need += S(VM_CARET) * 4 + S(VM_VALUE_GAP);
+        }
         if (need > w) w = need;
-        if (h) { int hw = 12 + text_w(h, 1) + 12; if (hw > w) w = hw; }
+        if (h) {
+            int hw = inner * 2 + pad * 2 + text_w(h, fh);
+            if (hw > w) w = hw;
+        }
         if (num_range(m, i, &lo, &hi)) has_number = 1;
     }
-    /* Typing swaps in a long "TYPE DIGITS / ENTER APPLY / ESC CANCEL" hint.
+    /* Typing swaps in a long "Type digits / Enter apply / Esc cancel" hint.
      * Reserve it up front so the panel does not resize mid-edit. */
     if (has_number) {
-        int ew = 12 + text_w("TYPE DIGITS  ENTER APPLY  ESC CANCEL", 1) + 12;
+        int ew = inner * 2 + pad * 2 + text_w(VM_EDIT_HINT, fh);
         if (ew > w) w = ew;
     }
-    if (w < 200) w = 200;
+    if (w < S(VM_PANEL_MIN_W)) w = S(VM_PANEL_MIN_W);
     if (w > s_lw) w = s_lw;          /* never wider than the canvas */
     if (x + w > s_lw) x = s_lw - w;
     if (x < 0) x = 0;
     *px = x;
     *pw = w;
-    *ph = rows * VM_ROW_H + 28;
+    *ph = rows_y1(m) + S(VM_HINT_GAP) + S(VM_HINT_H) + S(VM_PANEL_PAD)
+          - (S(VM_BAR_H) + S(VM_PANEL_GAP));
 }
 
 /* Slider rows: a draggable track instead of type-only entry.
@@ -767,9 +1008,6 @@ static void panel_rect(int m, int *px, int *pw, int *ph) {
  * works (ENTER opens the field) — this is an additional way in, not a
  * replacement. Only rows that report a range AND opt in get one, so the
  * cheat/speed fields keep their exact-entry behaviour. */
-#define VM_SLIDER_W 120
-#define VM_SLIDER_H 8
-
 static int row_is_slider(int m, int row) {
     int lo, hi;
     { VmRegRow *r = row_reg(m, row); if (r) return r->slider ? 1 : 0; }
@@ -787,27 +1025,41 @@ static int slider_mark(int m, int row) {
     return -1;
 }
 
-/* Track rect for a slider row, in logical canvas pixels. */
+/* Track rect for a slider row, in canvas pixels. Right-aligned, leaving room
+ * for the numeric readout beyond it. */
 static void slider_rect(int m, int row, int *sx, int *sy, int *sw, int *sh) {
     int px, pw, ph;
+    const PsxUiFace *f = face_row(1);
+    int readout = slider_readout_w(f);
     panel_rect(m, &px, &pw, &ph);
-    *sw = VM_SLIDER_W;
-    *sh = VM_SLIDER_H;
-    /* Right-aligned, leaving room for the numeric readout beyond it. */
-    *sx = px + pw - VM_SLIDER_W - 52;
-    *sy = VM_ROWS_Y0 + row * VM_ROW_H + (VM_ROW_H - VM_SLIDER_H) / 2 - 3;
+    *sw = S(VM_SLIDER_W);
+    *sh = S(VM_SLIDER_H);
+    *sx = px + pw - *sw - readout;
+    *sy = row_y(m, row) + (S(VM_ROW_H) - *sh) / 2;
 }
 
 /* Which row's slider is being dragged, or -1. Held across motion events so a
  * drag keeps control even when the pointer strays off the track. */
 static int s_drag_row = -1;
 
+/* Where the KNOB's centre may sit, as a start x and a span. The knob is a
+ * circle drawn on the value, so its centre has to stay one radius in from each
+ * end or half of it hangs off the track -- and the click-to-value mapping has
+ * to use the same range, or the knob lands somewhere other than the pointer. */
+static void slider_travel(int sx, int sw, int *x0, int *span) {
+    int k = S(VM_SLIDER_KNOB);
+    *x0 = sx + k;
+    *span = sw - k * 2;
+    if (*span < 1) { *x0 = sx; *span = sw > 1 ? sw - 1 : 1; }
+}
+
 static void slider_set_from_x(int m, int row, int lx) {
-    int sx, sy, sw, sh, lo = 0, hi = 0, v;
+    int sx, sy, sw, sh, lo = 0, hi = 0, v, tx0, span;
     if (!num_range(m, row, &lo, &hi)) return;
     slider_rect(m, row, &sx, &sy, &sw, &sh);
     if (sw <= 1) return;
-    v = lo + ((lx - sx) * (hi - lo) + (sw - 1) / 2) / (sw - 1);
+    slider_travel(sx, sw, &tx0, &span);
+    v = lo + ((lx - tx0) * (hi - lo) + span / 2) / span;
     if (v < lo) v = lo;
     if (v > hi) v = hi;
     if (v != num_get(m, row)) {
@@ -817,7 +1069,40 @@ static void slider_set_from_x(int m, int row, int lx) {
     }
 }
 
-/* ---- drawing ------------------------------------------------------------- */
+/* ---- drawing -------------------------------------------------------------
+ *
+ * Everything is composited, not written: the canvas is straight (non-
+ * premultiplied) ARGB that the presenter blends with SRC_ALPHA /
+ * ONE_MINUS_SRC_ALPHA, so a shape drawn over the transparent part has to carry
+ * its own alpha out or it disappears at present time. That is also why the
+ * rounded rects below compute a coverage value rather than a hard mask -- the
+ * antialiased edge IS partial alpha. */
+
+static void blend_px(int x, int y, uint32_t argb, float cov) {
+    uint32_t *p, d;
+    unsigned sa, da, oa, i, sc[3], dc[3], oc[3];
+
+    if ((unsigned)x >= (unsigned)s_lw || (unsigned)y >= (unsigned)s_lh) return;
+    if (cov <= 0.0f) return;
+    if (cov > 1.0f) cov = 1.0f;
+
+    sa = (unsigned)(((argb >> 24) & 0xFFu) * cov + 0.5f);
+    if (!sa) return;
+
+    p = &s_canvas[(size_t)y * s_lw + x];
+    if (sa == 255u) { *p = 0xFF000000u | (argb & 0x00FFFFFFu); return; }
+
+    d  = *p;
+    da = (d >> 24) & 0xFFu;
+    sc[0] = (argb >> 16) & 0xFFu; sc[1] = (argb >> 8) & 0xFFu; sc[2] = argb & 0xFFu;
+    dc[0] = (d >> 16) & 0xFFu;    dc[1] = (d >> 8) & 0xFFu;    dc[2] = d & 0xFFu;
+
+    oa = sa + da * (255u - sa) / 255u;
+    if (!oa) { *p = 0; return; }
+    for (i = 0; i < 3; i++)
+        oc[i] = (sc[i] * sa + dc[i] * da * (255u - sa) / 255u) / oa;
+    *p = (oa << 24) | (oc[0] << 16) | (oc[1] << 8) | oc[2];
+}
 
 static void fill_rect(int x0, int y0, int w, int h, uint32_t col) {
     int x, y;
@@ -826,91 +1111,433 @@ static void fill_rect(int x0, int y0, int w, int h, uint32_t col) {
     if (x0 + w > s_lw) w = s_lw - x0;
     if (y0 + h > s_lh) h = s_lh - y0;
     if (w <= 0 || h <= 0) return;
+    mark_drawn(x0, y0, w, h);
     for (y = y0; y < y0 + h; y++)
         for (x = x0; x < x0 + w; x++)
-            s_canvas[y * s_lw + x] = col;
+            blend_px(x, y, col, 1.0f);
 }
 
-static void stroke_rect(int x, int y, int w, int h, uint32_t col) {
-    fill_rect(x, y, w, 1, col);
-    fill_rect(x, y + h - 1, w, 1, col);
-    fill_rect(x, y, 1, h, col);
-    fill_rect(x + w - 1, y, 1, h, col);
+/* Signed distance from (px,py) to a rounded rect. Negative inside. This is the
+ * whole antialiasing story: coverage is 0.5 - d clamped to 0..1, which is the
+ * exact area of a pixel covered by a straight edge and close enough on a
+ * curve at any radius the UI actually uses. */
+static float rr_dist(float px, float py, float cx, float cy,
+                     float hw, float hh, float r) {
+    float qx, qy, ax, ay, m;
+    if (r > hw) r = hw;
+    if (r > hh) r = hh;
+    qx = (px > cx ? px - cx : cx - px) - (hw - r);
+    qy = (py > cy ? py - cy : cy - py) - (hh - r);
+    ax = qx > 0.0f ? qx : 0.0f;
+    ay = qy > 0.0f ? qy : 0.0f;
+    m  = qx > qy ? qx : qy;
+    return (float)sqrt((double)(ax * ax + ay * ay)) + (m < 0.0f ? m : 0.0f) - r;
 }
 
-static void draw_char(int x0, int y0, char c, uint32_t col, int scale) {
-    int x, y, sx, sy;
-    const uint8_t *g;
-    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
-    if (c < 32 || c > 90) c = '?';
-    g = FONT8[(int)c - 32];
-    for (y = 0; y < 8; y++) {
-        uint8_t row = g[y];
-        for (x = 0; x < 8; x++) {
-            if ((row & (1u << x)) == 0) continue;
-            for (sy = 0; sy < scale; sy++)
-                for (sx = 0; sx < scale; sx++) {
-                    int dx = x0 + x * scale + sx;
-                    int dy = y0 + y * scale + sy;
-                    if ((unsigned)dx < (unsigned)s_lw &&
-                        (unsigned)dy < (unsigned)s_lh)
-                        s_canvas[dy * s_lw + dx] = col;
-                }
+/* Clamp a radius to something the rect can actually hold. */
+static float rr_clamp(int w, int h, float r) {
+    float lim = (float)(w < h ? w : h) * 0.5f;
+    if (r < 0.0f) r = 0.0f;
+    if (r > lim) r = lim;
+    return r;
+}
+
+/* Filled rounded rect.
+ *
+ * The per-pixel distance function is only needed in the four corner bands: the
+ * rows between them are a solid span, and because x/y/w/h are whole pixels
+ * their left and right edges land exactly on pixel boundaries with no partial
+ * coverage to compute. Skipping the square root on those rows is what keeps a
+ * 4K redraw cheap -- the panel alone is a quarter of a million pixels and
+ * redraw() runs on every pointer move during a slider drag. */
+static void round_rect(int x, int y, int w, int h, float r, uint32_t col) {
+    float cx, cy, hw, hh;
+    int iy, ix, y0, y1, x0, x1, band0, band1;
+
+    if (w <= 0 || h <= 0 || !(col >> 24)) return;
+    r = rr_clamp(w, h, r);
+    x0 = x < 0 ? 0 : x;
+    y0 = y < 0 ? 0 : y;
+    x1 = x + w > s_lw ? s_lw : x + w;
+    y1 = y + h > s_lh ? s_lh : y + h;
+    if (x1 <= x0 || y1 <= y0) return;
+    mark_drawn(x0, y0, x1 - x0, y1 - y0);
+
+    cx = (float)x + (float)w * 0.5f;
+    cy = (float)y + (float)h * 0.5f;
+    hw = (float)w * 0.5f;
+    hh = (float)h * 0.5f;
+    band0 = y + (int)r + 1;                 /* first fully straight row */
+    band1 = y + h - (int)r - 1;             /* last  fully straight row */
+
+    for (iy = y0; iy < y1; iy++) {
+        if (iy >= band0 && iy < band1) {
+            for (ix = x0; ix < x1; ix++) blend_px(ix, iy, col, 1.0f);
+            continue;
+        }
+        for (ix = x0; ix < x1; ix++) {
+            float cov = 0.5f - rr_dist((float)ix + 0.5f, (float)iy + 0.5f,
+                                       cx, cy, hw, hh, r);
+            if (cov <= 0.0f) continue;
+            blend_px(ix, iy, col, cov);
         }
     }
 }
 
-static void draw_text(int x, int y, const char *s, uint32_t col, int scale) {
-    if (!s) return;
-    while (*s) {
-        draw_char(x, y, *s++, col, scale);
-        x += 8 * scale;
+/* Outline of a rounded rect, `width` px wide, centred on the edge. Only the
+ * pixels near an edge can be lit, so the straight middle rows are visited at
+ * their two ends and skipped in between. */
+static void round_rect_line(int x, int y, int w, int h, float r,
+                            uint32_t col, float width) {
+    float cx, cy, hw, hh, half;
+    int iy, ix, y0, y1, x0, x1, band0, band1, reach;
+
+    if (w <= 0 || h <= 0 || !(col >> 24)) return;
+    if (width <= 0.0f) width = 1.0f;
+    r = rr_clamp(w, h, r);
+    half = width * 0.5f;
+    reach = (int)half + 2;
+
+    x0 = x - reach < 0 ? 0 : x - reach;
+    y0 = y - reach < 0 ? 0 : y - reach;
+    x1 = x + w + reach > s_lw ? s_lw : x + w + reach;
+    y1 = y + h + reach > s_lh ? s_lh : y + h + reach;
+    if (x1 <= x0 || y1 <= y0) return;
+    mark_drawn(x0, y0, x1 - x0, y1 - y0);
+
+    cx = (float)x + (float)w * 0.5f;
+    cy = (float)y + (float)h * 0.5f;
+    hw = (float)w * 0.5f;
+    hh = (float)h * 0.5f;
+    band0 = y + (int)r + 1;
+    band1 = y + h - (int)r - 1;
+
+    for (iy = y0; iy < y1; iy++) {
+        int straight = (iy >= band0 && iy < band1);
+        for (ix = x0; ix < x1; ix++) {
+            float d, ad, cov;
+            if (straight && ix >= x + reach && ix < x + w - reach) {
+                ix = x + w - reach - 1;     /* skip the hollow middle */
+                continue;
+            }
+            d = rr_dist((float)ix + 0.5f, (float)iy + 0.5f, cx, cy, hw, hh, r);
+            ad = d < 0.0f ? -d : d;
+            cov = half + 0.5f - ad;
+            if (cov <= 0.0f) continue;
+            blend_px(ix, iy, col, cov);
+        }
     }
 }
 
+/* Soft drop shadow OUTSIDE a rounded rect: coverage falls off as the square of
+ * the distance from the edge, over `spread` pixels.
+ *
+ * This is what lifts the dropdown off the game underneath it. Drawn as one
+ * pass over the ring rather than as a stack of ever-larger rounded rects: the
+ * stack costs a full fill per layer over the whole panel, and the panel is the
+ * most expensive thing this module draws. */
+static void round_rect_shadow(int x, int y, int w, int h, float r,
+                              uint32_t col, int spread) {
+    float cx, cy, hw, hh, sp;
+    int iy, ix, y0, y1, x0, x1, band0, band1;
+
+    if (w <= 0 || h <= 0 || spread <= 0 || !(col >> 24)) return;
+    r = rr_clamp(w, h, r);
+    sp = (float)spread;
+
+    x0 = x - spread < 0 ? 0 : x - spread;
+    y0 = y - spread < 0 ? 0 : y - spread;
+    x1 = x + w + spread > s_lw ? s_lw : x + w + spread;
+    y1 = y + h + spread > s_lh ? s_lh : y + h + spread;
+    if (x1 <= x0 || y1 <= y0) return;
+    mark_drawn(x0, y0, x1 - x0, y1 - y0);
+
+    cx = (float)x + (float)w * 0.5f;
+    cy = (float)y + (float)h * 0.5f;
+    hw = (float)w * 0.5f;
+    hh = (float)h * 0.5f;
+    band0 = y + (int)r + 1;
+    band1 = y + h - (int)r - 1;
+
+    for (iy = y0; iy < y1; iy++) {
+        int straight = (iy >= band0 && iy < band1);
+        for (ix = x0; ix < x1; ix++) {
+            float d, t;
+            if (straight && ix >= x && ix < x + w) {
+                ix = x + w - 1;             /* the panel itself covers this */
+                continue;
+            }
+            d = rr_dist((float)ix + 0.5f, (float)iy + 0.5f, cx, cy, hw, hh, r);
+            if (d <= 0.0f || d >= sp) continue;
+            t = 1.0f - d / sp;
+            blend_px(ix, iy, col, t * t);
+        }
+    }
+}
+
+/* Filled triangle from three vertices, antialiased by distance to each edge.
+ *
+ * Explicit vertices rather than a rotated half-plane test: the rotated version
+ * drew the left arrow pointing right, which is the kind of bug that survives a
+ * code read and only shows up in a picture. */
+static void draw_tri3(float ax, float ay, float bx, float by,
+                      float cx, float cy, uint32_t col) {
+    float ex[3], ey[3], vx[3], vy[3], inv[3], area;
+    int i, x0, y0, x1, y1, ix, iy;
+
+    vx[0] = ax; vy[0] = ay; vx[1] = bx; vy[1] = by; vx[2] = cx; vy[2] = cy;
+    area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area == 0.0f) return;
+
+    for (i = 0; i < 3; i++) {
+        int j = (i + 1) % 3;
+        float dx = vx[j] - vx[i], dy = vy[j] - vy[i];
+        float len = (float)sqrt((double)(dx * dx + dy * dy));
+        if (len <= 0.0f) return;
+        /* Outward normal, flipped so "positive" is always inside. */
+        ex[i] = (area > 0.0f ? dy : -dy) / len;
+        ey[i] = (area > 0.0f ? -dx : dx) / len;
+        inv[i] = ex[i] * vx[i] + ey[i] * vy[i];
+    }
+
+    x0 = (int)((vx[0] < vx[1] ? (vx[0] < vx[2] ? vx[0] : vx[2])
+                              : (vx[1] < vx[2] ? vx[1] : vx[2])) - 1.0f);
+    x1 = (int)((vx[0] > vx[1] ? (vx[0] > vx[2] ? vx[0] : vx[2])
+                              : (vx[1] > vx[2] ? vx[1] : vx[2])) + 2.0f);
+    y0 = (int)((vy[0] < vy[1] ? (vy[0] < vy[2] ? vy[0] : vy[2])
+                              : (vy[1] < vy[2] ? vy[1] : vy[2])) - 1.0f);
+    y1 = (int)((vy[0] > vy[1] ? (vy[0] > vy[2] ? vy[0] : vy[2])
+                              : (vy[1] > vy[2] ? vy[1] : vy[2])) + 2.0f);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s_lw) x1 = s_lw;
+    if (y1 > s_lh) y1 = s_lh;
+    if (x1 <= x0 || y1 <= y0) return;
+    mark_drawn(x0, y0, x1 - x0, y1 - y0);
+
+    for (iy = y0; iy < y1; iy++) {
+        for (ix = x0; ix < x1; ix++) {
+            float px = (float)ix + 0.5f, py = (float)iy + 0.5f;
+            float d = 1e30f, cov;
+            for (i = 0; i < 3; i++) {
+                float di = inv[i] - (ex[i] * px + ey[i] * py);
+                if (di < d) d = di;
+            }
+            cov = d + 0.5f;
+            if (cov <= 0.0f) continue;
+            blend_px(ix, iy, col, cov);
+        }
+    }
+}
+
+/* Small solid caret. `dir`: -1 left, 1 right, 0 down. */
+static void draw_caret(int cx, int cy, int size, int dir, uint32_t col) {
+    float s = (float)size, x = (float)cx, y = (float)cy;
+    if (s < 1.0f) return;
+    if (dir < 0)
+        draw_tri3(x + s * 0.7f, y - s, x + s * 0.7f, y + s, x - s * 0.8f, y, col);
+    else if (dir > 0)
+        draw_tri3(x - s * 0.7f, y - s, x - s * 0.7f, y + s, x + s * 0.8f, y, col);
+    else
+        draw_tri3(x - s, y - s * 0.7f, x + s, y - s * 0.7f, x, y + s * 0.8f, col);
+}
+
+/* Text. Baseline-positioned; every caller derives the baseline from a band's
+ * top edge plus the face's ascent, so rows of different sizes still sit on a
+ * common grid. */
+static int draw_text(int x, int baseline, const char *s, uint32_t col,
+                     const PsxUiFace *f) {
+    int end;
+    if (!s || !f) return x;
+    end = psx_ui_font_draw(s_canvas, s_lw, s_lh, x, baseline, s, col, f);
+    mark_drawn(x, baseline - psx_ui_font_ascent(f) - 1,
+               end - x + 2, psx_ui_font_line_height(f) + 2);
+    return end;
+}
+
+/* Text that must not run past `max_w`, ending in an ellipsis when it would.
+ * Rows are registered by titles with labels of arbitrary length, so "it fits
+ * because the panel measured it" holds only until the panel hits the canvas
+ * width -- at which point something has to give, and a clipped half-glyph is
+ * the worst of the options. */
+static void draw_text_clip(int x, int baseline, const char *s, uint32_t col,
+                           const PsxUiFace *f, int max_w) {
+    char buf[128];
+    int n, ell;
+    if (!s || !f || max_w <= 0) return;
+    if (text_w(s, f) <= max_w) { draw_text(x, baseline, s, col, f); return; }
+    ell = text_w("...", f);
+    for (n = 0; s[n] && n < (int)sizeof buf - 4; n++) {
+        buf[n] = s[n];
+        buf[n + 1] = '\0';
+        if (text_w(buf, f) + ell > max_w) { buf[n] = '\0'; break; }
+    }
+    /* Never emit a dangling UTF-8 lead byte: the decoder would read past the
+     * terminator looking for continuation bytes. */
+    while (n > 0 && ((unsigned char)buf[n - 1] & 0xC0) == 0x80) buf[--n] = '\0';
+    if (n > 0 && ((unsigned char)buf[n - 1] & 0x80)) buf[n - 1] = '\0';
+    n = (int)strlen(buf);
+    buf[n] = '.'; buf[n + 1] = '.'; buf[n + 2] = '.'; buf[n + 3] = '\0';
+    draw_text(x, baseline, buf, col, f);
+}
+
+/* Vertically centre a face's ink inside a band of height h. Uses ascent and
+ * descent rather than the line height, because a font's line box carries
+ * leading that is not part of the glyphs and would push short text low. */
+static int baseline_in(int y, int h, const PsxUiFace *f) {
+    int a = psx_ui_font_ascent(f), d = psx_ui_font_descent(f);
+    return y + (h - (a + d)) / 2 + a;
+}
+
+static void draw_slider(int m, int row, int sel) {
+    int sx, sy, sw, sh, lo = 0, hi = 0, knob, tx0, span, cx;
+    slider_rect(m, row, &sx, &sy, &sw, &sh);
+    num_range(m, row, &lo, &hi);
+    knob = S(VM_SLIDER_KNOB);
+    slider_travel(sx, sw, &tx0, &span);
+    cx = (hi > lo) ? tx0 + ((num_get(m, row) - lo) * span) / (hi - lo) : tx0;
+
+    round_rect(sx, sy, sw, sh, (float)sh * 0.5f, COL_TRACK);
+    if (cx > sx)
+        round_rect(sx, sy, cx - sx, sh, (float)sh * 0.5f,
+                   sel ? COL_ACCENT : COL_TEXT);
+
+    /* Notches, one per selectable value, on short ranges only.
+     *
+     * A bare track says "anywhere along here", which is true for a 0..100
+     * volume and a lie for a 1..8 zoom, where every position between the steps
+     * is unreachable. The ticks show how many stops there are and where the
+     * pointer will actually land. Skipped above VM_SLIDER_TICK_MAX steps, where
+     * they would be closer together than the pixels drawing them. */
+    if (hi > lo && (hi - lo) <= VM_SLIDER_TICK_MAX) {
+        int t, tw = S(1.0f) < 1 ? 1 : S(1.0f);
+        int ty = sy + sh + S(1.5f), th = S(2.5f) < 2 ? 2 : S(2.5f);
+        for (t = lo; t <= hi; t++) {
+            int tx = tx0 + ((t - lo) * span) / (hi - lo);
+            /* UNDER the groove, not through it. Drawn across the track the
+             * ticks washed out against the fill on one side and fought the
+             * knob on the other, which made a 1..8 row read as about six
+             * notches -- and counting the stops is the entire point. */
+            fill_rect(tx, ty, tw, th, COL_TICK);
+        }
+    }
+    {
+        const int mark = slider_mark(m, row);
+        if (mark >= lo && mark <= hi && hi > lo) {
+            int mx = tx0 + ((mark - lo) * span) / (hi - lo);
+            int tw = S(1.0f) < 1 ? 1 : S(1.0f);
+            /* Taller than the ordinary ticks so the stock value stays findable
+             * by eye after a drag. */
+            fill_rect(mx, sy + sh + S(1.0f), tw, S(4.5f), COL_ACCENT);
+        }
+    }
+    /* The knob. What makes the track look draggable rather than like a meter. */
+    round_rect(cx - knob, sy + sh / 2 - knob, knob * 2, knob * 2,
+               (float)knob, sel ? COL_ACCENT : COL_TEXT);
+}
+
 static void redraw(void) {
-    int i, rows, y, px, pw, ph;
+    int i, rows, px, pw, ph, bar_h;
+    const PsxUiFace *ft, *fh;
+    int clear_x = s_dirty_x, clear_y = s_dirty_y;
+    int clear_w = s_dirty_w, clear_h = s_dirty_h;
 
-    memset(s_canvas, 0, (size_t)s_lw * (size_t)s_lh * sizeof(uint32_t));
-    if (!s_visible) { s_dirty = 0; return; }
+    /* Clear only what the previous pass drew. A full memset of a 4K canvas is
+     * 33 MB per redraw, and redraw runs on every pointer move during a slider
+     * drag -- that is milliseconds of frame budget spent zeroing pixels that
+     * were already zero. */
+    if (clear_w > 0) {
+        int y;
+        if (clear_x < 0) { clear_w += clear_x; clear_x = 0; }
+        if (clear_y < 0) { clear_h += clear_y; clear_y = 0; }
+        if (clear_x + clear_w > s_lw) clear_w = s_lw - clear_x;
+        if (clear_y + clear_h > s_lh) clear_h = s_lh - clear_y;
+        for (y = clear_y; y < clear_y + clear_h; y++)
+            memset(&s_canvas[(size_t)y * s_lw + clear_x], 0,
+                   (size_t)clear_w * sizeof(uint32_t));
+    }
+    s_dirty_x = s_dirty_y = s_dirty_w = s_dirty_h = 0;
 
-    fill_rect(0, 0, s_lw, VM_BAR_H, COL_BAR);
-    fill_rect(0, VM_BAR_H - 1, s_lw, 1, COL_BAR_EDGE);
+    if (!s_visible) goto done;
+
+    ft    = face_title();
+    fh    = face_hint();
+    bar_h = S(VM_BAR_H);
+
+    fill_rect(0, 0, s_lw, bar_h, COL_BAR);
+    fill_rect(0, bar_h - 1, s_lw, 1, COL_BAR_EDGE);
 
     for (i = 0; i < s_menu_total; i++) {
         int tx = title_x(i);
-        int tw = text_w(menu_title(i), 1);
+        int tw = title_w(i);
+        int chip_y = S(2.0f), chip_h = bar_h - S(4.0f);
         /* A title is only "active" while its dropdown is actually open. With
          * the bar collapsed nothing is selected, so the last-used menu must not
          * stay highlighted — it would read as an open menu that isn't. */
         int active = (s_expanded && i == s_menu);
         if (active)
-            fill_rect(tx - VM_TITLE_PAD, 0, tw + VM_TITLE_PAD * 2,
-                      VM_BAR_H - 1, COL_TITLE_BG);
+            round_rect(tx, chip_y, tw, chip_h, VM_TITLE_R * s_unit, COL_SEL_BG);
         else if (i == s_hover_menu)
-            fill_rect(tx - VM_TITLE_PAD, 0, tw + VM_TITLE_PAD * 2,
-                      VM_BAR_H - 1, COL_HOVER_BG);
-        draw_text(tx, 7, menu_title(i), active ? COL_ACCENT : COL_TEXT, 1);
+            round_rect(tx, chip_y, tw, chip_h, VM_TITLE_R * s_unit, COL_HOVER_BG);
+        {
+            const uint32_t col = active ? COL_ACCENT : COL_TEXT;
+            int lx = tx + S(VM_TITLE_PAD);
+            const PsxUiFace *fi = face_icon();
+            int slot = icon_slot_w();
+            if (fi && slot > 0) {
+                char buf[5];
+                /* Material Symbols sit on the baseline with the box reaching
+                 * from there up to about one em, so centring the ICON means
+                 * putting its baseline below the text's -- deriving it from
+                 * the face's own ascent keeps that true at every size. */
+                int ia = psx_ui_font_ascent(fi);
+                draw_text(lx, bar_h / 2 + ia / 2,
+                          psx_ui_font_utf8(menu_icon(i), buf), col, fi);
+                lx += slot;
+            }
+            draw_text(lx, baseline_in(0, bar_h, ft), menu_title(i), col, ft);
+        }
     }
     /* Collapsed: the bar alone, sitting over the game without taking input.
      * Only F10 / VIEW > MENU BAR removes it. */
-    if (!s_expanded) { s_dirty = 0; return; }
-
+    if (!s_expanded) goto done;
 
     rows = menu_rows(s_menu);
     panel_rect(s_menu, &px, &pw, &ph);
-    fill_rect(px, VM_BAR_H, pw, ph, COL_PANEL);
-    stroke_rect(px, VM_BAR_H, pw, ph, COL_PANEL_ED);
+    round_rect_shadow(px, bar_h + S(VM_PANEL_GAP), pw, ph, VM_PANEL_R * s_unit,
+                      COL_SHADOW, S(VM_SHADOW));
+    round_rect(px, bar_h + S(VM_PANEL_GAP), pw, ph, VM_PANEL_R * s_unit,
+               COL_PANEL);
+    round_rect_line(px, bar_h + S(VM_PANEL_GAP), pw, ph, VM_PANEL_R * s_unit,
+                    COL_PANEL_ED, 1.0f);
 
-    y = VM_ROWS_Y0;
+    /* The hairline between the rows this module owns and the rows a title
+     * registered. Structure the player can see without reading: the top group
+     * is the emulator's, the bottom group is this game's. */
+    if (has_sep(s_menu)) {
+        int sy = row_y(s_menu, builtin_rows(s_menu)) - S(VM_SEP_H) / 2;
+        fill_rect(px + S(VM_PANEL_PAD) + S(VM_ROW_PAD_X), sy,
+                  pw - (S(VM_PANEL_PAD) + S(VM_ROW_PAD_X)) * 2, 1, COL_SEP);
+    }
+
     for (i = 0; i < rows; i++) {
         int sel = (i == s_item[s_menu]);
         int hov = (s_hover_row == i && s_hover_menu == s_menu);
-        if (sel || hov)
-            fill_rect(px + 3, y - 3, pw - 6, VM_ROW_H,
-                      sel ? COL_SEL_BG : COL_HOVER_BG);
-        draw_text(px + 12, y + 2, row_label(s_menu, i),
-                  sel ? COL_ACCENT : COL_TEXT, 1);
+        int ry  = row_y(s_menu, i);
+        int rh  = S(VM_ROW_H);
+        int inset = px + S(VM_PANEL_PAD);
+        int iw    = pw - S(VM_PANEL_PAD) * 2;
+        int tx    = inset + S(VM_ROW_PAD_X);
+        const PsxUiFace *fr = face_row(sel);
+        int base = baseline_in(ry, rh, fr);
+        int editing_here = (s_editing && i == s_item[s_menu]);
+        int label_max = iw - S(VM_ROW_PAD_X) * 2;
+
+        if (sel)
+            round_rect(inset, ry, iw, rh, VM_ROW_R * s_unit, COL_SEL_BG);
+        else if (hov)
+            round_rect(inset, ry, iw, rh, VM_ROW_R * s_unit, COL_HOVER_BG);
+
         {
             /* Draw whatever the row reports as its value — this must cover
              * IT_NUMBER too, not just IT_OPTION, or a typed field renders
@@ -918,86 +1545,91 @@ static void redraw(void) {
             /* COPY it: slider_rect -> panel_rect measures every row, which
              * calls row_value again. Holding the returned pointer across that
              * is what made every row print the last row's number. */
-            char vbuf[24];
+            char vbuf[32];
             const char *vsrc = row_value(s_menu, i);
             const char *v = NULL;
-            int editing_here = (s_editing && i == s_item[s_menu]);
-            if (vsrc) {
+            if (vsrc && *vsrc) {
                 int c = 0;
                 while (vsrc[c] && c < (int)sizeof(vbuf) - 1) { vbuf[c] = vsrc[c]; c++; }
-                vbuf[c] = ' ';
+                vbuf[c] = '\0';
                 v = vbuf;
             }
             if (row_is_slider(s_menu, i) && !editing_here) {
-                int sx, sy, sw, sh, lo = 0, hi = 0, fill;
+                int sx, sy, sw, sh;
                 slider_rect(s_menu, i, &sx, &sy, &sw, &sh);
-                num_range(s_menu, i, &lo, &hi);
-                fill = (hi > lo)
-                         ? ((num_get(s_menu, i) - lo) * sw) / (hi - lo) : 0;
-                if (fill < 0) fill = 0;
-                if (fill > sw) fill = sw;
-                fill_rect(sx, sy, sw, sh, 0xFF0E1119u);
-                if (fill > 0)
-                    fill_rect(sx, sy, fill, sh, sel ? COL_ACCENT : COL_TEXT);
-                stroke_rect(sx, sy, sw, sh, COL_PANEL_ED);
-                /* Notches, one per selectable value, on short ranges only.
-                 *
-                 * A bare track says "anywhere along here", which is true for a
-                 * 0..100 volume and a lie for a 1..8 zoom, where every position
-                 * between the steps is unreachable. The ticks show how many
-                 * stops there are and where the pointer will actually land.
-                 * Skipped above VM_SLIDER_TICK_MAX steps, where they would be
-                 * closer together than the pixels drawing them. */
-                if (hi > lo && (hi - lo) <= VM_SLIDER_TICK_MAX) {
-                    int t;
-                    for (t = lo; t <= hi; t++) {
-                        const int tx = sx + ((t - lo) * (sw - 1)) / (hi - lo);
-                        /* Drawn TALLER than the track, not inside it. Inside,
-                         * the first and last ticks land on the border and the
-                         * rest wash out against the filled part, so a 1..8 row
-                         * reads as about six notches - you cannot count the
-                         * stops, which is the whole point of having them.
-                         * Standing proud of the track, all eight are countable
-                         * whether or not the fill has reached them. */
-                        fill_rect(tx, sy - 2, 1, sh + 4, COL_DIM);
-                    }
-                }
-                {
-                    const int mark = slider_mark(s_menu, i);
-                    if (mark >= lo && mark <= hi && hi > lo) {
-                        int mx = sx + ((mark - lo) * (sw - 1)) / (hi - lo);
-                        /* Taller than the track so it reads as a notch on the
-                         * scale rather than part of the fill. */
-                        fill_rect(mx, sy - 3, 1, sh + 6, COL_ACCENT);
-                    }
-                }
+                draw_slider(s_menu, i, sel);
+                label_max = sx - tx - S(VM_VALUE_GAP);
                 if (v)
-                    draw_text(sx + sw + 10, y + 2, v,
-                              sel ? COL_ACCENT : COL_DIM, 1);
+                    draw_text(sx + sw + S(VM_ROW_PAD_X), base, v,
+                              sel ? COL_ACCENT : COL_DIM, fr);
             } else if (v && editing_here) {
                 /* Active field: a boxed, left-aligned entry so the caret and
                  * the digits are unmistakable against the row highlight. */
-                int bw = VM_EDIT_MAX * 8 + 14;
-                int bx = px + pw - bw - 10;
-                fill_rect(bx, y - 2, bw, VM_ROW_H - 2, 0xFF0E1119u);
-                stroke_rect(bx, y - 2, bw, VM_ROW_H - 2, COL_ACCENT);
-                draw_text(bx + 6, y + 2, v, COL_ACCENT, 1);
+                int bw = text_w("00000", fr) + S(VM_ROW_PAD_X) * 2;
+                int bx = inset + iw - bw - S(VM_ROW_PAD_X);
+                int bh = rh - S(4.0f);
+                round_rect(bx, ry + S(2.0f), bw, bh, VM_ROW_R * s_unit * 0.6f,
+                           COL_EDIT_BG);
+                round_rect_line(bx, ry + S(2.0f), bw, bh,
+                                VM_ROW_R * s_unit * 0.6f, COL_ACCENT, 1.0f);
+                draw_text(bx + S(VM_ROW_PAD_X) / 2, base, v, COL_ACCENT, fr);
+                label_max = bx - tx - S(VM_VALUE_GAP);
             } else if (v) {
-                draw_text(px + pw - text_w(v, 1) - 12, y + 2, v,
-                          sel ? COL_ACCENT : COL_DIM, 1);
+                int vw = text_w(v, fr);
+                int vx = inset + iw - S(VM_ROW_PAD_X) - vw;
+                /* Arrows on the SELECTED option row only. They say that left
+                 * and right change this row -- the one thing the old menu
+                 * never told anyone, and the reason players cycled options by
+                 * clicking them repeatedly. Suppressed on rows that do not
+                 * cycle (actions, and anything with a single choice), where
+                 * they would be a promise the row cannot keep. */
+                if (sel && row_kind(s_menu, i) == IT_OPTION &&
+                    row_choices(s_menu, i) > 1) {
+                    int a = S(VM_CARET), gap = S(VM_VALUE_GAP) / 2;
+                    int ay = ry + rh / 2;
+                    int rx = inset + iw - S(VM_ROW_PAD_X) - a;
+                    vx = rx - a - gap - vw;
+                    draw_caret(rx, ay, a, 1, COL_ACCENT);
+                    draw_caret(vx - gap - a, ay, a, -1, COL_ACCENT);
+                }
+                draw_text(vx, base, v, sel ? COL_ACCENT : COL_DIM, fr);
+                label_max = vx - tx - S(VM_VALUE_GAP);
             }
+            draw_text_clip(tx, base, row_label(s_menu, i),
+                           sel ? COL_ACCENT : COL_TEXT, fr, label_max);
         }
-        y += VM_ROW_H;
     }
-    /* Hint follows the POINTER when it is over a row, and the keyboard
-     * selection otherwise — so you can read what an option does just by
-     * hovering it, without committing to selecting it. */
+
+    /* Hint band, ruled off from the rows the way the reference pins its
+     * secondary items to the bottom of the panel. Follows the POINTER when it
+     * is over a row, and the keyboard selection otherwise — so you can read
+     * what an option does just by hovering it, without committing to selecting
+     * it. */
     {
         const int hint_row = (s_hover_row >= 0 && s_hover_menu == s_menu)
                                  ? s_hover_row : s_item[s_menu];
-        draw_text(px + 12, y + 4, row_hint(s_menu, hint_row), COL_DIM, 1);
+        int hy = rows_y1(s_menu) + S(VM_HINT_GAP);
+        int hx = px + S(VM_PANEL_PAD) + S(VM_ROW_PAD_X);
+        fill_rect(hx, hy, pw - (S(VM_PANEL_PAD) + S(VM_ROW_PAD_X)) * 2, 1,
+                  COL_SEP);
+        draw_text_clip(hx, baseline_in(hy, S(VM_HINT_H), fh),
+                       row_hint(s_menu, hint_row), COL_DIM, fh,
+                       pw - (S(VM_PANEL_PAD) + S(VM_ROW_PAD_X)) * 2);
     }
 
+done:
+    /* Exactly what was drawn, from the bounding box the draw calls just built.
+     * Derived rather than computed from the layout a second time: a hand-rolled
+     * "bar plus panel plus shadow" sum is one more thing to keep in step with
+     * the drawing, and it would be wrong the first time anything moved.
+     *
+     * EVERY exit comes through here. The two early returns above used to skip
+     * it, which left a collapsed bar reporting a one-pixel-tall canvas -- the
+     * bar simply was not on screen, and with it goes the only way to reach the
+     * menu that undoes a bad setting. */
+    s_used_h = s_dirty_y + s_dirty_h;
+    if (s_used_h > s_lh) s_used_h = s_lh;
+    if (s_used_h < 1) s_used_h = 1;
     s_dirty = 0;
 }
 
@@ -1005,6 +1637,13 @@ static void redraw(void) {
 
 void psx_video_menu_init(const PsxVideoMenuState *initial) {
     if (initial) s_state = *initial;
+    /* Take the canvas HERE, on the main thread before the window exists,
+     * rather than lazily on first draw. psx_video_menu_ui_scale is a pure
+     * function the renderers call from two threads and it has to agree with
+     * what was allocated; deciding that once, up front, is the only ordering
+     * where it cannot disagree with itself. */
+    canvas_alloc();
+    s_unit = unit_for(s_lh);
     /* Bar VISIBLE on launch so it is discoverable — a hotkey nobody knows about
      * may as well not exist — but COLLAPSED, so a dropdown is not sitting over
      * the game while it boots. Clicking a title (or F10 after hiding) expands. */
@@ -1038,13 +1677,27 @@ void psx_video_menu_sync_fast_loads(int level) {
 void psx_video_menu_set_layout(int logical_w, int logical_h, int ui_scale) {
     if (logical_w < 160) logical_w = 160;
     if (logical_h < 120) logical_h = 120;
-    if (logical_w > VM_MAX_W) logical_w = VM_MAX_W;
-    if (logical_h > VM_MAX_H) logical_h = VM_MAX_H;
+    /* Clamp to what was actually ALLOCATED, not to VM_MAX_*: if the big canvas
+     * could not be had, the fallback is smaller and writing past it is the one
+     * bug in this module that would be a crash rather than a cosmetic fault.
+     * psx_video_menu_ui_scale reads the same caps, so the renderer has already
+     * raised its magnification to match and this clamp never bites. */
+    if (logical_w > s_cap_w) logical_w = s_cap_w;
+    if (logical_h > s_cap_h) logical_h = s_cap_h;
     if (ui_scale < 1) ui_scale = 1;
     if (s_lw == logical_w && s_lh == logical_h && s_ui == ui_scale) return;
     s_lw = logical_w;
     s_lh = logical_h;
     s_ui = ui_scale;
+    s_unit = unit_for(logical_h);
+    /* Every baked face is at the old pixel sizes. Dropping them here rather
+     * than letting the cache fill and evict keeps a window drag from carrying
+     * eight stale atlases around. */
+    psx_ui_font_reset();
+    /* Nothing on the canvas belongs to the new size, and the old dirty box is
+     * measured in the old one -- clear the whole thing once and start over. */
+    memset(s_canvas, 0, (size_t)s_lw * (size_t)s_lh * sizeof(uint32_t));
+    s_dirty_x = s_dirty_y = s_dirty_w = s_dirty_h = 0;
     s_dirty = 1;
 }
 
@@ -1113,34 +1766,35 @@ void psx_video_menu_collapse(void) {
 
 void psx_video_menu_close(void) { psx_video_menu_collapse(); }
 
-/* Window pixels -> logical canvas pixels. */
+/* Window pixels -> canvas pixels. */
 static void to_logical(int wx, int wy, int *lx, int *ly) {
     int s = (s_ui > 0) ? s_ui : 1;
     *lx = wx / s;
     *ly = wy / s;
 }
 
-/* Which top-level title is at logical (x,y)? -1 for none. */
+/* Which top-level title is at canvas (x,y)? -1 for none. */
 static int hit_title(int x, int y) {
     int i;
-    if (y < 0 || y >= VM_BAR_H) return -1;
+    if (y < 0 || y >= S(VM_BAR_H)) return -1;
     for (i = 0; i < s_menu_total; i++) {
-        int tx = title_x(i) - VM_TITLE_PAD;
-        int tw = text_w(menu_title(i), 1) + VM_TITLE_PAD * 2;
-        if (x >= tx && x < tx + tw) return i;
+        int tx = title_x(i);
+        if (x >= tx && x < tx + title_w(i)) return i;
     }
     return -1;
 }
 
-/* Which row of the OPEN menu is at logical (x,y)? -1 for none. */
+/* Which row of the OPEN menu is at canvas (x,y)? -1 for none. Rows are found
+ * through row_y(), the same function that draws them, so a highlight can never
+ * sit on a different row from the one a click lands on. */
 static int hit_row(int x, int y) {
     int px, pw, ph, rows, i;
     panel_rect(s_menu, &px, &pw, &ph);
     if (x < px || x >= px + pw) return -1;
     rows = menu_rows(s_menu);
     for (i = 0; i < rows; i++) {
-        int ry = VM_ROWS_Y0 + i * VM_ROW_H - 3;
-        if (y >= ry && y < ry + VM_ROW_H) return i;
+        int ry = row_y(s_menu, i);
+        if (y >= ry && y < ry + S(VM_ROW_H)) return i;
     }
     return -1;
 }
@@ -1657,11 +2311,11 @@ static void write_renderer_line(FILE *f, int renderer) {
     else
         fprintf(f, "# renderer=1      # 0 software, 1 opengl, 2 vulkan;"
                    " omit to use the game's own setting\n");
-    fprintf(f, "#                  # VULKAN IS EXPERIMENTAL: this F10 menu and\n"
-               "#                  # anything the build draws over the game are\n"
-               "#                  # NOT shown under it (toasts and the save-\n"
-               "#                  # state menu are). Takes effect on next\n"
-               "#                  # launch; --renderer still wins.\n");
+    fprintf(f, "#                  # VULKAN IS EXPERIMENTAL. It composites this\n"
+               "#                  # menu and the build's other overlays now,\n"
+               "#                  # but OpenGL is the backend the game is\n"
+               "#                  # tested on. Takes effect on next launch;\n"
+               "#                  # --renderer still wins.\n");
 }
 
 int psx_video_menu_settings_save(const char *path) {
@@ -1721,23 +2375,43 @@ int psx_video_menu_settings_save(const char *path) {
     return 1;
 }
 
-int psx_video_menu_bar_height(void) { return VM_BAR_H; }
+/* Bar height in DESIGN UNITS -- a 480-tall screen's worth, which is exactly
+ * the coordinate space psx_savestate_menu.c authors its 640x480 panel in, so
+ * it can keep asking this how much of its own canvas the bar covers. For a
+ * count of real pixels use psx_video_menu_bar_h_px. */
+int psx_video_menu_bar_height(void) { return (int)VM_BAR_H; }
 
 int psx_video_menu_ui_scale(int drawable_w, int drawable_h) {
-    int mui;
+    int mui = 1;
     if (drawable_w <= 0 || drawable_h <= 0) return 1;
-    mui = drawable_h / 480;
-    if (mui < 1) mui = 1;
-    if (mui > 8) mui = 8;
-    /* Raise until the logical canvas fits the module's buffer cap. */
-    while (mui < 16 && (drawable_w / mui > VM_MAX_W || drawable_h / mui > VM_MAX_H))
+    /* 1:1 with the window, so glyphs are rasterised at their real size. The
+     * loop only fires past the canvas cap (beyond 4K, or after a failed
+     * allocation), where whole-number magnification is what keeps the bar full
+     * width and legible instead of covering part of the screen. */
+    while (mui < 16 && (drawable_w / mui > s_cap_w || drawable_h / mui > s_cap_h))
         mui++;
     return mui;
 }
 
+/* The strip the bar occupies, in drawable pixels, WHETHER OR NOT it is
+ * currently visible. Callers that reserve space use this: the letterbox is
+ * sized once, so pressing F10 uncovers the space rather than rescaling the
+ * picture under the player.
+ *
+ * Design -> canvas is s_unit, canvas -> screen is the magnification, and this
+ * is the only place the two are multiplied. Recomputed from the arguments
+ * rather than read off s_unit, because callers ask about window sizes the
+ * module has not been laid out for yet (psx_apply_windowed_scale iterates
+ * toward one). */
+int psx_video_menu_bar_h_px(int drawable_w, int drawable_h) {
+    int mui = psx_video_menu_ui_scale(drawable_w, drawable_h);
+    float unit = unit_for(drawable_h / mui);
+    return (int)(VM_BAR_H * unit + 0.5f) * mui;
+}
+
 int psx_video_menu_bar_px(int drawable_w, int drawable_h) {
     if (!s_visible) return 0;
-    return VM_BAR_H * psx_video_menu_ui_scale(drawable_w, drawable_h);
+    return psx_video_menu_bar_h_px(drawable_w, drawable_h);
 }
 
 int psx_video_menu_needs_present(void) { return s_visible; }
@@ -1747,7 +2421,7 @@ int psx_video_menu_overlay_image(const uint32_t **pixels, int *w, int *h) {
     if (s_dirty) { redraw(); s_canvas_ready = 1; }
     if (pixels) *pixels = s_canvas;
     if (w) *w = s_lw;
-    if (h) *h = s_lh;
+    if (h) *h = s_used_h;
     return 1;
 }
 
@@ -1769,6 +2443,6 @@ int psx_video_menu_overlay_image_ro(const uint32_t **pixels, int *w, int *h) {
     if (!s_visible || !s_canvas_ready) return 0;
     if (pixels) *pixels = s_canvas;
     if (w) *w = s_lw;
-    if (h) *h = s_lh;
+    if (h) *h = s_used_h;
     return 1;
 }

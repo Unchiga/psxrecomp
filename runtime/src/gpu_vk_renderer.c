@@ -24,6 +24,8 @@
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
 #include "psx_rewind.h"
+#include "psx_video_menu.h"
+#include "psx_guest_overlay.h"
 #include "crash_trace.h"
 #include "gpu_vk_upload.h"
 
@@ -321,6 +323,19 @@ static VkDescriptorPool s_dpool;
 static VkDescriptorSetLayout s_dsl_tex;   /* binding0: raw usampler2D (frag) */
 static VkDescriptorSetLayout s_dsl_pack;  /* binding0: hr sampler, binding1: raw storage (compute) */
 static VkDescriptorSetLayout s_dsl_blit;  /* binding0: src sampler (frag) */
+/* 1 once the overlay compositor built. Declared up here because context
+ * init sets it long before the compositor block below. */
+static int             s_ovl_ready;
+
+/* Overlay compositor. Defined far below, next to the staging helpers it
+ * uses; declared here because context init builds it and finish_present
+ * calls it, both of which come first. */
+static void ovl_note_picture(const VkOffset3D dst[2], int native_w, int native_h);
+static void vk_overlay_pass(VkCommandBuffer cb, uint32_t img_idx);
+static int  ovl_create_pipeline(void);
+static int  ovl_ensure_staging(VkDeviceSize need);
+static void ovl_free_framebuffers(void);
+static void vk_overlay_shutdown(void);
 static VkDescriptorSet s_ds_tex;
 static VkDescriptorSet s_ds_pack;
 /* Blit src image is rebound per blit; a ring of sets avoids updating a set still
@@ -1403,6 +1418,11 @@ int vk_renderer_init_context(SDL_Window *win) {
     if (!create_vram_image()) return 0;
     if (!create_render_targets()) return 0;
 
+    /* Overlay compositor. Non-fatal: a failure here costs the menu and the
+     * guest overlays, not the picture, so the renderer still comes up. */
+    s_ovl_ready = ovl_create_pipeline() ? 1 : 0;
+    if (!s_ovl_ready) vk_log("overlay compositor unavailable (menu/overlays hidden)");
+
     s_ctx_ok = 1;
     vk_log("instance/device/swapchain/VRAM + raw mirror/pipelines ready");
     return 1;
@@ -1416,6 +1436,7 @@ void vk_renderer_shutdown(void) {
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
     osd_staging_free();       /* host toast OSD staging */
+    vk_overlay_shutdown();    /* overlay compositor */
     for (int i = 0; i < STAGING_CACHE_MAX; ++i) {
         if (s_staging_cache[i].buf)
             staging_destroy(s_staging_cache[i].buf, s_staging_cache[i].mem);
@@ -1465,6 +1486,7 @@ void vk_renderer_shutdown(void) {
         if (s_sem_render[i])  p_vkDestroySemaphore(s_dev, s_sem_render[i], NULL);
         if (s_fence[i])       p_vkDestroyFence(s_dev, s_fence[i], NULL);
     }
+    ovl_free_framebuffers();   /* swapchain-lifetime */
     destroy_swapchain();
     if (s_work_pool) p_vkDestroyCommandPool(s_dev, s_work_pool, NULL);
     if (s_cmd_pool) p_vkDestroyCommandPool(s_dev, s_cmd_pool, NULL);
@@ -1491,7 +1513,8 @@ static int acquire_present(VkImage *out_sc, VkCommandBuffer *out_cb,
     s_perf_cur.acquire_us += perf_elapsed_us(acquire_start);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         p_vkDeviceWaitIdle(s_dev);
-        destroy_swapchain();
+        ovl_free_framebuffers();   /* swapchain-lifetime */
+    destroy_swapchain();
         if (!create_swapchain()) return 0;
         return 0;  /* skip this frame; next one uses the new swapchain */
     }
@@ -1550,77 +1573,73 @@ static void vk_osd_copy_rect(VkCommandBuffer cb, VkImage sc,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
 }
 
+/* The overlays that survive a plain buffer-to-image COPY: opaque, every one of
+ * them. The toast is NOT here any more -- it is a rounded translucent pill now,
+ * and this path writes the bytes it is handed with no blending at all, so its
+ * corners would land as opaque black. vk_overlay_pass gathers it instead,
+ * because that one has a real blend. See host_osd.c's header. */
 static void vk_osd_blit(VkCommandBuffer cb, VkImage sc) {
-    const uint32_t *text_px = NULL, *vol_px = NULL, *rw_px = NULL, *ssm_px = NULL;
-    int tw = 0, th = 0, vw = 0, vh = 0, rw = 0, rh = 0, sw = 0, sh = 0;
-    const int have_text = host_osd_image(&text_px, &tw, &th) && text_px;
+    const uint32_t *vol_px = NULL, *rw_px = NULL, *ssm_px = NULL;
+    int vw = 0, vh = 0, rw = 0, rh = 0, sw = 0, sh = 0;
+    const int ww = (int)s_sc_extent.width, wh = (int)s_sc_extent.height;
+    int ui = wh / 480;
+    if (ui < 1) ui = 1;
+    if (ui > 8) ui = 8;
+    /* Both modules author at the size they will be SHOWN at now, so they have
+     * to be told what that is before being asked for an image. Done here, not
+     * in vk_overlay_pass, because this runs first. */
+    host_osd_set_layout(ww, wh);
+    psx_savestate_menu_set_layout(ww, wh);
+
     const int have_vol = host_osd_volume_image(&vol_px, &vw, &vh) && vol_px;
     const int have_rw = psx_rewind_overlay_image(&rw_px, &rw, &rh) && rw_px;
     const int have_ssm =
         psx_savestate_menu_overlay_image(&ssm_px, &sw, &sh) && ssm_px;
-    if (!have_text && !have_vol && !have_rw && !have_ssm) {
-        host_osd_present_done();
-        return;
-    }
+    if (!have_vol && !have_rw && !have_ssm) return;
     /* Only BGRA swapchains match ARGB8888 LE packing used by host_osd. */
     if (s_sc_format != VK_FORMAT_B8G8R8A8_UNORM &&
-        s_sc_format != VK_FORMAT_B8G8R8A8_SRGB) {
-        host_osd_present_done();
-        return;
-    }
-    VkDeviceSize text_bytes =
-        have_text ? (VkDeviceSize)tw * (VkDeviceSize)th * 4u : 0;
+        s_sc_format != VK_FORMAT_B8G8R8A8_SRGB) return;
+
     VkDeviceSize vol_bytes =
         have_vol ? (VkDeviceSize)vw * (VkDeviceSize)vh * 4u : 0;
     VkDeviceSize rw_bytes =
         have_rw ? (VkDeviceSize)rw * (VkDeviceSize)rh * 4u : 0;
     VkDeviceSize ssm_bytes =
         have_ssm ? (VkDeviceSize)sw * (VkDeviceSize)sh * 4u : 0;
-    VkDeviceSize bytes = text_bytes + vol_bytes + rw_bytes + ssm_bytes;
+    VkDeviceSize bytes = vol_bytes + rw_bytes + ssm_bytes;
     if (bytes > s_osd_cap) {
         p_vkQueueWaitIdle(s_queue);
         osd_staging_free();
-        if (!make_staging(bytes, &s_osd_buf, &s_osd_mem, &s_osd_map)) {
-            host_osd_present_done();
+        if (!make_staging(bytes, &s_osd_buf, &s_osd_mem, &s_osd_map))
             return;
-        }
         s_osd_cap = bytes;
     }
-    const int margin = 8;
+    /* Scaled with the window, as GL's is. A flat 8 px left the volume bar
+     * jammed against the edge on a 4K panel while the bar itself grew. */
+    const int margin = 8 * ui;
     VkDeviceSize off = 0;
-    if (have_text) {
-        vk_osd_copy_rect(cb, sc, text_px, tw, th, margin, margin, off);
-        off += text_bytes;
-    }
     if (have_vol) {
-        int x = ((int)s_sc_extent.width > vw + margin)
-                    ? ((int)s_sc_extent.width - vw - margin)
-                    : margin;
-        int y = ((int)s_sc_extent.height > vh)
-                    ? (((int)s_sc_extent.height - vh) / 2)
-                    : margin;
+        int x = (ww > vw + margin) ? (ww - vw - margin) : margin;
+        int y = (wh > vh) ? ((wh - vh) / 2) : margin;
         vk_osd_copy_rect(cb, sc, vol_px, vw, vh, x, y, off);
         off += vol_bytes;
     }
     if (have_rw) {
         float slide = psx_rewind_slide();
-        int x = ((int)s_sc_extent.width > rw)
-                    ? (((int)s_sc_extent.width - rw) / 2)
-                    : 0;
-        int y = (int)s_sc_extent.height - (int)((float)rh * slide + 0.5f);
+        int x = (ww > rw) ? ((ww - rw) / 2) : 0;
+        int y = wh - (int)((float)rh * slide + 0.5f);
         vk_osd_copy_rect(cb, sc, rw_px, rw, rh, x, y, off);
         off += rw_bytes;
     }
     if (have_ssm) {
-        int x = ((int)s_sc_extent.width > sw)
-                    ? (((int)s_sc_extent.width - sw) / 2)
-                    : 0;
-        int y = ((int)s_sc_extent.height > sh)
-                    ? (((int)s_sc_extent.height - sh) / 2)
-                    : 0;
+        /* Centred rather than pinned to the corner because the panel's canvas
+         * can come back SMALLER than the swapchain, when its allocation fell
+         * back to the static buffer. At the size it normally reports this is
+         * 0,0 and the panel covers the screen. */
+        int x = (ww > sw) ? ((ww - sw) / 2) : 0;
+        int y = (wh > sh) ? ((wh - sh) / 2) : 0;
         vk_osd_copy_rect(cb, sc, ssm_px, sw, sh, x, y, off);
     }
-    host_osd_present_done();
 }
 
 static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr);
@@ -1628,6 +1647,15 @@ static void submit_present(VkCommandBuffer cb, uint32_t img_idx, uint32_t fr);
 static void finish_present(VkCommandBuffer cb, VkImage sc,
                            uint32_t img_idx, uint32_t fr) {
     vk_osd_blit(cb, sc);
+    /* After the copy-path OSD so the menu bar lands on top of it, matching the
+     * GL layer order. Takes and returns TRANSFER_DST_OPTIMAL, so the barrier
+     * below is unchanged. */
+    vk_overlay_pass(cb, img_idx);
+    /* Once, here, rather than inside either of them: both consume host_osd
+     * images now, and both have early returns that would otherwise skip the
+     * acknowledgement and leave an expired toast asking to be presented for
+     * ever. */
+    host_osd_present_done();
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
@@ -1691,6 +1719,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
               force_4_3 ? 4 : 4, force_4_3 ? 3 : 3, dst);
+    ovl_note_picture(dst, w, h);
 
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1809,6 +1838,7 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
         dst[0].y = y0;
         dst[1].y = y0 + content_h;
     }
+    ovl_note_picture(dst, src_w, src_h);
     VkImageBlit blit = {0};
     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; blit.srcSubresource.layerCount = 1;
     blit.srcOffsets[1].x = src_w; blit.srcOffsets[1].y = src_h; blit.srcOffsets[1].z = 1;
@@ -1856,6 +1886,7 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
     VkOffset3D dst[2];
     letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
               4 * s_wide_w, 3 * native_w, dst);
+    ovl_note_picture(dst, s_wide_w, disp_h);
 
     int sy0 = disp_y * S, sy1 = (disp_y + disp_h) * S;
     if (sy0 < 0) sy0 = 0;
@@ -2049,6 +2080,478 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
     s_perf_cur.alloc_kb += (uint32_t)(bytes / 1024);
     return 1;
 }
+
+/* ---- Alpha-blended overlay compositor -----------------------------------
+ *
+ * vk_osd_blit() above composites four host layers with vkCmdCopyBufferToImage:
+ * a raw copy, so no alpha and no scaling, pasted 1:1 at a fixed margin. That is
+ * enough for the toasts it was written for and cannot serve the two layers it
+ * omits. The F10 menu bar is authored at a ui_scale the window chooses, and the
+ * guest overlays (rank meter, fusion hint, CARD DROPS tags, the freeze report
+ * banner) are authored in GUEST pixels and have to ride the same letterbox
+ * transform the picture used, or they drift away from the boxes they label.
+ * Both also rely on real alpha: a copy pastes their transparent margins as
+ * opaque black rectangles.
+ *
+ * So: a small graphics pass that draws each layer as a textured quad with
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA, into the swapchain image the game frame was
+ * just blitted into. loadOp is LOAD, because the picture is already there and
+ * must survive. The render pass takes and returns TRANSFER_DST_OPTIMAL so it
+ * slots between the existing blit and the existing barrier to PRESENT_SRC
+ * without either needing to change.
+ *
+ * Mirrors gpu_gl_renderer.c ordering, and for the reason its comment records:
+ * guest overlays belong to the PICTURE and composite first; host UI the player
+ * summoned goes on top. Drawn the other way round, a full-screen mod panel
+ * hides the save-state menu completely - it opens, takes input, and cannot be
+ * seen.
+ */
+
+#define VK_OVL_MAX 14            /* layers per frame: guest overlays, menu, toast */
+
+static VkRenderPass          s_ovl_rpass;
+static VkImageView           s_ovl_scview[8];
+static VkFramebuffer         s_ovl_fb[8];
+static VkPipelineLayout      s_ovl_playout;
+static VkPipeline            s_ovl_pipe;
+static VkDescriptorPool      s_ovl_dpool;
+static VkDescriptorSet       s_ovl_dset[VK_OVL_MAX];
+static VkImage               s_ovl_img[VK_OVL_MAX];
+static VkDeviceMemory        s_ovl_imem[VK_OVL_MAX];
+static VkImageView           s_ovl_iview[VK_OVL_MAX];
+static int                   s_ovl_iw[VK_OVL_MAX], s_ovl_ih[VK_OVL_MAX];
+static VkImageLayout         s_ovl_ilayout[VK_OVL_MAX];
+static VkBuffer              s_ovl_buf;
+static VkDeviceMemory        s_ovl_bmem;
+static void                 *s_ovl_map;
+static VkDeviceSize          s_ovl_cap;
+static int                   s_ovl_slot;      /* next free slot this frame */
+
+static void ovl_free_slots(void) {
+    for (int i = 0; i < VK_OVL_MAX; i++) {
+        if (s_ovl_iview[i]) { p_vkDestroyImageView(s_dev, s_ovl_iview[i], NULL); s_ovl_iview[i] = VK_NULL_HANDLE; }
+        if (s_ovl_img[i])   { p_vkDestroyImage(s_dev, s_ovl_img[i], NULL);       s_ovl_img[i] = VK_NULL_HANDLE; }
+        if (s_ovl_imem[i])  { p_vkFreeMemory(s_dev, s_ovl_imem[i], NULL);        s_ovl_imem[i] = VK_NULL_HANDLE; }
+        s_ovl_iw[i] = s_ovl_ih[i] = 0;
+        s_ovl_ilayout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+}
+
+/* Framebuffers are swapchain-lifetime: dropped and rebuilt on every resize. */
+static void ovl_free_framebuffers(void) {
+    for (int i = 0; i < 8; i++) {
+        if (s_ovl_fb[i])     { p_vkDestroyFramebuffer(s_dev, s_ovl_fb[i], NULL); s_ovl_fb[i] = VK_NULL_HANDLE; }
+        if (s_ovl_scview[i]) { p_vkDestroyImageView(s_dev, s_ovl_scview[i], NULL); s_ovl_scview[i] = VK_NULL_HANDLE; }
+    }
+}
+
+static void vk_overlay_shutdown(void) {
+    ovl_free_framebuffers();
+    ovl_free_slots();
+    if (s_ovl_buf)     { p_vkDestroyBuffer(s_dev, s_ovl_buf, NULL); s_ovl_buf = VK_NULL_HANDLE; }
+    if (s_ovl_bmem)    { p_vkFreeMemory(s_dev, s_ovl_bmem, NULL);   s_ovl_bmem = VK_NULL_HANDLE; }
+    s_ovl_map = NULL; s_ovl_cap = 0;
+    if (s_ovl_pipe)    { p_vkDestroyPipeline(s_dev, s_ovl_pipe, NULL); s_ovl_pipe = VK_NULL_HANDLE; }
+    if (s_ovl_playout) { p_vkDestroyPipelineLayout(s_dev, s_ovl_playout, NULL); s_ovl_playout = VK_NULL_HANDLE; }
+    if (s_ovl_dpool)   { p_vkDestroyDescriptorPool(s_dev, s_ovl_dpool, NULL); s_ovl_dpool = VK_NULL_HANDLE; }
+    if (s_ovl_rpass)   { p_vkDestroyRenderPass(s_dev, s_ovl_rpass, NULL); s_ovl_rpass = VK_NULL_HANDLE; }
+    s_ovl_ready = 0;
+}
+
+/* Own descriptor pool rather than s_dpool: that one is sized exactly
+ * BLIT_DESC_RING + 2 for the renderer own sets, and quietly borrowing from it
+ * would fail allocation the moment the blit ring filled. */
+static int ovl_create_pipeline(void) {
+    VkAttachmentDescription at = {0};
+    at.format = s_sc_format;
+    at.samples = VK_SAMPLE_COUNT_1_BIT;
+    at.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;      /* the game frame is already there */
+    at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    at.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    at.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    /* In and out as TRANSFER_DST_OPTIMAL so this pass drops between the game
+     * blit and the finish_present barrier without either needing to change. */
+    at.initialLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    at.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkAttachmentReference ar = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp = {0};
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount = 1; sp.pColorAttachments = &ar;
+    VkSubpassDependency dep[2];
+    memset(dep, 0, sizeof dep);
+    dep[0].srcSubpass = VK_SUBPASS_EXTERNAL; dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].srcSubpass = 0; dep[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    rpi.attachmentCount = 1; rpi.pAttachments = &at;
+    rpi.subpassCount = 1; rpi.pSubpasses = &sp;
+    rpi.dependencyCount = 2; rpi.pDependencies = dep;
+    if (p_vkCreateRenderPass(s_dev, &rpi, NULL, &s_ovl_rpass) != VK_SUCCESS) return 0;
+
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_OVL_MAX };
+    VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    pci.maxSets = VK_OVL_MAX; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+    if (p_vkCreateDescriptorPool(s_dev, &pci, NULL, &s_ovl_dpool) != VK_SUCCESS) return 0;
+    for (int i = 0; i < VK_OVL_MAX; i++) {
+        VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ai.descriptorPool = s_ovl_dpool; ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &s_dsl_blit;    /* binding0: combined image sampler */
+        if (p_vkAllocateDescriptorSets(s_dev, &ai, &s_ovl_dset[i]) != VK_SUCCESS) return 0;
+    }
+
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 4 };
+    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pli.setLayoutCount = 1; pli.pSetLayouts = &s_dsl_blit;
+    pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+    if (p_vkCreatePipelineLayout(s_dev, &pli, NULL, &s_ovl_playout) != VK_SUCCESS) return 0;
+
+    VkShaderModule vs = make_module(spv_overlay_vert, spv_overlay_vert_size);
+    VkShaderModule fs = make_module(spv_overlay_frag, spv_overlay_frag_size);
+    if (!vs || !fs) return 0;
+    VkPipelineShaderStageCreateInfo stages[2];
+    memset(stages, 0, sizeof stages);
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vs; stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vin = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    /* Straight (non-premultiplied) alpha, matching how every host overlay in
+     * this runtime authors its ARGB buffer. */
+    VkPipelineColorBlendAttachmentState cba = {0};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gpi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    gpi.stageCount = 2; gpi.pStages = stages;
+    gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp; gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState = &ms; gpi.pDepthStencilState = &dss;
+    gpi.pColorBlendState = &cb; gpi.pDynamicState = &dy;
+    gpi.layout = s_ovl_playout; gpi.renderPass = s_ovl_rpass;
+    VkResult r = p_vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gpi, NULL, &s_ovl_pipe);
+    p_vkDestroyShaderModule(s_dev, vs, NULL);
+    p_vkDestroyShaderModule(s_dev, fs, NULL);
+    return r == VK_SUCCESS;
+}
+
+/* Grow the shared upload buffer to hold at least `need` bytes for ONE layer.
+ * Sized on demand rather than up front: a full-window menu at 4K is ~33 MB and
+ * allocating that on every launch to serve a bar that is usually closed is a
+ * cost for nothing. Growth waits for the queue first -- the old buffer may
+ * still be referenced by a frame in flight. */
+static int ovl_ensure_staging(VkDeviceSize need) {
+    if (need <= s_ovl_cap) return 1;
+    p_vkQueueWaitIdle(s_queue);
+    if (s_ovl_buf)  { p_vkDestroyBuffer(s_dev, s_ovl_buf, NULL); s_ovl_buf = VK_NULL_HANDLE; }
+    if (s_ovl_bmem) { p_vkFreeMemory(s_dev, s_ovl_bmem, NULL);   s_ovl_bmem = VK_NULL_HANDLE; }
+    s_ovl_map = NULL; s_ovl_cap = 0;
+    if (!make_staging(need, &s_ovl_buf, &s_ovl_bmem, &s_ovl_map)) return 0;
+    s_ovl_cap = need;
+    return 1;
+}
+
+static int ovl_ensure_framebuffers(void) {
+    if (s_ovl_fb[0]) return 1;
+    for (uint32_t i = 0; i < s_sc_count; i++) {
+        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = s_sc_images[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = s_sc_format;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+        if (p_vkCreateImageView(s_dev, &vi, NULL, &s_ovl_scview[i]) != VK_SUCCESS)
+            return 0;
+        VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        fi.renderPass = s_ovl_rpass; fi.attachmentCount = 1;
+        fi.pAttachments = &s_ovl_scview[i];
+        fi.width = s_sc_extent.width; fi.height = s_sc_extent.height; fi.layers = 1;
+        if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_ovl_fb[i]) != VK_SUCCESS)
+            return 0;
+    }
+    return 1;
+}
+
+/* Stage one ARGB layer into its own image and point a descriptor set at it.
+ * Returns the slot, or -1. Slots are per-frame and recycled; an image is only
+ * reallocated when the layer size actually changes, so a menu redrawing at a
+ * constant size costs one memcpy and one copy command per frame. */
+static int ovl_stage(VkCommandBuffer cb, const uint32_t *px, int w, int h,
+                     VkDeviceSize *off) {
+    if (s_ovl_slot >= VK_OVL_MAX || !px || w <= 0 || h <= 0) return -1;
+    const int i = s_ovl_slot;
+    const VkDeviceSize bytes = (VkDeviceSize)w * (VkDeviceSize)h * 4u;
+    if (*off + bytes > s_ovl_cap) return -1;
+
+    if (s_ovl_iw[i] != w || s_ovl_ih[i] != h) {
+        if (s_ovl_iview[i]) { p_vkDestroyImageView(s_dev, s_ovl_iview[i], NULL); s_ovl_iview[i] = VK_NULL_HANDLE; }
+        if (s_ovl_img[i])   { p_vkDestroyImage(s_dev, s_ovl_img[i], NULL);       s_ovl_img[i] = VK_NULL_HANDLE; }
+        if (s_ovl_imem[i])  { p_vkFreeMemory(s_dev, s_ovl_imem[i], NULL);        s_ovl_imem[i] = VK_NULL_HANDLE; }
+        if (!make_image(VK_FORMAT_B8G8R8A8_UNORM, w, h,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT,
+                        &s_ovl_img[i], &s_ovl_imem[i], &s_ovl_iview[i]))
+            return -1;
+        s_ovl_iw[i] = w; s_ovl_ih[i] = h;
+        s_ovl_ilayout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    memcpy((uint8_t *)s_ovl_map + (size_t)*off, px, (size_t)bytes);
+    img_to(cb, s_ovl_img[i], &s_ovl_ilayout[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy bc = {0};
+    bc.bufferOffset = *off;
+    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bc.imageSubresource.layerCount = 1;
+    bc.imageExtent.width = (uint32_t)w; bc.imageExtent.height = (uint32_t)h;
+    bc.imageExtent.depth = 1;
+    p_vkCmdCopyBufferToImage(cb, s_ovl_buf, s_ovl_img[i],
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    img_to(cb, s_ovl_img[i], &s_ovl_ilayout[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    VkDescriptorImageInfo di = { s_samp, s_ovl_iview[i],
+                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    wr.dstSet = s_ovl_dset[i]; wr.dstBinding = 0; wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr.pImageInfo = &di;
+    p_vkUpdateDescriptorSets(s_dev, 1, &wr, 0, NULL);
+
+    *off += bytes;
+    s_ovl_slot++;
+    return i;
+}
+
+/* Where the picture actually landed this frame, and how many guest pixels it
+ * was made of. Recorded by whichever present path ran rather than recomputed
+ * here: the three of them letterbox to different aspects (4:3, and the wide
+ * path to 4*wide_w : 3*native_w) and the CPU path nudges its rect again for
+ * short GP1(07h) bands. Recomputing would mean duplicating all of that and
+ * getting it subtly wrong on exactly the frames that are hardest to notice. */
+static int s_ovl_pic_x, s_ovl_pic_y, s_ovl_pic_w, s_ovl_pic_h;
+static int s_ovl_native_w, s_ovl_native_h;
+
+static void ovl_note_picture(const VkOffset3D dst[2], int native_w, int native_h) {
+    s_ovl_pic_x = dst[0].x;
+    s_ovl_pic_y = dst[0].y;
+    s_ovl_pic_w = dst[1].x - dst[0].x;
+    s_ovl_pic_h = dst[1].y - dst[0].y;
+    s_ovl_native_w = native_w > 0 ? native_w : 320;
+    s_ovl_native_h = native_h > 0 ? native_h : 240;
+}
+
+/* Draw a staged slot at a destination rect given in SWAPCHAIN pixels. */
+static void ovl_draw(VkCommandBuffer cb, int slot, int dx, int dy, int dw, int dh) {
+    if (slot < 0 || dw <= 0 || dh <= 0) return;
+    const float sw = (float)s_sc_extent.width, sh = (float)s_sc_extent.height;
+    float rect[4];
+    rect[0] = ((float)dx / sw) * 2.0f - 1.0f;
+    rect[1] = ((float)dy / sh) * 2.0f - 1.0f;
+    rect[2] = ((float)(dx + dw) / sw) * 2.0f - 1.0f;
+    rect[3] = ((float)(dy + dh) / sh) * 2.0f - 1.0f;
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ovl_playout,
+                              0, 1, &s_ovl_dset[slot], 0, NULL);
+    p_vkCmdPushConstants(cb, s_ovl_playout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                         (uint32_t)sizeof rect, rect);
+    p_vkCmdDraw(cb, 6, 1, 0, 0);
+}
+
+/* One frame of overlay compositing, recorded into the present command buffer
+ * between the game blit and the barrier to PRESENT_SRC.
+ *
+ * Three phases, and the order is forced rather than stylistic:
+ *
+ *  1. GATHER every layer and work out where it goes. Nothing is uploaded yet,
+ *     because the total size is not known until the last one is collected and
+ *     growing the staging buffer discards whatever was already copied into it.
+ *  2. STAGE them all -- transfers are illegal inside a render pass, so every
+ *     upload has to be recorded before the pass begins. That is also why slots
+ *     are a fixed array rather than one reused image: all the copies land
+ *     before the first draw reads any of them, so they cannot share storage.
+ *  3. DRAW inside the render pass.
+ *
+ * Layer order mirrors gpu_gl_renderer.c, and for the reason its comment
+ * records: guest overlays belong to the PICTURE and composite first; host UI
+ * the player summoned goes on top. Drawn the other way round, a full-screen
+ * mod panel hides the save-state menu completely -- it opens, takes input, and
+ * cannot be seen.
+ */
+extern int gpu_sprite_watch_query(int max_age, int *x, int *y, int *occluded);
+
+typedef struct { const uint32_t *px; int w, h, dx, dy, dw, dh; } OvlLayer;
+
+static void vk_overlay_pass(VkCommandBuffer cb, uint32_t img_idx) {
+    OvlLayer lay[VK_OVL_MAX];
+    int n = 0;
+    VkDeviceSize total = 0, off = 0;
+    const uint32_t *px = NULL;
+    int ow = 0, oh = 0;
+
+    if (!s_ovl_ready || img_idx >= s_sc_count) return;
+    /* Only BGRA swapchains match the ARGB8888 LE packing every host overlay
+     * uses -- the same constraint vk_osd_blit documents. */
+    if (s_sc_format != VK_FORMAT_B8G8R8A8_UNORM &&
+        s_sc_format != VK_FORMAT_B8G8R8A8_SRGB) return;
+    if (!ovl_ensure_framebuffers()) return;
+
+    /* ---- 1. gather: guest overlays, in the picture's own space ---------- */
+    if (s_ovl_pic_w > 0 && s_ovl_pic_h > 0) {
+        const int lw = s_ovl_pic_w, lh = s_ovl_pic_h;
+        const int nw = s_ovl_native_w, nh = s_ovl_native_h;
+        /* Canonical guest coordinates sit s_wide_offset columns into a wide
+         * presented source, so anything anchored to a box the game drew has to
+         * shift with it. Zero unless the wide layer is actually presenting. */
+        const int goff = (s_wide_w > 0 && nw == s_wide_w) ? s_wide_offset : 0;
+        for (int oi = 0; oi < psx_guest_overlay_count() && n < VK_OVL_MAX - 1; oi++) {
+            const PsxGuestOverlay *ov = psx_guest_overlay_at(oi);
+            if (!ov || !ov->image || !ov->origin) continue;
+            /* Occlusion is tested HERE, at composite time, not where the
+             * overlay decided its own state: that decision runs in the frame
+             * loop and can only see occluders from the frame BEFORE, so the
+             * frame where a card view first covers the meter would still be
+             * drawn with it on -- a one-frame flash. */
+            if (ov->occlusion_group >= 0) {
+                int occluded = 0;
+                (void)gpu_sprite_watch_query(ov->occlusion_group, NULL, NULL, &occluded);
+                if (occluded) continue;
+            }
+            if (!ov->image(&px, &ow, &oh) || !px || ow <= 0 || oh <= 0) continue;
+            int gx = 0, gy = 0;
+            ov->origin(&gx, &gy);
+            const int sub = ov->subpixel_y ? ov->subpixel_y() : 0;
+            OvlLayer *L = &lay[n];
+            L->px = px; L->w = ow; L->h = oh;
+            /* No vertical flip here, unlike the GL path. GL's letterbox y is
+             * fed to glViewport, whose origin is BOTTOM-left, so that path has
+             * to convert with wh - ly - lh. A Vulkan framebuffer's origin is
+             * already TOP-left and s_ovl_pic_y is a top-based blit offset, so
+             * applying the same correction would push every overlay off by
+             * twice the letterbox inset. */
+            L->dx = s_ovl_pic_x + ((gx + goff) * lw) / nw;
+            L->dy = s_ovl_pic_y + (gy * lh) / nh + (sub * lh) / (2 * nh);
+            L->dw = (ow * lw) / nw; if (L->dw < 1) L->dw = 1;
+            L->dh = (oh * lh) / nh; if (L->dh < 1) L->dh = 1;
+            total += (VkDeviceSize)ow * (VkDeviceSize)oh * 4u;
+            n++;
+        }
+    }
+
+    /* ---- 1b. gather: the menu bar, on top ------------------------------ */
+    /* set_layout and the redraw inside the non-_ro accessor both MUTATE menu
+     * state. The Vulkan present path runs on the emulator thread (unlike GL,
+     * which can present on its own), so preparing here is safe and keeps the
+     * sequence identical to GL's menu_prepare_for_present(). */
+    if (n < VK_OVL_MAX && psx_video_menu_needs_present()) {
+        const int ww = (int)s_sc_extent.width, wh = (int)s_sc_extent.height;
+        const int mui = psx_video_menu_ui_scale(ww, wh);
+        if (mui > 0) {
+            psx_video_menu_set_layout(ww / mui, wh / mui, mui);
+            psx_video_menu_prepare();
+            if (psx_video_menu_overlay_image_ro(&px, &ow, &oh) && px &&
+                ow > 0 && oh > 0) {
+                OvlLayer *L = &lay[n];
+                /* Authored at canvas size x ui_scale, i.e. already the
+                 * window's own pixels, so it maps 1:1 onto the swapchain from
+                 * the top-left. Scaled from the IMAGE, not stretched to the
+                 * window: the menu reports only the rows it actually drew (the
+                 * bar alone while collapsed), and stretching those over the
+                 * full height would smear a 50 px strip across the screen. */
+                L->px = px; L->w = ow; L->h = oh;
+                L->dx = 0; L->dy = 0;
+                L->dw = ow * mui; L->dh = oh * mui;
+                if (L->dw > ww) L->dw = ww;
+                if (L->dh > wh) L->dh = wh;
+                total += (VkDeviceSize)ow * (VkDeviceSize)oh * 4u;
+                n++;
+            }
+        }
+    }
+
+    /* ---- 1c. gather: the toast, on top of everything -------------------- */
+    /* Here rather than on vk_osd_blit's copy path because the toast carries
+     * real alpha -- it is a rounded translucent pill -- and that path cannot
+     * blend. LAST in the list, so it lands above the menu bar: every option a
+     * toast reports can only be changed from an open dropdown, and drawn
+     * underneath it would be hidden by the very panel that triggered it. Same
+     * order as GL. host_osd_set_layout has already run, in vk_osd_blit.
+     *
+     * A backend with no overlay pipeline (s_ovl_ready false, or a non-BGRA
+     * swapchain) returned above and shows no toast -- but it shows no menu bar
+     * either, so the two fail together rather than one of them silently. */
+    if (n < VK_OVL_MAX && host_osd_image(&px, &ow, &oh) && px &&
+        ow > 0 && oh > 0) {
+        const int ww = (int)s_sc_extent.width, wh = (int)s_sc_extent.height;
+        int ui = wh / 480;
+        OvlLayer *L = &lay[n];
+        if (ui < 1) ui = 1;
+        if (ui > 8) ui = 8;
+        L->px = px; L->w = ow; L->h = oh;
+        /* Inset below the bar whether or not the bar is currently showing:
+         * top-left is exactly where the bar itself sits. */
+        L->dx = 8 * ui;
+        L->dy = psx_video_menu_bar_px(ww, wh) + 8 * ui;
+        L->dw = ow; L->dh = oh;    /* authored at its final size; no scaling */
+        total += (VkDeviceSize)ow * (VkDeviceSize)oh * 4u;
+        n++;
+    }
+
+    if (n == 0) return;
+    if (!ovl_ensure_staging(total)) return;
+
+    /* ---- 2. stage everything before the render pass opens --------------- */
+    s_ovl_slot = 0;
+    int slot[VK_OVL_MAX];
+    int staged = 0;
+    for (int i = 0; i < n; i++) {
+        slot[i] = ovl_stage(cb, lay[i].px, lay[i].w, lay[i].h, &off);
+        if (slot[i] >= 0) staged++;
+    }
+    if (!staged) return;
+
+    /* ---- 3. draw ------------------------------------------------------- */
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = s_ovl_rpass;
+    rp.framebuffer = s_ovl_fb[img_idx];
+    rp.renderArea.extent = s_sc_extent;
+    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vpv = { 0.0f, 0.0f, (float)s_sc_extent.width,
+                       (float)s_sc_extent.height, 0.0f, 1.0f };
+    VkRect2D sci; sci.offset.x = 0; sci.offset.y = 0; sci.extent = s_sc_extent;
+    p_vkCmdSetViewport(cb, 0, 1, &vpv);
+    p_vkCmdSetScissor(cb, 0, 1, &sci);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ovl_pipe);
+    for (int i = 0; i < n; i++)
+        ovl_draw(cb, slot[i], lay[i].dx, lay[i].dy, lay[i].dw, lay[i].dh);
+    p_vkCmdEndRenderPass(cb);
+}
+
+
+
 static void free_staging(VkBuffer buf, VkDeviceMemory mem) {
     staging_release(buf, mem);
 }
