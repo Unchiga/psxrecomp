@@ -87,6 +87,11 @@ int cdrom_load_in_progress(void);
 /* Physical non-XA data-read command state, without the logical load gap
  * bridge used by cdrom_load_in_progress(). Diagnostics only. */
 int cdrom_data_read_active(void);
+/* True while anything in the emulated controller could still deliver a CD-ROM
+ * interrupt (armed second response, queued command, un-acked or unpresented
+ * INT, pended data-ready, active read stream). False means no completion can
+ * arrive without a fresh guest command. Read-only. */
+int cdrom_completion_possible(void);
 
 /* boot_state / netplay digest — full controller FSM (sector FIFOs included). */
 uint32_t cdrom_snapshot_bytes(void);

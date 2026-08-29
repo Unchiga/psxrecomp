@@ -3015,6 +3015,31 @@ int cdrom_data_read_active(void) {
     return reading && !xa_stream_active;
 }
 
+/* True while anything in the emulated controller could still deliver a CD-ROM
+ * interrupt: an armed second response, a command queued behind an ack, an INT
+ * raised but not yet acked or presented, a pended data-ready, or an active
+ * read stream. False means the drive is quiescent -- no path in the emulation
+ * can produce another completion without the guest issuing a fresh command.
+ *
+ * Added for the mid-duel freeze repair (see src/psx_freeze_report.c). The
+ * guest sets its "CD script in flight" bit AFTER submitting, so a completion
+ * that lands inside the submit leaves that bit set with nothing alive to
+ * clear it. Telling "still coming" from "never coming" is exactly this
+ * predicate, and only the host can answer it: the guest's own queue depth is
+ * reset in bulk rather than decremented per completion, so it cannot.
+ *
+ * Read-only -- it must never touch controller state, because the repair polls
+ * it every vblank. */
+int cdrom_completion_possible(void) {
+    if (pending.pending)              return 1;  /* second response armed   */
+    if (queued_cmd.pending)           return 1;  /* command behind an ack   */
+    if (irq_flag)                     return 1;  /* INT raised, not acked   */
+    if (pending_dataready)            return 1;  /* data-ready pended       */
+    if (reading)                      return 1;  /* sectors streaming       */
+    if (irq_present_rem_cycles() > 0) return 1;  /* armed, awaiting present */
+    return 0;
+}
+
 /* Savestate post-load: authentic CD second-response delays (ReadTOC ~30M
  * cycles, Init ~1.1M, far seeks, etc.) leave the restored frame on screen
  * for up to ~1s+ of wall time. Clamp those timers so the next cdrom_advance
