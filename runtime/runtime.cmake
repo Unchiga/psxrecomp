@@ -930,6 +930,13 @@ function(psxrecomp_add_runtime_target target)
     # requirement explicit instead of relying on a parent project's global
     # CMAKE_C_STANDARD setting.
     target_compile_features(${target} PRIVATE c_std_11)
+    # Same reasoning for C++: the runtime's .cpp sources use std::filesystem and
+    # constexpr, so they need C++17. Most toolchains default to it, but Apple
+    # Clang from the macOS Command Line Tools still defaults /usr/bin/c++ to
+    # C++98 -- which surfaces as "expected namespace name" on
+    # `namespace fs = std::filesystem` and "unknown type name 'constexpr'",
+    # errors that read like a broken header rather than a missing flag.
+    target_compile_features(${target} PRIVATE cxx_std_17)
 
     # Game-specific executable name. Every title instantiates this function with
     # the same CMake target name ("psx-runtime"), so without this they ALL produce
