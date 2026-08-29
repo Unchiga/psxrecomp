@@ -53,3 +53,14 @@ psx_screenshot.bmp
 __pycache__/
 /toolchain
 /card2.mcd.bak.before_beetle_copy
+
+# Retail BIOS dumps are Sony's. They must never enter the tree, and the
+# packager scrubs them from a release by content (see
+# tools/package_setup_host.sh, scrub_retail_bios). This is the first line of
+# that defence: an SCPH1001.BIN dropped into bios/ for a debugging session is
+# exactly how one nearly shipped. openbios.bin is the image releases DO ship
+# and stays tracked.
+bios/*.bin
+bios/*.BIN
+bios/*.rom
+!bios/openbios.bin

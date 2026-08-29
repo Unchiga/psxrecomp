@@ -256,6 +256,29 @@ for d in "${PROJECT_DIRS[@]}"; do
   copy_proj "${d}"
 done
 
+# A retail PlayStation BIOS dump is Sony's, and a release must never carry one
+# -- not from a developer's working tree, not from a submodule's bios/. This is
+# not hypothetical: an SCPH1001.BIN dropped into psxrecomp/bios/ during a
+# debugging session sat one packaging run away from shipping, and nothing in
+# the copy path would have caught it.
+#
+# Identified by CONTENT, not by name or size. OpenBIOS is the image a release
+# exists to ship, it lives at bios/openbios.bin, and it deliberately carries
+# "Licensed by Sony Computer Entertainment Inc." for compatibility -- so a name
+# match, a size match, or a string match on "Sony" would delete the wrong file.
+# Only a retail dump carries a Sony COPYRIGHT line (verified: 0 hits in
+# OpenBIOS, 6 in SCPH1001).
+scrub_retail_bios() {
+  local dir="$1" f
+  [[ -d "${dir}" ]] || return 0
+  while IFS= read -r -d '' f; do
+    if grep -qa 'Copyright.*Sony Computer Entertainment' "${f}" 2>/dev/null; then
+      echo "scrub: removed retail BIOS dump from release: ${f#${dir}/}" >&2
+      rm -f "${f}"
+    fi
+  done < <(find "${dir}" -type f -size -1025k -size +255k                 \( -iname '*.bin' -o -iname '*.rom' -o -iname '*.img' \)                 -print0 2>/dev/null)
+}
+
 # Project paths a release must NOT carry, removed after the copy because
 # copy_proj is a plain cp -a of the working tree. The motivating case: art a
 # title bakes from the player's own disc or captures from a running game
@@ -267,6 +290,7 @@ for x in "${PROJECT_EXCLUDES[@]}"; do
 done
 find "${STAGE}" -type d -name '__pycache__' -prune -exec rm -rf {} + \
   2>/dev/null || true
+scrub_retail_bios "${STAGE}"
 
 copy_tree_filtered() {
   local src="$1" dest="$2"
@@ -286,6 +310,8 @@ copy_tree_filtered() {
   # ignores every --exclude it is handed, so a filter argument alone would
   # quietly ship these on any machine without rsync.
   find "${dest}" -type f \( -name '*.mcd' -o -name '*.mcr' \) -delete 2>/dev/null || true
+  # Same posture, same reason for being here rather than in a --exclude.
+  scrub_retail_bios "${dest}"
 }
 
 if [[ ! -d "${ROOT}/psxrecomp" ]]; then

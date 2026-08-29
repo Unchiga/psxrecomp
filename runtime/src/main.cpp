@@ -2322,6 +2322,36 @@ static std::string bios_accepted_images() {
     return s.empty() ? std::string("(this build ships its own BIOS)") : s;
 }
 
+/* Would loading `p` mean silently running a DIFFERENT recompiled BIOS from
+ * every other player of this title?
+ *
+ * A title that ships OpenBIOS must never load a retail image the player did
+ * not ask for in this run. Remembered paths count as "did not ask": an
+ * earlier release adopted any SCPH1001 dump found by walking UP the whole
+ * tree from the exe, wrote it to bios.cfg, and from then on that player ran a
+ * different BIOS from everyone else -- having chosen nothing and been told
+ * nothing. Gating the discovery only stops NEW adoptions; the remembered path
+ * keeps loading forever after. Measured: a reporter's savestate carried
+ * bios_checksum 0x99CB7EF6 (SCPH1001) against 0xC4DAEB88 (OpenBIOS) for the
+ * same game and release, and nothing surfaced the difference until the state
+ * refused to load. That is a bug report nobody can reproduce.
+ *
+ * --bios on the command line is still honoured: that is asking. So is a
+ * netplay lobby that names an image, which is the match's decision, not a
+ * stale local file. Everything else gets the image the title ships.
+ *
+ * Ignoring a stored path also CLEARS it: the seed is rebuilt without one, so
+ * settings.toml and bios.cfg are rewritten empty and the launcher shows
+ * OpenBIOS. Nothing is left claiming a choice that is no longer in effect. */
+static bool bios_auto_load_blocked(const std::filesystem::path& p) {
+    if (!s_openbios_allowed) return false;      /* title needs a retail dump */
+    std::error_code ec;
+    if (p.empty() || !std::filesystem::exists(p, ec)) return false;
+    const PsxBiosBackend* b = bios_backend_for_file(p, nullptr, nullptr);
+    return b && b->image && !b->image->image_bundled;
+}
+
+
 /* Identity-gate a player-chosen BIOS and activate its backend on success. */
 static bool validate_bios_for_launch(const std::filesystem::path& path) {
     uint32_t crc = 0; uint64_t size = 0;
@@ -2785,8 +2815,8 @@ static bool resolve_match_session_bios_path(
         try_retail(resolve_bios_path(launcher_bios_path, argv0));
     if (retail.empty())
         try_retail(read_cached_path(argv0, "bios.cfg"));
-    if (retail.empty())
-        try_retail(discover_retail_bios_near(argv0));
+    if (retail.empty() && !s_openbios_allowed)
+        try_retail(discover_retail_bios_near(argv0));  /* see the adoption note */
     *out_path = std::move(retail); /* empty ⇒ caller falls back to OpenBIOS */
     return true;
 }
@@ -8811,7 +8841,8 @@ namespace {
             has_dump = path_is_retail(p);
         }
         if (!has_dump) has_dump = path_is_retail(read_cached_path(argv0, "bios.cfg"));
-        if (!has_dump) has_dump = path_is_retail(discover_retail_bios_near(argv0));
+        if (!has_dump && !s_openbios_allowed)
+            has_dump = path_is_retail(discover_retail_bios_near(argv0));
         offer.can_scph1001 =
             (psx_bios_has_selectable() && has_dump) ? 1 : 0;
 
@@ -11427,7 +11458,8 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
             g_hotkey_pad_save_state_menu = normalize_hotkey_pad_binding(
                 us.hotkey_pad_save_state_menu,
                 PSX_HOTKEY_PAD_SELECT_R1);
-        if (us.has_bios_path && !boot.bios_from_cli && !us.bios_path.empty()) {
+        if (us.has_bios_path && !boot.bios_from_cli && !us.bios_path.empty()
+            && !bios_auto_load_blocked(us.bios_path)) {
             boot.settings_bios_storage = us.bios_path.string();
             boot.bios_path = boot.settings_bios_storage.c_str();
             boot.bios_explicit = true;
@@ -11909,7 +11941,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
             if (bios_choice_supported && !seed.has_bios_path) {
                 std::filesystem::path cached =
                     read_cached_path(argv[0], "bios.cfg");
-                if (!cached.empty()) {
+                if (!cached.empty() && !bios_auto_load_blocked(cached)) {
                     seed.bios_path = cached;
                     seed.has_bios_path = true;
                 }
@@ -11929,8 +11961,21 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
             }
             /* First-run setup: if nothing remembered, adopt a retail dump next
              * to the install (SCPH1001…). Missing → leave empty (OpenBIOS).
-             * Never override an existing bios.cfg (including cleared OpenBIOS). */
-            if (bios_choice_supported && !seed.has_bios_path) {
+             * Never override an existing bios.cfg (including cleared OpenBIOS).
+             *
+             * NOT for titles that ship OpenBIOS. discover_retail_bios_near()
+             * walks UP the whole tree from the exe checking bios/, system/,
+             * firmware/ and more at every level, so an unrelated SCPH1001.BIN
+             * anywhere above the install was silently adopted -- the player
+             * chose nothing, saw nothing, and from then on ran a DIFFERENT
+             * RECOMPILED BIOS to everyone else. Measured: a reporter's
+             * savestate carried bios_checksum 0x99CB7EF6 (SCPH1001) against
+             * 0xC4DAEB88 (OpenBIOS) for the same game and release, and the
+             * mismatch was invisible until the state refused to load. That is
+             * a bug report nobody can reproduce. A title that allows the
+             * bundled image gets the bundled image; --bios is still honoured
+             * for anyone who deliberately asks. */
+            if (bios_choice_supported && !seed.has_bios_path && !s_openbios_allowed) {
                 std::error_code ec;
                 const auto cfg = sidecar_cfg_path(argv[0], "bios.cfg");
                 if (!std::filesystem::exists(cfg, ec)) {
