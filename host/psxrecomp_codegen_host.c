@@ -50,6 +50,9 @@ static char g_exe_path[1100];
 static char g_helper_path[1100];
 static char g_cmake_target[256];
 static char g_exe_basename[256];
+/* Why the wizard reopened on a setup host that already generated once; the
+ * launcher keeps the pointer for the life of the window. */
+static char g_stale_note[640];
 static char g_display[128];
 static char g_toolchain_bin[1400];
 /* Last ensure-toolchain JSONL result path (bin/); shared-cache fallback. */
@@ -3744,6 +3747,48 @@ static int host_paths_same_file(const char* a, const char* b) {
  * stale-build test below. */
 static int host_local_game_version(char* out, size_t cap);
 
+/* Is the product build under build-<cfg>/ the one this source tree would
+ * produce?  0 = yes (exe present; version stamp matches, or is unknown).
+ * 1 = no exe.  2 = exe stamped with another version than the VERSION file
+ * next to it (src_ver / built_ver filled in).
+ *
+ * Shared by forward_if_built (never launch a stale binary) and host_apply
+ * (reopen the wizard so the player can rebuild).  They MUST agree: when the
+ * forwarder declines but the wizard stays shut, the launcher opens on an exe
+ * that links no game code, PLAY is enabled, and PLAY ends in the runtime's
+ * "Setup host -- finish Generate & rebuild" dialog with nothing in the UI
+ * that would do so.  Seen on Windows after a rebuild helper console that
+ * was closed or failed (generated/ present, build-release/ empty), and
+ * after extracting a newer setup zip over an install built from the
+ * previous one (stamp mismatch). */
+static int host_product_build_stale(char* src_ver, size_t src_cap,
+                                    char* built_ver, size_t built_cap) {
+    char stamp[1200];
+    if (src_ver && src_cap) src_ver[0] = '\0';
+    if (built_ver && built_cap) built_ver[0] = '\0';
+    if (!g_exe_path[0] || !path_is_file(g_exe_path))
+        return 1;
+    if (!src_ver || !built_ver || src_cap < 2 || built_cap < 2)
+        return 0;
+    (void)host_local_game_version(src_ver, src_cap);
+    if (join_path(stamp, sizeof(stamp), g_build_dir, "psx_game_version.txt")) {
+        FILE* f = fopen(stamp, "rb");
+        if (f) {
+            size_t n = fread(built_ver, 1, built_cap - 1, f);
+            fclose(f);
+            built_ver[n] = '\0';
+            while (n && (built_ver[n - 1] == '\n' || built_ver[n - 1] == '\r' ||
+                         built_ver[n - 1] == ' '  || built_ver[n - 1] == '\t'))
+                built_ver[--n] = '\0';
+        }
+    }
+    /* Only when BOTH are known: a missing stamp is an older layout, not a
+     * stale build, and must not trigger an endless rebuild loop. */
+    if (src_ver[0] && built_ver[0] && strcmp(src_ver, built_ver) != 0)
+        return 2;
+    return 0;
+}
+
 void psxrecomp_codegen_host_forward_if_built(
     const PsxrecompCodegenHostConfig* cfg, int argc, char** argv) {
 #if defined(PSX_HAS_GAME_DISPATCH)
@@ -3802,27 +3847,13 @@ void psxrecomp_codegen_host_forward_if_built(
      * launching 0.2.3 every time, and (because the runtime asks GitHub what
      * the latest release is) nagging to download an update it already had.
      *
-     * Declining to forward drops through to the generate/build path below,
-     * which rebuilds and then forwards to the fresh binary. */
+     * Declining to forward drops through to the generate/build path below
+     * (launcher-less host), or to a launcher whose wizard host_apply reopens
+     * with the same check, so the player is offered the rebuild. */
     {
-        char src_ver[64], built_ver[64], stamp[1200];
-        src_ver[0] = built_ver[0] = '\0';
-        (void)host_local_game_version(src_ver, sizeof(src_ver));
-        if (join_path(stamp, sizeof(stamp), g_build_dir,
-                      "psx_game_version.txt")) {
-            FILE* f = fopen(stamp, "rb");
-            if (f) {
-                size_t n = fread(built_ver, 1, sizeof(built_ver) - 1, f);
-                fclose(f);
-                built_ver[n] = '\0';
-                while (n && (built_ver[n - 1] == '\n' || built_ver[n - 1] == '\r' ||
-                             built_ver[n - 1] == ' '  || built_ver[n - 1] == '\t'))
-                    built_ver[--n] = '\0';
-            }
-        }
-        /* Only when BOTH are known: a missing stamp is an older layout, not a
-         * stale build, and must not trigger an endless rebuild loop. */
-        if (src_ver[0] && built_ver[0] && strcmp(src_ver, built_ver) != 0) {
+        char src_ver[64], built_ver[64];
+        if (host_product_build_stale(src_ver, sizeof(src_ver),
+                                     built_ver, sizeof(built_ver)) == 2) {
             fprintf(stderr,
                     "psxrecomp-codegen: installed sources are %s but the build "
                     "is %s - rebuilding instead of launching the old one\n",
@@ -4516,6 +4547,46 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         gi->needs_setup = 1;
         gi->prepare_required_before_continue = 1;
     }
+#if !defined(PSX_HAS_GAME_DISPATCH)
+    /* Setup host only (a product build can always PLAY itself).  Sources were
+     * generated once, but the product build is missing or belongs to an older
+     * tree, so forward_if_built declined and this process -- which links no
+     * game code -- is what the player is looking at.  Reopen the first-run
+     * page with Generate & rebuild required: it is the only way out of a
+     * setup host, and PLAY would only reach the runtime's "finish Generate &
+     * rebuild" dialog.  Same check as the forwarder, so the two cannot
+     * disagree. */
+    else if (can_rebuild) {
+        char src_ver[64], built_ver[64];
+        const int stale = host_product_build_stale(
+            src_ver, sizeof(src_ver), built_ver, sizeof(built_ver));
+        if (stale == 1) {
+            snprintf(g_stale_note, sizeof(g_stale_note),
+                     "The last Generate & rebuild did not finish: %s/ has no "
+                     "%s. On Windows a separate console window builds after "
+                     "this one closes; if it was closed early or showed an "
+                     "error, run Generate & rebuild again and leave that "
+                     "window open until %s starts.",
+                     cfg_or(cfg->build_dir_name, "build-release"),
+                     g_exe_basename, g_display);
+        } else if (stale == 2) {
+            snprintf(g_stale_note, sizeof(g_stale_note),
+                     "This download is version %s, but the game built next to "
+                     "it is version %s. Run Generate & rebuild once to bring "
+                     "the build up to date; your saves and settings are not "
+                     "touched.",
+                     src_ver, built_ver);
+        }
+        if (stale) {
+            fprintf(stderr,
+                    "psxrecomp-codegen: product build %s - reopening setup\n",
+                    stale == 1 ? "missing" : "stale");
+            gi->prepare_disc_note = g_stale_note;
+            gi->needs_setup = 1;
+            gi->prepare_required_before_continue = 1;
+        }
+    }
+#endif /* !PSX_HAS_GAME_DISPATCH */
 #endif /* PSX_HAS_SETUP_WIZARD */
 }
 #endif /* PSX_HAS_RECOMP_LAUNCHER */
