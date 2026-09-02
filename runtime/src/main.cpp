@@ -12242,7 +12242,8 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                     std::error_code ec;
                     if (std::filesystem::exists(rui_initial_disc, ec)) {
                         const DiscValidation dv =
-                            validate_disc_image(rui_initial_disc, boot.game_id);
+                            validate_disc_image(rui_initial_disc, boot.game_id,
+                                                /*check_content=*/false);
                         disc_ok = dv.opened && dv.has_header;
                     }
                     if (!disc_ok) rui_initial_disc.clear();
