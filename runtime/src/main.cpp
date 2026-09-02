@@ -12036,9 +12036,9 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
              * launcher opens with "No disc selected" and forces a manual pick on
              * every launch. resolve_disc_for_runtime still applies the override
              * authoritatively after the launcher returns. */
-            if (disc_override_path && disc_override_path[0]) {
+            if (boot.disc_override_path && boot.disc_override_path[0]) {
                 std::filesystem::path cli_disc = normalize_disc_path_for_launch(
-                    std::filesystem::path(disc_override_path));
+                    std::filesystem::path(boot.disc_override_path));
                 std::error_code cli_ec;
                 if (std::filesystem::exists(cli_disc, cli_ec))
                     boot.resolved_disc = cli_disc;
@@ -12490,7 +12490,13 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                 SDL_Quit();
                 return LauncherOutcome::Quit;
             }
-#if defined(PSX_HAS_GAME_CODEGEN)
+/* The title's codegen_setup.c compiles these entry points out once the
+ * generated game C exists (its guard: PSX_HAS_SETUP_HOST &&
+ * !PSX_HAS_GAME_DISPATCH), so a dispatch build has no definition to call.
+ * PSX_HAS_GAME_CODEGEN does not imply they link -- every game runtime
+ * defines it. The launcher-less path above already pairs the same guard;
+ * these launcher-path blocks did not, and failed at link. */
+#if defined(PSX_HAS_GAME_CODEGEN) && !defined(PSX_HAS_GAME_DISPATCH)
             if (lr == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
                 const char* disc_for_relaunch =
                     rui_out_disc[0] ? rui_out_disc
@@ -13446,7 +13452,14 @@ int main(int argc, char** argv) {
      * PSX_RECOMP_UI=OFF build (headless/generated) links no definition and
      * previously failed to compile this call. There is no setup-host handoff
      * without the launcher, so skipping it there is the correct behavior. */
-#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER)
+/* The title's codegen_setup.c compiles these entry points out once the
+ * generated game C exists (its guard: PSX_HAS_SETUP_HOST &&
+ * !PSX_HAS_GAME_DISPATCH), so a dispatch build has no definition to call.
+ * PSX_HAS_GAME_CODEGEN does not imply they link -- every game runtime
+ * defines it. The launcher-less path above already pairs the same guard;
+ * these launcher-path blocks did not, and failed at link. */
+#if defined(PSX_HAS_GAME_CODEGEN) && defined(RECOMP_LAUNCHER) && \
+    !defined(PSX_HAS_GAME_DISPATCH)
     psx_game_codegen_forward_if_built(argc, argv);
 #endif
 
@@ -14492,7 +14505,13 @@ soft_return_lobby:
             SDL_Quit();
             return 0;
         }
-#if defined(PSX_HAS_GAME_CODEGEN)
+/* The title's codegen_setup.c compiles these entry points out once the
+ * generated game C exists (its guard: PSX_HAS_SETUP_HOST &&
+ * !PSX_HAS_GAME_DISPATCH), so a dispatch build has no definition to call.
+ * PSX_HAS_GAME_CODEGEN does not imply they link -- every game runtime
+ * defines it. The launcher-less path above already pairs the same guard;
+ * these launcher-path blocks did not, and failed at link. */
+#if defined(PSX_HAS_GAME_CODEGEN) && !defined(PSX_HAS_GAME_DISPATCH)
         if (rui_rc == RECOMP_LAUNCHER_RESULT_RELAUNCH) {
             const char* disc_for_relaunch =
                 rui_out_disc[0] ? rui_out_disc

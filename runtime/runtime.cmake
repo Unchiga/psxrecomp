@@ -1489,6 +1489,15 @@ function(psxrecomp_add_runtime_target target)
             list(APPEND _psx_recomp_ui_args BRAND "${PSXRT_LAUNCHER_BRAND}")
         endif()
         recomp_target_launcher_ui(${target} ${_psx_recomp_ui_args})
+        # Set HERE, beside the call that actually compiles recomp-ui's sources
+        # into the target, because that is the only thing this macro asserts:
+        # the launcher IMPLEMENTATION is linked. PSX_HAS_RECOMP_LAUNCHER is a
+        # different claim -- "recomp_launcher.h is reachable" -- and is keyed
+        # on RECOMP_UI_ROOT alone, which is true whenever the submodule sits on
+        # disk even with PSX_RECOMP_UI=OFF. Conflating the two left the codegen
+        # host dropping its own fallback recomp_launcher_relaunch_exe() while
+        # nothing supplied the real one: an undefined symbol at link.
+        target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_LAUNCHER_IMPL=1)
         target_compile_definitions(${target} PRIVATE
             RECOMP_UI_PSX_HAS_REWIND=$<BOOL:${PSXRECOMP_HAS_RBENGINE_SNAP}>)
     endif()
@@ -1550,9 +1559,52 @@ function(psxrecomp_add_runtime_target target)
     endif()
     find_program(GLSLC_EXE NAMES glslc
         HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    # find_path searches the HOST filesystem, so a hit does not prove the
+    # compiler can reach the header. Two things break that, together:
+    #   * a toolchain carrying its own sysroot (the retcomm clang packs one)
+    #     never looks in the host /usr/include, and
+    #   * CMake unconditionally refuses to emit -I/usr/include, so
+    #     target_include_directories cannot hand it over either.
+    # The old code took the find_path hit as proof, defined PSX_HAVE_VULKAN=1,
+    # and left gpu_vk_renderer.c to fail on a missing vulkan/vulkan.h. Probe
+    # what the compiler actually sees, and only claim Vulkan once a real
+    # compile of the header has succeeded.
+    set(_vk_stage "")
     if(_vk_inc AND GLSLC_EXE)
+        include(CheckIncludeFile)
+        set(_vk_req_save "${CMAKE_REQUIRED_INCLUDES}")
+        set(CMAKE_REQUIRED_INCLUDES "")
+        check_include_file("vulkan/vulkan.h" PSX_VK_HEADER_IMPLICIT)
+        if(NOT PSX_VK_HEADER_IMPLICIT)
+            # Stage a private include dir holding only the Vulkan subtrees.
+            # Adding ${_vk_inc} itself is not an option when it is
+            # /usr/include: CMake drops that, and forcing it via a raw -I
+            # would put host libc headers ahead of the sysroot's for every TU
+            # in this target. vk_video/ is required too -- vulkan_core.h
+            # includes the H.264/H.265 codec headers from it.
+            set(_vk_stage "${CMAKE_CURRENT_BINARY_DIR}/${target}_vkinc")
+            file(MAKE_DIRECTORY "${_vk_stage}")
+            foreach(_vk_sub vulkan vk_video)
+                if(EXISTS "${_vk_inc}/${_vk_sub}")
+                    file(CREATE_LINK "${_vk_inc}/${_vk_sub}"
+                         "${_vk_stage}/${_vk_sub}"
+                         SYMBOLIC COPY_ON_ERROR)
+                endif()
+            endforeach()
+            set(CMAKE_REQUIRED_INCLUDES "${_vk_stage}")
+            check_include_file("vulkan/vulkan.h" PSX_VK_HEADER_STAGED)
+        endif()
+        set(CMAKE_REQUIRED_INCLUDES "${_vk_req_save}")
+    endif()
+    if(_vk_inc AND GLSLC_EXE AND (PSX_VK_HEADER_IMPLICIT OR PSX_VK_HEADER_STAGED))
         message(STATUS "Vulkan backend: headers ${_vk_inc}, glslc ${GLSLC_EXE}")
-        target_include_directories(${target} PRIVATE "${_vk_inc}")
+        if(_vk_stage)
+            message(STATUS "Vulkan backend: staged private include ${_vk_stage} "
+                           "(compiler cannot reach ${_vk_inc} directly)")
+            target_include_directories(${target} PRIVATE "${_vk_stage}")
+        else()
+            target_include_directories(${target} PRIVATE "${_vk_inc}")
+        endif()
         target_compile_definitions(${target} PRIVATE PSX_HAVE_VULKAN=1)
         # Compile every shader under runtime/shaders/ to SPIR-V (glslc) and embed
         # them into one generated header (vk_shaders_spv.h) of uint32_t arrays, so
@@ -1604,6 +1656,14 @@ function(psxrecomp_add_runtime_target target)
         add_custom_target(${target}_vk_shaders DEPENDS "${_vk_spv_hdr}")
         add_dependencies(${target} ${target}_vk_shaders)
         target_include_directories(${target} PRIVATE "${_vk_gen_dir}")
+    elseif(_vk_inc AND GLSLC_EXE)
+        # Found on the host but not compilable -- say which, rather than
+        # reporting the same "not found" as a machine with no Vulkan at all.
+        message(WARNING
+            "Vulkan backend: headers located at ${_vk_inc} but the compiler "
+            "cannot include <vulkan/vulkan.h> (sysroot toolchain?) - "
+            "gpu_vk_renderer.c builds as a software stub. Set VULKAN_SDK to a "
+            "location this toolchain can reach to enable the Vulkan renderer.")
     else()
         message(STATUS "Vulkan backend: PSX_ENABLE_VULKAN=ON but SDK headers/glslc "
                        "not found - gpu_vk_renderer.c builds as a software stub")
@@ -1961,6 +2021,12 @@ function(psxrecomp_add_game_runtime target)
         # and keeps its launcher-facing _apply(). Without this it falls back to
         # psxrecomp_launcher_compat.h, which declares only the progress typedef
         # and the relaunch query -- the whole of what the engine actually uses.
+        #
+        # HEADER REACHABILITY ONLY. The submodule being on disk says nothing
+        # about whether its sources are compiled in -- PSX_RECOMP_UI=OFF leaves
+        # them out entirely. Anything that needs a launcher SYMBOL to exist must
+        # test PSX_HAS_RECOMP_LAUNCHER_IMPL, which is set beside the
+        # recomp_target_launcher_ui() call that adds those sources.
         target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_LAUNCHER=1)
     endif()
     foreach(_psxg_t IN LISTS _psxg_targets)

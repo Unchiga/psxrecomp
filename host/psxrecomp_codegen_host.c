@@ -3869,7 +3869,13 @@ void psxrecomp_codegen_host_forward_if_built(
 #endif /* !PSX_HAS_GAME_DISPATCH */
 }
 
-#if !defined(PSX_HAS_RECOMP_LAUNCHER)
+/* Keyed on _IMPL, not on PSX_HAS_RECOMP_LAUNCHER: that macro only says the
+ * recomp-ui HEADER is reachable, which is true whenever the submodule is on
+ * disk. The definition below must be dropped exactly when recomp-ui's
+ * launcher_ng_capi.c is LINKED (it defines the same symbol), and kept in every
+ * other case -- including PSX_RECOMP_UI=OFF with the submodule present, which
+ * otherwise links nothing at all and fails on an undefined symbol. */
+#if !defined(PSX_HAS_RECOMP_LAUNCHER_IMPL)
 /* Which binary to restart, with no launcher to ask.
  *
  * On Windows a rebuild cannot happen in this process -- the running .exe holds
