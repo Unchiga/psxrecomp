@@ -1550,6 +1550,26 @@ function(psxrecomp_add_runtime_target target)
     endif()
     find_program(GLSLC_EXE NAMES glslc
         HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    # find_path answers "does the file exist", not "can THIS compiler include
+    # it". Those differ under a compiler that carries its own sysroot -- the
+    # portable cmake-clang-v1 pack on Linux -- where find_path lands on the
+    # host's /usr/include/vulkan/vulkan.h, CMake then drops -I/usr/include as
+    # always-implicit, and gpu_vk_renderer.c fails with "file not found" in
+    # the middle of the player's first-run build. Ask the compiler instead; a
+    # header it cannot see means no Vulkan backend, the same as no header.
+    if(_vk_inc AND GLSLC_EXE)
+        include(CheckIncludeFile)
+        set(CMAKE_REQUIRED_INCLUDES "${_vk_inc}")
+        set(CMAKE_REQUIRED_QUIET TRUE)
+        check_include_file("vulkan/vulkan.h" PSX_VK_HEADER_COMPILES)
+        unset(CMAKE_REQUIRED_INCLUDES)
+        unset(CMAKE_REQUIRED_QUIET)
+        if(NOT PSX_VK_HEADER_COMPILES)
+            message(STATUS "Vulkan backend: headers at ${_vk_inc} are not visible "
+                "to ${CMAKE_C_COMPILER} (own sysroot?) - building the inert stub")
+            set(_vk_inc "")
+        endif()
+    endif()
     if(_vk_inc AND GLSLC_EXE)
         message(STATUS "Vulkan backend: headers ${_vk_inc}, glslc ${GLSLC_EXE}")
         target_include_directories(${target} PRIVATE "${_vk_inc}")

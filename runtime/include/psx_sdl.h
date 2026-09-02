@@ -63,6 +63,20 @@ static inline SDL_Renderer *psx_sdl_create_renderer(
     return renderer;
 }
 
+/* A renderer by DRIVER NAME ("software", "opengl", ...), on either backend.
+ * Needed by anything that opens a SECOND window while the game's own GL
+ * renderer owns the first: SDL's GL-backed renderer makes its context current
+ * on every call and never restores the game's, so on platforms where the
+ * default renderer is GL (Linux) each present of the second window steals the
+ * context from the game's -- the second window strobes with game frames and
+ * the game window stops updating. Windows (D3D) and macOS (Metal) never hit
+ * it. Returns NULL when no driver of that name exists; callers fall back. */
+static inline SDL_Renderer *psx_sdl_create_renderer_named(SDL_Window *window,
+                                                          const char *name)
+{
+    return SDL_CreateRenderer(window, name);
+}
+
 static inline int psx_sdl_render_set_logical_size(
     SDL_Renderer *renderer, int w, int h)
 {
@@ -238,5 +252,26 @@ static inline int psx_sdl_cond_wait_timeout(
 #else
 
 #include <SDL.h>
+
+/* A renderer by DRIVER NAME ("software", "opengl", ...), on either backend.
+ * Needed by anything that opens a SECOND window while the game's own GL
+ * renderer owns the first: SDL's GL-backed renderer makes its context current
+ * on every call and never restores the game's, so on platforms where the
+ * default renderer is GL (Linux) each present of the second window steals the
+ * context from the game's -- the second window strobes with game frames and
+ * the game window stops updating. Windows (D3D) and macOS (Metal) never hit
+ * it. Returns NULL when no driver of that name exists; callers fall back. */
+static inline SDL_Renderer *psx_sdl_create_renderer_named(SDL_Window *window,
+                                                          const char *name)
+{
+    const int n = SDL_GetNumRenderDrivers();
+    for (int i = 0; i < n; i++) {
+        SDL_RendererInfo info;
+        if (SDL_GetRenderDriverInfo(i, &info) == 0 && info.name &&
+            SDL_strcmp(info.name, name) == 0)
+            return SDL_CreateRenderer(window, i, 0);
+    }
+    return NULL;
+}
 
 #endif

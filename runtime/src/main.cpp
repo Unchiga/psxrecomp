@@ -1958,6 +1958,64 @@ static std::wstring widen_utf8(const std::string& s) {
 }
 #endif
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
+/* Desktop-native modal for macOS/Linux. SDL's own message box is fine on
+ * macOS (Cocoa), but on Linux under Wayland it needs zenity and otherwise
+ * falls back to a hand-drawn X11 box in a fixed 8px font -- unreadable on a
+ * HiDPI desktop, and the first thing a new player sees. So ask the desktop's
+ * dialog tool first (kdialog on KDE, zenity elsewhere, either as fallback)
+ * and use SDL only when neither exists. Returns 1 for OK/Yes, 0 for No, and
+ * -1 when no tool could be run so the caller falls back to SDL. */
+enum class PosixBoxKind { Info, Warning, Question };
+
+static int run_desktop_dialog(const std::vector<std::string>& argv) {
+    const pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        std::vector<char*> av;
+        for (const std::string& a : argv) av.push_back(const_cast<char*>(a.c_str()));
+        av.push_back(nullptr);
+        execvp(av[0], av.data());
+        _exit(127);   /* tool not on PATH */
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return -1;
+    if (!WIFEXITED(status)) return -1;
+    const int rc = WEXITSTATUS(status);
+    return rc == 127 ? -1 : rc;
+}
+
+static int posix_desktop_messagebox(PosixBoxKind kind, const char* title,
+                                    const std::string& msg) {
+    const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+    const bool kde_first = desktop && std::strstr(desktop, "KDE");
+    auto try_kdialog = [&]() -> int {
+        const char* flag = kind == PosixBoxKind::Info     ? "--msgbox"
+                         : kind == PosixBoxKind::Warning  ? "--sorry"
+                                                          : "--yesno";
+        const int rc = run_desktop_dialog({"kdialog", "--title", title, flag, msg});
+        if (rc < 0) return -1;
+        return kind == PosixBoxKind::Question ? (rc == 0 ? 1 : 0) : 1;
+    };
+    auto try_zenity = [&]() -> int {
+        const char* flag = kind == PosixBoxKind::Info     ? "--info"
+                         : kind == PosixBoxKind::Warning  ? "--warning"
+                                                          : "--question";
+        const int rc = run_desktop_dialog({"zenity", flag, "--title", title,
+                                           "--text", msg});
+        if (rc < 0) return -1;
+        return kind == PosixBoxKind::Question ? (rc == 0 ? 1 : 0) : 1;
+    };
+    int r = kde_first ? try_kdialog() : try_zenity();
+    if (r < 0) r = kde_first ? try_zenity() : try_kdialog();
+    return r;
+}
+#endif
+
 static void launcher_warning(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
@@ -1966,6 +2024,13 @@ static void launcher_warning(const char* title, const std::string& msg) {
     if (!g_headless)
         MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
                     widen_utf8(title).c_str(), MB_OK | MB_ICONWARNING);
+#elif defined(PSX_SDL3)
+    // macOS / Linux: the same modal, so a player who launched from a desktop
+    // icon (no terminal) still sees why the first run stopped.
+    if (!g_headless &&
+        posix_desktop_messagebox(PosixBoxKind::Warning, title, msg) < 0)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, title, msg.c_str(),
+                                 sdl_window);
 #endif
 }
 
@@ -1975,6 +2040,11 @@ static void launcher_info(const char* title, const std::string& msg) {
     if (!g_headless)
         MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
                     widen_utf8(title).c_str(), MB_OK | MB_ICONINFORMATION);
+#elif defined(PSX_SDL3)
+    if (!g_headless &&
+        posix_desktop_messagebox(PosixBoxKind::Info, title, msg) < 0)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, title, msg.c_str(),
+                                 sdl_window);
 #endif
 }
 
@@ -1988,6 +2058,23 @@ static bool launcher_confirm(const char* title, const std::string& msg) {
     return MessageBoxW(launcher_dialog_owner(), widen_utf8(msg).c_str(),
                        widen_utf8(title).c_str(),
                        MB_YESNO | MB_ICONQUESTION) == IDYES;
+#elif defined(PSX_SDL3)
+    if (g_headless) return false;
+    {
+        const int r = posix_desktop_messagebox(PosixBoxKind::Question, title, msg);
+        if (r >= 0) return r == 1;
+    }
+    const SDL_MessageBoxButtonData buttons[] = {
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No"  },
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes" },
+    };
+    const SDL_MessageBoxData box = {
+        SDL_MESSAGEBOX_INFORMATION, sdl_window, title, msg.c_str(),
+        (int)(sizeof(buttons) / sizeof(buttons[0])), buttons, nullptr
+    };
+    int clicked = 0;
+    if (!SDL_ShowMessageBox(&box, &clicked)) return false;
+    return clicked == 1;
 #else
     return false;
 #endif
@@ -2066,10 +2153,88 @@ static bool pick_runtime_file(const char* title, const char* filter,
     if (!GetOpenFileNameW(&ofn)) return false;
     out = std::filesystem::path(path_buf.data());
     return true;
+#elif defined(PSX_SDL3)
+    // macOS / Linux: SDL3's native open-file dialog (Cocoa panel, or the
+    // xdg-desktop-portal / zenity chooser on Linux). It is asynchronous and
+    // its callback may arrive on another thread, so publish the result
+    // through an atomic and pump events while waiting: the launcher window,
+    // when there is one, stays responsive behind the modal.
+    //
+    // The filter comes in Win32 form -- NUL-separated "Name\0*.a;*.b\0" pairs,
+    // double-NUL terminated -- and SDL3 wants {name, "a;b"} with "*" for all.
+    struct Filter { std::string name, pattern; };
+    std::vector<Filter> filters;
+    if (filter) {
+        size_t i = 0;
+        while (filter[i] != '\0') {
+            std::string name(filter + i);
+            i += name.size() + 1;
+            if (filter[i] == '\0') break;
+            std::string win(filter + i);
+            i += win.size() + 1;
+            std::string pat;
+            size_t start = 0;
+            while (start <= win.size()) {
+                size_t semi = win.find(';', start);
+                std::string ext = win.substr(start, semi == std::string::npos
+                                                        ? std::string::npos
+                                                        : semi - start);
+                if (ext == "*.*" || ext == "*") { pat = "*"; break; }
+                if (ext.compare(0, 2, "*.") == 0) ext.erase(0, 2);
+                if (!ext.empty()) { if (!pat.empty()) pat += ';'; pat += ext; }
+                if (semi == std::string::npos) break;
+                start = semi + 1;
+            }
+            if (!pat.empty()) filters.push_back({name, pat});
+        }
+    }
+    std::vector<SDL_DialogFileFilter> sdl_filters;
+    sdl_filters.reserve(filters.size());
+    for (const Filter& f : filters)
+        sdl_filters.push_back({f.name.c_str(), f.pattern.c_str()});
+
+    // The dialog needs the video subsystem; the launch-time BIOS/disc prompts
+    // run before the window exists, so bring it up here if nobody has yet.
+    // (psx_sdl.h keeps SDL2's convention: SDL_InitSubSystem returns 0 on success.)
+    if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        std::fprintf(stderr,
+            "psxrecomp: cannot open a file dialog (SDL video init failed: %s) — '%s'\n"
+            "  Supply it on the command line:  %s <path>   (or set it in game.toml).\n",
+            SDL_GetError(), title, cli_flag);
+        return false;
+    }
+
+    struct PickState {
+        std::atomic<int> done{0};      // 0 pending, 1 picked, 2 cancelled/error
+        std::string      path;
+    } state;
+    SDL_ShowOpenFileDialog(
+        [](void* ud, const char* const* list, int /*filter_idx*/) {
+            PickState* st = static_cast<PickState*>(ud);
+            if (list && list[0] && list[0][0]) {
+                st->path = list[0];
+                st->done.store(1, std::memory_order_release);
+            } else {
+                if (!list)
+                    std::fprintf(stderr, "psxrecomp: file dialog failed: %s\n",
+                                 SDL_GetError());
+                st->done.store(2, std::memory_order_release);
+            }
+        },
+        &state, sdl_window, sdl_filters.empty() ? nullptr : sdl_filters.data(),
+        (int)sdl_filters.size(), nullptr, false);
+    (void)title;  // SDL3 has no dialog-title parameter; the filter names carry it
+    while (state.done.load(std::memory_order_acquire) == 0) {
+        SDL_PumpEvents();
+        SDL_Delay(10);
+    }
+    if (state.done.load(std::memory_order_acquire) != 1) return false;
+    out = std::filesystem::path(state.path);
+    return true;
 #else
     (void)filter;
     (void)out;
-    // No native GUI file picker on this platform (macOS/Linux): the file must be
+    // SDL2 fallback build on macOS/Linux: no GUI picker, so the file must be
     // named on the command line. Tell the user the exact flag + a full example
     // instead of a dead-end "requires a command-line path".
     std::fprintf(stderr,
@@ -6044,6 +6209,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * the debug server records the frame, and outside the debug guard, so a
      * title's rings carry the same frame stamp in every build. */
     psx_game_run_vblank_hooks();
+    /* A title hook may have driven another window's renderer (see
+     * gl_renderer_reclaim_context); take the game's GL context back before
+     * anything below touches GL. */
+    if (g_gl_active) gl_renderer_reclaim_context();
 
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
@@ -6383,8 +6552,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 }
             }
         }
+        /* Event hooks and menu rows can open or drive a second window; the game's
+         * GL context must be current again before emulation resumes. */
+        if (g_gl_active) gl_renderer_reclaim_context();
         /* Whatever this title registered for itself. */
         psx_game_run_frame_hooks();
+        if (g_gl_active) gl_renderer_reclaim_context();
         /* Drives the menu's hover-to-open dwell; the module keeps no clock. */
         psx_video_menu_tick((unsigned int)SDL_GetTicks());
         /* A newer release, if the background check found one. Polled once a

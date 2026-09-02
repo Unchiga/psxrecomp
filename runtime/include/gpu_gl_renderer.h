@@ -96,6 +96,11 @@ void gl_renderer_get_present_native_size(int *w, int *h);
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
+/* Restore the game's GL context if a foreign one (another window's SDL
+ * renderer) is current on this thread. Cheap when nothing changed. Called by
+ * the runtime after the title's hooks and after SDL event dispatch. */
+void gl_renderer_reclaim_context(void);
+
 /* §33: re-present the last Live frame captured before Swap (or from a VRAM
  * snapshot when interpolation owned the last present). Used during rollback
  * resim so the window keeps a wall-clock present cadence without reading

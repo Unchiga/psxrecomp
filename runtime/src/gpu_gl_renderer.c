@@ -3055,6 +3055,27 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     s_last_present_path = GL_PRES_CPU;
 }
 
+/* Make the game's context current again if something else took it.
+ *
+ * Anything that drives an SDL_Renderer on ANOTHER window from the game thread
+ * -- a title's second window, such as the Drop Table Manager -- makes that
+ * renderer's GL context current and never restores ours. It is not enough to
+ * ask that window for the "software" renderer: on Wayland SDL has no native
+ * window framebuffer and emulates one over an internal GL renderer, so a GL
+ * context on the other window appears regardless. Windows (D3D) and macOS
+ * (Metal) never take the context, which is why this only ever showed on Linux:
+ * the game window froze on its last frame while the other window strobed.
+ *
+ * Only a FOREIGN context is reclaimed. The interpolation context is ours and
+ * may legitimately be current on this thread during an interp handoff. */
+void gl_renderer_reclaim_context(void) {
+    if (!s_ctx || !s_win) return;
+    const SDL_GLContext cur = SDL_GL_GetCurrentContext();
+    if (cur == s_ctx) return;
+    if (s_interp_ctx && cur == s_interp_ctx) return;
+    SDL_GL_MakeCurrent(s_win, s_ctx);
+}
+
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
     interp_reset_history();

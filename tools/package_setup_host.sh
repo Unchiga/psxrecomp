@@ -382,16 +382,38 @@ else
   BIOS_HINT=" A retail SCPH-1001 BIOS dump is optional; otherwise OpenBIOS is regenerated locally."
 fi
 
+# The readme names paths and the launch command the way the player's platform
+# does. A Windows host is the .exe; anything else is a Unix host.
+if [[ "${EXE_BASENAME}" == *.exe ]]; then
+  RUN_CMD="${EXE_BASENAME}"
+  SAVE_DIR="Documents\\My Games\\${DISPLAY_NAME}"
+  SAVES_SUB="saves\\                 (or the openbios\\ folder inside it: save states)"
+  UNIX_NOTE=""
+else
+  RUN_CMD="./${EXE_BASENAME}"
+  SAVE_DIR="~/Documents/My Games/${DISPLAY_NAME}"
+  SAVES_SUB="saves/                 (or the openbios/ folder inside it: save states)"
+  UNIX_NOTE="
+Linux / macOS: extract with unzip (or your file manager) so the executable
+bits survive; if the host will not run, chmod +x it. The build uses your
+system compiler, cmake and ninja when present -- on Arch:
+    sudo pacman -S cmake ninja python
+on Debian/Ubuntu:
+    sudo apt install build-essential cmake ninja-build python3
+-- and downloads a portable cmake/clang pack when they are missing.
+"
+fi
+
 cat >"${STAGE}/README-SETUP.txt" <<EOF
 ${DISPLAY_NAME} ${VERSION} — setup package
 Platform: ${ARTIFACT}
-
+${UNIX_NOTE}
 One zip for first install and updates. Does NOT include disc images, retail
 BIOS dumps, pre-generated game C, or a portable cmake/clang pack. Emitters
 (psxrecomp-game / psxrecomp-bios) and the CLI are inside psxrecomp/.
 
 Standalone:
-1. Run ${EXE_BASENAME}. Nothing needs installing first -- the setup brings
+1. Run ${RUN_CMD}. Nothing needs installing first -- the setup brings
    its own compiler and its own Python, and uses yours if you have them.
 2. Provide ${DISC_HINT}.${BIOS_HINT}
 3. ${STEP4}
@@ -412,7 +434,7 @@ YOUR SAVES ARE NOT IN THIS FOLDER
 
 Memory cards, save states and your settings live in
 
-    Documents\\My Games\\${DISPLAY_NAME}
+    ${SAVE_DIR}
 
 so updating cannot touch them. Extract a new version wherever you like --
 over the top of the old one or into a brand new folder -- and your saves
@@ -429,10 +451,10 @@ If you instead extracted into a brand new folder, the game cannot see your
 old saves, because they are still sitting in the old folder. Nothing is
 gone. Copy these from the OLD game folder into
 
-    Documents\\My Games\\${DISPLAY_NAME}
+    ${SAVE_DIR}
 
     card1.mcd, card2.mcd   (memory cards)
-    saves\\                 (or the openbios\\ folder inside it: save states)
+    ${SAVES_SUB}
 
 After that first launch, this no longer applies: your saves are outside the
 game folder for good, and any later update can be extracted anywhere.
@@ -462,8 +484,34 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
     powershell.exe -NoProfile -NonInteractive -Command \
       "Compress-Archive -Path '.\\*' -DestinationPath '$(cygpath -w "${DIST}/${ZIP_NAME}" 2>/dev/null || echo "${DIST}/${ZIP_NAME}")' -Force" \
       || { echo "error: Compress-Archive failed" >&2; exit 1; }
+  elif command -v python3 >/dev/null 2>&1; then
+    # Linux/macOS hosts commonly lack `zip` (Arch, Fedora minimal, fresh
+    # macOS). Python is already a hard requirement of the setup flow, so use
+    # its zipfile module -- and store the Unix mode bits explicitly, which the
+    # module does not do on its own: without them the extracted host and the
+    # emitters are not executable and the player's first run dies on
+    # "permission denied".
+    rm -f "${DIST}/${ZIP_NAME}"
+    python3 - "${DIST}/${ZIP_NAME}" <<'PYZIP' || { echo "error: python zipfile failed" >&2; exit 1; }
+import os, stat, sys, zipfile
+out = sys.argv[1]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk("."):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            arc = os.path.relpath(path, ".")
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                continue  # no symlinks in a release stage
+            zi = zipfile.ZipInfo.from_file(path, arc)
+            zi.external_attr = (stat.S_IMODE(st.st_mode) | stat.S_IFREG) << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            with open(path, "rb") as f:
+                zf.writestr(zi, f.read())
+PYZIP
   else
-    echo "error: no zip, 7z, or powershell.exe available to build the archive" >&2
+    echo "error: no zip, 7z, powershell.exe, or python3 available to build the archive" >&2
     exit 1
   fi
 )
