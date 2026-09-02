@@ -11727,6 +11727,55 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
  * it would let a resident DLL load run against a torn-down runtime. */
 enum class LauncherOutcome { Boot, Quit, Failed };
 
+/* SDL controller-backend hints. Process-wide and idempotent, so this is
+ * called from BOTH places that may SDL_Init: the launcher session (which
+ * on a PSX_RECOMP_UI build initialises SDL long before the game window) and
+ * open_game_window(). It used to live only in the latter, so a launcher
+ * build paid the DirectInput enumeration this block exists to avoid:
+ * measured 40.4 s between host:before_sdl_init and host:after_sdl_init
+ * on the boot-timing trace, with everything else in the launcher summing
+ * to under a second. Same stall the runtime already fixed for the game
+ * window (see the DIRECTINPUT comment below), reached by another door. */
+static void apply_controller_backend_hints(void) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
+     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
+     * as a game controller rather than a raw HID device. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+    /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
+     * it also preserves DualSense rumble on the explicit SDL2 fallback. */
+    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
+                            SDL_HINT_OVERRIDE);
+    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
+     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
+     * Xbox One/Series controller would be claimed by nobody -> not a GameController
+     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
+     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    /* ...and DirectInput, which SDL enables by default on Windows, is then
+     * pure cost. Every backend this block actually relies on is HIDAPI:
+     * Xbox pads just above, DualSense by HIDAPI's own default, Steam's
+     * virtual pad by the HIDAPI preference two hints up. RAWINPUT is
+     * already off. Nothing here needs DirectInput to find a controller.
+     *
+     * What it costs is the whole startup. DirectInput enumerates by asking
+     * every HID device on the machine for its product string, on the main
+     * thread, before the window opens -- and one device that answers slowly
+     * stalls the lot. Measured here at over fifty seconds on an i7-13700K,
+     * blocked in ZwDeviceIoControlFile under HidD_GetProductString, with the
+     * guest at frame 0 and zero instructions dispatched. It also tripped the
+     * freeze heartbeat, so every launch littered the install folder with
+     * psx_freeze_dump_*.json.
+     *
+     * A DEFAULT, not a decree: an SDL_JOYSTICK_DIRECTINPUT already in the
+     * environment wins, so anyone whose pad genuinely needs DirectInput can
+     * turn it back on without a rebuild. SDL_SetHint would otherwise
+     * override the environment rather than defer to it. */
+    if (!SDL_getenv(SDL_HINT_JOYSTICK_DIRECTINPUT))
+        SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+}
+
 static LauncherOutcome run_launcher_session(int argc, char** argv,
                                             PsxBootConfig& boot) {
     /* Deferred overlay-cache warmup; joined before the runtime starts. */
@@ -11890,6 +11939,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
         (!std::getenv("PSX_NO_LAUNCHER") && !boot.force_no_launcher && !boot.skip_launcher_setting);
     if (want_launcher) {
         launcher_boot_timing_mark("host:before_sdl_init");
+        apply_controller_backend_hints();
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             launcher_boot_timing_mark("host:after_sdl_init");
             recomp_launcher_set_preserve_sdl(1);
@@ -11999,6 +12049,21 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                                      found.string().c_str());
                     }
                 }
+            }
+            /* The launcher seeds its disc from the settings.toml beside THIS
+             * exe. After first-run Generate & rebuild the product lives in
+             * build-release/ with a settings.toml of its own, so the disc the
+             * wizard just verified is not in it and the player was asked for
+             * the same disc a second time. The setup host does leave disc.cfg
+             * beside the product exe (and the player data dir keeps one), so
+             * fall back to that. resolve_disc_for_runtime() still runs the
+             * authoritative gate after the launcher returns. */
+            if (boot.resolved_disc.empty() && !boot.disc_override_path) {
+                const std::filesystem::path cached =
+                    read_cached_path(argv[0], "disc.cfg");
+                std::error_code cec;
+                if (!cached.empty() && std::filesystem::exists(cached, cec))
+                    boot.resolved_disc = normalize_disc_path_for_launch(cached);
             }
             if (!boot.resolved_disc.empty())    { seed.disc_path = boot.resolved_disc; seed.has_disc_path = true; }
             seed.memcard_dir = boot.memcard_dir;          seed.has_memcard_dir = true;
@@ -13059,43 +13124,10 @@ static bool open_game_window(char** argv, PsxBootConfig& boot) {
      * antialiasing is on so the (super)sampled frame stays smooth when the
      * window is resized; nearest preserves crisp pixels otherwise. */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
-     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
-     * as a game controller rather than a raw HID device. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
-    /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
-     * it also preserves DualSense rumble on the explicit SDL2 fallback. */
-    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
-                            SDL_HINT_OVERRIDE);
-    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
-     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
-     * Xbox One/Series controller would be claimed by nobody -> not a GameController
-     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
-     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
-    /* ...and DirectInput, which SDL enables by default on Windows, is then
-     * pure cost. Every backend this block actually relies on is HIDAPI:
-     * Xbox pads just above, DualSense by HIDAPI's own default, Steam's
-     * virtual pad by the HIDAPI preference two hints up. RAWINPUT is
-     * already off. Nothing here needs DirectInput to find a controller.
-     *
-     * What it costs is the whole startup. DirectInput enumerates by asking
-     * every HID device on the machine for its product string, on the main
-     * thread, before the window opens -- and one device that answers slowly
-     * stalls the lot. Measured here at over fifty seconds on an i7-13700K,
-     * blocked in ZwDeviceIoControlFile under HidD_GetProductString, with the
-     * guest at frame 0 and zero instructions dispatched. It also tripped the
-     * freeze heartbeat, so every launch littered the install folder with
-     * psx_freeze_dump_*.json.
-     *
-     * A DEFAULT, not a decree: an SDL_JOYSTICK_DIRECTINPUT already in the
-     * environment wins, so anyone whose pad genuinely needs DirectInput can
-     * turn it back on without a rebuild. SDL_SetHint would otherwise
-     * override the environment rather than defer to it. */
-    if (!SDL_getenv(SDL_HINT_JOYSTICK_DIRECTINPUT))
-        SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+    /* Controller backend hints. Shared with the launcher session, which
+     * initialises SDL first on a launcher build -- see
+     * apply_controller_backend_hints() for why they must precede it. */
+    apply_controller_backend_hints();
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
