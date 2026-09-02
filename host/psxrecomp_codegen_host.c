@@ -3393,9 +3393,48 @@ static int host_prepare_generate(const char* source_path, char* out_path,
 }
 
 #if defined(_WIN32)
+/* cmd.exe decodes a batch file in the CONSOLE code page (CP850 on a Brazilian
+ * Portuguese Windows, CP437 on a US one), but every path this host holds is
+ * in the process ANSI page. The two agree on ASCII and on nothing else, so a
+ * user name with an accent (C:\Users\Usuário\...\python.exe) came back from
+ * cmd as a path that does not exist: "cannot find the path specified" right
+ * after "Ensuring toolchain...", one step from the end of the player's first
+ * run. Converting to the OEM page does not help either -- the runtime's
+ * manifest makes this process's OEM page UTF-8 too, and measured on a US
+ * machine even system-OEM bytes failed. What works everywhere is to make the
+ * batch file self-describing: write UTF-8 and open it with "chcp 65001", so
+ * cmd re-reads every following line as UTF-8 regardless of the console's
+ * default. bat_utf8() is the identity under the manifest (ANSI page already
+ * UTF-8) and a real conversion on a build without it. */
+static const char* bat_utf8(const char* ansi, char* buf, size_t cap) {
+    if (!ansi) return "";
+    if (cap == 0) return ansi;
+    wchar_t wide[2048];
+    int wn = MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide,
+                                 (int)(sizeof(wide) / sizeof(wide[0])));
+    if (wn <= 0) {
+        snprintf(buf, cap, "%s", ansi);
+        return buf;
+    }
+    int on = WideCharToMultiByte(CP_UTF8, 0, wide, -1, buf, (int)cap,
+                                 NULL, NULL);
+    if (on <= 0) {
+        snprintf(buf, cap, "%s", ansi);
+        return buf;
+    }
+    return buf;
+}
+
+/* First lines of every helper. chcp before anything that names a path. */
+static void bat_write_header(FILE* f) {
+    fprintf(f, "@echo off\r\n");
+    fprintf(f, "chcp 65001 >NUL\r\n");
+}
+
 static void bat_write_set(FILE* f, const char* name, const char* value) {
+    char utf8[2048];
     fprintf(f, "set \"%s=", name);
-    for (const char* p = value; *p; ++p) {
+    for (const char* p = bat_utf8(value, utf8, sizeof(utf8)); *p; ++p) {
         if (*p == '%')
             fputc('%', f);
         fputc(*p, f);
@@ -3429,7 +3468,7 @@ static int write_windows_deferred_rebuild_helper(int force_pgo,
     char pid_buf[32];
     snprintf(pid_buf, sizeof(pid_buf), "%lu",
              (unsigned long)GetCurrentProcessId());
-    fprintf(f, "@echo off\r\n");
+    bat_write_header(f);
     fprintf(f, "setlocal EnableExtensions\r\n");
     fprintf(f, "title %s - %s\r\n", g_display,
             force_pgo ? "PGO optimize" : "rebuilding");
@@ -4124,22 +4163,26 @@ static int host_write_update_helper(const char* zip_path, char* err_msg,
         snprintf(err_msg, err_cap, "Could not write %s.", g_helper_path);
         return 0;
     }
-    fprintf(f, "@echo off\r\n");
+    bat_write_header(f);
     fprintf(f, "setlocal EnableExtensions\r\n");
     fprintf(f, "title %s - updating\r\n", g_display);
     fprintf(f, "set \"PARENT_PID=%lu\"\r\n",
             (unsigned long)GetCurrentProcessId());
-    fprintf(f, "set \"ROOT=%s\"\r\n", g_project_root);
-    fprintf(f, "set \"ZIP=%s\"\r\n", zip_path);
-    fprintf(f, "set \"PYTHON=%s\"\r\n", g_python);
-    fprintf(f, "set \"CLI=%s\"\r\n", g_cli_path);
-    fprintf(f, "set \"CONFIG=%s\"\r\n", g_game_toml);
-    fprintf(f, "set \"BUILD_DIR=%s\"\r\n", g_build_dir);
-    fprintf(f, "set \"TARGET=%s\"\r\n", g_cmake_target);
-    fprintf(f, "set \"EXE_BASE=%s\"\r\n", g_exe_basename);
-    fprintf(f, "set \"EXE=%s\"\r\n", exe_dir);
-    if (g_toolchain_bin[0])
-        fprintf(f, "set \"PATH=%s;%%PATH%%\"\r\n", g_toolchain_bin);
+    /* Paths go through bat_write_set: see bat_utf8() for why raw bytes in a
+     * .cmd break on any non-ASCII user name. */
+    bat_write_set(f, "ROOT", g_project_root);
+    bat_write_set(f, "ZIP", zip_path);
+    bat_write_set(f, "PYTHON", g_python);
+    bat_write_set(f, "CLI", g_cli_path);
+    bat_write_set(f, "CONFIG", g_game_toml);
+    bat_write_set(f, "BUILD_DIR", g_build_dir);
+    bat_write_set(f, "TARGET", g_cmake_target);
+    bat_write_set(f, "EXE_BASE", g_exe_basename);
+    bat_write_set(f, "EXE", exe_dir);
+    if (g_toolchain_bin[0]) {
+        bat_write_set(f, "TC_BIN", g_toolchain_bin);
+        fprintf(f, "set \"PATH=%%TC_BIN%%;%%PATH%%\"\r\n");
+    }
     fprintf(f, "echo Waiting for %s to exit...\r\n", g_display);
     fprintf(f, ":waitloop\r\n");
     fprintf(f, "tasklist /FI \"PID eq %%PARENT_PID%%\" 2>NUL | "

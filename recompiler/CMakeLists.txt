@@ -81,7 +81,56 @@ set(PSXRECOMP_GAME_SOURCES
     src/main_psx.cpp
 )
 
+# --- Windows: UTF-8 as the process ANSI code page for the emitters ----------
+# The emitters take their paths from argv and game.toml as narrow strings and
+# hand them to std::filesystem, which on MinGW's libstdc++ decodes narrow paths
+# as UTF-8. argv arrives in the user's ANSI page, so a project root with an
+# accent (C:\Users\Usuário\...) throws "Cannot convert character sequence:
+# Illegal byte sequence" and psxrecomp-game dies with exit 3 before it has
+# read a byte -- which the setup host reports as "generate failed (exit 1)".
+# Declaring activeCodePage=UTF-8 (Windows 10 1903+) makes argv, fopen and the
+# "A" Win32 calls all speak UTF-8, so libstdc++'s assumption becomes true.
+# Same manifest the runtime embeds (see runtime/runtime.cmake).
+function(psxrecomp_add_utf8_manifest target)
+    if(NOT WIN32)
+        return()
+    endif()
+    enable_language(RC)
+    if(NOT CMAKE_RC_COMPILER)
+        find_program(CMAKE_RC_COMPILER
+            NAMES llvm-rc llvm-windres windres
+            HINTS "$ENV{RETCOMM_TOOLCHAIN}/bin" "$ENV{CMAKE_CLANG_V1}/bin"
+            DOC "Windows resource compiler for the app manifest")
+    endif()
+    if(NOT CMAKE_RC_COMPILER)
+        message(WARNING
+            "${target}: no RC compiler (llvm-rc/windres) - no UTF-8 manifest; "
+            "project paths with non-ASCII characters will fail")
+        return()
+    endif()
+    set(_m "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8.manifest")
+    file(WRITE "${_m}"
+"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">
+  <assemblyIdentity type=\"win32\" name=\"psxrecomp.${target}\" version=\"1.0.0.0\"/>
+  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">
+    <windowsSettings>
+      <activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
+")
+    string(REPLACE "\\" "/" _m_fwd "${_m}")
+    set(_rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8_manifest.rc")
+    # 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST (numeric so
+    # windres and llvm-rc both accept it without winuser.h).
+    file(WRITE "${_rc}" "1 24 \"${_m_fwd}\"\n")
+    target_sources(${target} PRIVATE "${_rc}")
+    message(STATUS "${target}: app manifest activeCodePage=UTF-8 (RC=${CMAKE_RC_COMPILER})")
+endfunction()
+
 add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
+psxrecomp_add_utf8_manifest(psxrecomp-game)
 target_include_directories(psxrecomp-game PRIVATE
     include
     lib/rabbitizer/include
@@ -192,6 +241,7 @@ add_executable(psxrecomp-bios
     src/recompiler_patch.cpp
     src/main_bios.cpp
 )
+psxrecomp_add_utf8_manifest(psxrecomp-bios)
 target_include_directories(psxrecomp-bios PRIVATE
     include
     src

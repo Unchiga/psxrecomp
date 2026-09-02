@@ -980,6 +980,54 @@ function(psxrecomp_add_runtime_target target)
             set(PSXRT_APP_ICON "${PSXRECOMP_ROOT}/assets/psxrecomp.ico")
         endif()
     endif()
+    # --- Windows: UTF-8 as the process ANSI code page ------------------------
+    # The runtime carries its paths as UTF-8 (SDL hands them over that way, and
+    # std::filesystem on MinGW assumes it) but opens files through the narrow C
+    # runtime and the "A" Win32 APIs, which decode in the user's ANSI page. On
+    # a US install the two agree on every character a path is likely to hold;
+    # on a Brazilian, Spanish, German... install they agree on ASCII only, and
+    # a game folder or user name with an accent (C:\Users\Usuário\...) makes
+    # game_options.toml unreadable, generate fail, or the host crash at boot.
+    # Rather than audit every fopen, declare activeCodePage=UTF-8 in the app
+    # manifest (Windows 10 1903+): the whole process then agrees on UTF-8. The
+    # codegen host's batch writers convert from CP_ACP, so they follow along.
+    # Kept out of the APP_ICON block so a title with no icon still gets it.
+    if(WIN32)
+        enable_language(RC)
+        if(NOT CMAKE_RC_COMPILER)
+            find_program(CMAKE_RC_COMPILER
+                NAMES llvm-rc llvm-windres windres
+                HINTS
+                    "$ENV{RETCOMM_TOOLCHAIN}/bin"
+                    "$ENV{CMAKE_CLANG_V1}/bin"
+                DOC "Windows resource compiler for the app manifest / icon")
+        endif()
+        if(CMAKE_RC_COMPILER)
+            set(_psxrt_manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8.manifest")
+            file(WRITE "${_psxrt_manifest}"
+"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">
+  <assemblyIdentity type=\"win32\" name=\"psxrecomp.${target}\" version=\"1.0.0.0\"/>
+  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">
+    <windowsSettings>
+      <activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
+")
+            string(REPLACE "\\" "/" _psxrt_manifest_fwd "${_psxrt_manifest}")
+            set(_psxrt_manifest_rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8_manifest.rc")
+            # 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST. Numeric
+            # so windres and llvm-rc both take it without a winuser.h include.
+            file(WRITE "${_psxrt_manifest_rc}" "1 24 \"${_psxrt_manifest_fwd}\"\n")
+            target_sources(${target} PRIVATE "${_psxrt_manifest_rc}")
+            message(STATUS "psxrecomp ${target}: app manifest activeCodePage=UTF-8 (RC=${CMAKE_RC_COMPILER})")
+        else()
+            message(WARNING
+                "psxrecomp ${target}: no RC compiler (llvm-rc/windres) — no UTF-8 "
+                "manifest; paths with non-ASCII characters will not work")
+        endif()
+    endif()
     if(PSXRT_APP_ICON AND EXISTS "${PSXRT_APP_ICON}")
         if(WIN32)
             # clang/llvm-mingw CI needs an RC compiler or the .rc is ignored and

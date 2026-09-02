@@ -478,7 +478,7 @@ def ensure_emitters(
         "psxrecomp-bios",
     ]
     progress.log(" ".join(build_cmd))
-    proc = subprocess.run(build_cmd, capture_output=True, text=True)
+    proc = subprocess.run(build_cmd, capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -592,6 +592,7 @@ def regen_bios_profile(
         cwd=str(fw),
         capture_output=True,
         text=True,
+        errors="replace",
     )
     for stream in (proc.stdout, proc.stderr):
         if not stream:
@@ -705,7 +706,22 @@ def run_prepare_disc(
         str(project_root),
         str(source),
     ]
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    # Pin BOTH ends of the pipe to UTF-8. The child's stdout encoding is
+    # whatever Python picks for a pipe on that machine, and text=True decodes
+    # with the locale's ANSI page; when the two disagree, a project root with
+    # an accent in it comes back as "UsuA~rio"-style mojibake, the RESULT_CUE
+    # path below points at a folder that does not exist, and the whole
+    # generate fails with nothing more specific than "exit 1".
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        cmd,
+        cwd=str(project_root),
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
     out = (proc.stdout or "") + (proc.stderr or "")
     for line in out.splitlines():
         if line.strip():
@@ -909,6 +925,7 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
         cwd=str(project_root),
         capture_output=True,
         text=True,
+        errors="replace",
     )
     ri_warn = 0
     for stream in (proc.stdout, proc.stderr):
@@ -1080,7 +1097,7 @@ def _cmake_configure(
         *extra,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1110,7 +1127,7 @@ def _cmake_build(
         target,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1267,6 +1284,7 @@ def run_pgo_train(
                     ["xcrun", "--find", "llvm-profdata"],
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     check=False,
                 )
                 if r.returncode == 0 and r.stdout.strip():
