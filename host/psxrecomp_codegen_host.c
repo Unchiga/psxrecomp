@@ -57,6 +57,10 @@ static char g_display[128];
 static char g_toolchain_bin[1400];
 /* Last ensure-toolchain JSONL result path (bin/); shared-cache fallback. */
 static char g_cli_toolchain_bin[1400];
+/* The last {"event":"error"} the CLI reported. "generate failed (exit 1)" on
+ * its own sent players guessing between the disc, the path and the toolchain;
+ * the CLI knows the reason and says it, so the dialog repeats it. */
+static char g_cli_last_error[480];
 static int g_ready;
 static int g_relaunch_is_helper;
 /* Wizard BIOS pick (survives cwd-relative bios.cfg misses on Windows). */
@@ -66,6 +70,11 @@ static char g_tc_repair_note[320];
 /* Set when host_persist_setup receives an explicit bios_path (including ""
  * for OpenBIOS). Distinguishes intentional OpenBIOS clear from "unset". */
 static int g_wizard_bios_explicit;
+
+/* cfg->openbios_only: the title runs the bundled OpenBIOS and nothing else. */
+static int host_openbios_only(void) {
+    return g_cfg && g_cfg->openbios_only;
+}
 
 static const char* cfg_or(const char* v, const char* d) {
     return (v && v[0]) ? v : d;
@@ -1308,6 +1317,12 @@ static int resolve_bios_arg(char* out, size_t cap) {
     char cand[1100];
     char line[1100];
     char abs[1100];
+    if (host_openbios_only()) {
+        /* Not "no pick yet" -- there is nothing to pick. A dump beside the
+         * install or a stale bios.cfg must not turn into --bios. */
+        out[0] = '\0';
+        return 0;
+    }
     if (g_wizard_bios[0] && absolutize_existing_file(abs, sizeof(abs),
                                                      g_wizard_bios)) {
         snprintf(out, cap, "%s", abs);
@@ -1432,6 +1447,16 @@ static void persist_relaunch_sidecars(const char* near_exe,
                 write_sidecar_near_exe(build_exe, "bios.cfg", "");
         }
         return;
+    } else if (host_openbios_only()) {
+        /* Nothing to carry over: clear a bios.cfg an older install may have
+         * left behind so the relaunched game does not even read it. */
+        write_sidecar_near_exe(near_exe, "bios.cfg", "");
+        write_line_file("bios.cfg", "");
+        if (g_project_root[0] &&
+            join_path(project_sidecar, sizeof(project_sidecar), g_project_root,
+                      "bios.cfg"))
+            write_line_file(project_sidecar, "");
+        return;
     } else {
         char line[1100];
         line[0] = '\0';
@@ -1495,6 +1520,9 @@ static void handle_progress_line(const char* line,
         return;
     char event[64] = "";
     json_get_string(line, "event", event, sizeof(event));
+    if (strcmp(event, "error") == 0)
+        json_get_string(line, "message", g_cli_last_error,
+                        sizeof(g_cli_last_error));
     /* Capture ensure-toolchain result even when UI progress is absent. */
     if (strcmp(event, "result") == 0) {
         char tb[1400], resolved[1400];
@@ -1540,6 +1568,7 @@ static int run_cli_win(const char* cmdline,
                        void* progress_ctx, char* err_msg, size_t err_cap,
                        const char* fail_label) {
     SECURITY_ATTRIBUTES sa;
+    g_cli_last_error[0] = '\0';
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -1603,6 +1632,9 @@ static int run_cli_win(const char* cmdline,
     if (code == 0) return 1;
     if (code == 3)
         snprintf(err_msg, err_cap, "Disc verification failed (wrong dump).");
+    else if (g_cli_last_error[0])
+        snprintf(err_msg, err_cap, "%s failed (exit %lu): %s", fail_label,
+                 (unsigned long)code, g_cli_last_error);
     else
         snprintf(err_msg, err_cap, "%s failed (exit %lu).", fail_label,
                  (unsigned long)code);
@@ -1613,6 +1645,7 @@ static int run_cli_posix(char* const argv[],
                          RecompLauncherCPrepareProgressFn on_progress,
                          void* progress_ctx, char* err_msg, size_t err_cap,
                          const char* fail_label) {
+    g_cli_last_error[0] = '\0';
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(err_msg, err_cap, "pipe() failed: %s", strerror(errno));
@@ -1661,6 +1694,9 @@ static int run_cli_posix(char* const argv[],
     if (code == 0) return 1;
     if (code == 3)
         snprintf(err_msg, err_cap, "Disc verification failed (wrong dump).");
+    else if (g_cli_last_error[0])
+        snprintf(err_msg, err_cap, "%s failed (exit %d): %s", fail_label, code,
+                 g_cli_last_error);
     else
         snprintf(err_msg, err_cap, "%s failed (exit %d).", fail_label, code);
     return 0;
@@ -3319,6 +3355,12 @@ static int host_prepare_generate(const char* source_path, char* out_path,
 
     /* Hand the CLI the launcher's staged disc + BIOS. Empty g_wizard_bios means
      * OpenBIOS unless setup can adopt a retail dump beside the install. */
+    if (host_openbios_only()) {
+        /* Explicit, not merely empty: the adoption below is skipped and the
+         * sidecars record OpenBIOS on purpose. */
+        g_wizard_bios[0] = '\0';
+        g_wizard_bios_explicit = 1;
+    }
     {
         char abs_bios[1100];
         if (g_wizard_bios[0] &&
@@ -4453,8 +4495,10 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     gi->setup_wizard_supported = 1;
     /* Setup SDKs often link OpenBIOS only (retail C comes from Generate).
      * psx_bios_has_selectable() is then 0 and would hide the BIOS row — keep
-     * the optional SCPH1001 picker so prepare can ingest a dump first. */
-    gi->has_bios = 1;
+     * the optional SCPH1001 picker so prepare can ingest a dump first.
+     * Unless the title runs OpenBIOS and nothing else: then there is no
+     * dump to ingest, and a BIOS step only invites one. */
+    gi->has_bios = host_openbios_only() ? 0 : 1;
 
     if (status == 0) {
         /* Still force the wizard when generated/ is missing — discovery may

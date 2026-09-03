@@ -287,18 +287,15 @@ def file_hashes(path: Path) -> tuple[str, str, int]:
 
 
 def resolve_cue_bin(cue_path: Path) -> Path:
-    text = cue_path.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r'FILE\s+"([^"]+)"\s+BINARY', text, re.I)
-    if not m:
-        m = re.search(r"FILE\s+(\S+)\s+BINARY", text, re.I)
-    if not m:
-        raise ValueError(f"no BINARY FILE in cue: {cue_path}")
-    cand = Path(m.group(1))
-    if not cand.is_absolute():
-        cand = cue_path.parent / cand
-    if not cand.is_file():
-        raise ValueError(f"cue references missing bin: {cand}")
-    return cand
+    """The data-track binary a cue names, with prepare_disc's tolerance for a
+    renamed bin -- the two must agree, or the wizard verifies a cue that
+    generate then refuses. Raises ValueError with a player-readable reason."""
+    from prepare_disc import list_cue_bins  # tools/ is on sys.path above
+
+    try:
+        return list_cue_bins(cue_path)[0]
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> Path:
@@ -619,7 +616,13 @@ def verify_disc_path(
 ) -> dict[str, Any]:
     path = disc.resolve()
     if path.suffix.lower() == ".cue":
-        path = resolve_cue_bin(path)
+        try:
+            path = resolve_cue_bin(path)
+        except ValueError as exc:
+            # Not a wrong dump -- a cue pointing at a file that is not there.
+            # Keep it off the verify exit code, which the setup host reports
+            # as "wrong dump".
+            raise DiscPathError(str(exc)) from None
     md5, sha1, size = file_hashes(path)
     identity = {
         "path": str(path),
@@ -653,6 +656,10 @@ class DiscVerifyError(Exception):
     pass
 
 
+class DiscPathError(Exception):
+    """The disc argument cannot be read as given (a cue naming a missing bin)."""
+
+
 def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int:
     config = Path(args.config).expanduser().resolve()
     if not config.is_file():
@@ -682,6 +689,9 @@ def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
+    except DiscPathError as exc:
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
     progress.phase("done", pct=1.0, message="Disc OK")
     progress.result(ok=True, **identity)
     return EXIT_OK
@@ -727,7 +737,18 @@ def run_prepare_disc(
         if line.strip():
             progress.log(line)
     if proc.returncode != 0:
-        raise RuntimeError(f"prepare_disc failed (exit {proc.returncode})")
+        # Carry the reason: the setup dialog shows only this message, and
+        # "exit 1" alone sent players guessing between the disc, the path
+        # and the toolchain.
+        reason = ""
+        for line in reversed((proc.stderr or "").splitlines()):
+            if line.strip():
+                reason = line.strip()
+                break
+        raise RuntimeError(
+            f"prepare_disc failed (exit {proc.returncode})"
+            + (f": {reason}" if reason else "")
+        )
     marker = "RESULT_CUE="
     cue = None
     for line in out.splitlines():
@@ -778,6 +799,9 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
+    except DiscPathError as exc:
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
 
     boot = str(prep.get("boot_exe") or Path(str(game.get("exe") or "")).name)
     out_rel = str(prep.get("out_dir") or "prepared_disc")

@@ -68,6 +68,15 @@ typedef struct PsxrecompCodegenHostConfig {
     const char* prepare_note;
     const char* prepare_note_windows;
     const char* prepare_note_no_cmake;
+
+    /* Non-zero: this title runs the bundled OpenBIOS and nothing else. The
+     * first-run wizard shows no BIOS step, setup never adopts a retail dump
+     * found beside the install, and generate is never handed --bios. Pair it
+     * with PSXRECOMP_BIOS_STEMS=OpenBIOS in the title's CMakeLists so the
+     * product build links only that backend; the runtime then hides its BIOS
+     * row and ignores any bios.cfg by itself (see resolve_bios_for_runtime).
+     * Appended last so older config initialisers keep their layout. */
+    int openbios_only;
 } PsxrecompCodegenHostConfig;
 
 /* Bring the host up: find the project root, the psxrecomp CLI and game.toml,

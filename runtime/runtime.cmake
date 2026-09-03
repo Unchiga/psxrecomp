@@ -781,6 +781,77 @@ function(psxrecomp_ensure_zlib)
         "(expected zlibstatic or zlib).")
 endfunction()
 
+# ---- OpenGL on a host that has the libraries but not GL/gl.h ---------------
+# Nothing in the runtime or in recomp-ui includes GL/gl.h: the GL backend and
+# the launcher include SDL's own SDL_opengl.h, and every entry point newer
+# than GL 1.1 is fetched through SDL_GL_GetProcAddress. The link still needs
+# a GL library for the 1.1 symbols (glClear, glBindTexture, ...), which both
+# legacy libGL and GLVND's libOpenGL export.
+#
+# CMake's FindOpenGL, though, lists the header directory as REQUIRED on
+# Linux. SteamOS ships libglvnd's libraries with every header stripped, so on
+# a Steam Deck recomp-ui's find_package(OpenGL REQUIRED) died at configure:
+#
+#   Could NOT find OpenGL (missing: OPENGL_INCLUDE_DIR)
+#
+# FindOpenGL honours its documented cache entries, so when the headers are
+# the only thing missing this seeds them with an empty staged directory, and
+# when the unversioned libGL.so dev link is missing as well, seeds the library
+# with the SONAME file a runtime-only host still has. Every later
+# find_package(OpenGL) then succeeds and defines its usual targets. A host
+# with the headers takes the early return and is untouched.
+function(psxrecomp_tolerate_headerless_gl)
+    if(WIN32 OR APPLE OR ANDROID OR EMSCRIPTEN)
+        return()
+    endif()
+    find_package(OpenGL QUIET)
+    if(OpenGL_FOUND OR OPENGL_INCLUDE_DIR)
+        return()
+    endif()
+    # A GL library to link. FindOpenGL's own find_library results outlive its
+    # failure; failing those, the SONAME files.
+    set(_gl "")
+    if(OPENGL_gl_LIBRARY)
+        set(_gl "${OPENGL_gl_LIBRARY}")
+    elseif(OPENGL_opengl_LIBRARY)
+        set(_gl "${OPENGL_opengl_LIBRARY}")
+    else()
+        find_library(PSX_GL_SONAME_LIBRARY
+            NAMES libGL.so.1 libOpenGL.so.0
+            PATH_SUFFIXES libglvnd
+            DOC "GL library found by SONAME (host has no libGL.so dev link)")
+        if(PSX_GL_SONAME_LIBRARY)
+            set(_gl "${PSX_GL_SONAME_LIBRARY}")
+            set(OPENGL_gl_LIBRARY "${_gl}" CACHE FILEPATH
+                "Legacy GL library (seeded by SONAME; no dev link on this host)"
+                FORCE)
+        endif()
+    endif()
+    if(NOT _gl)
+        return()   # no GL library anywhere: let the real find_package explain
+    endif()
+    set(_stage "${CMAKE_BINARY_DIR}/psx_gl_headerless")
+    file(MAKE_DIRECTORY "${_stage}")
+    file(WRITE "${_stage}/README.txt"
+        "Empty on purpose. This host has GL libraries but no GL/gl.h; the\n"
+        "runtime and launcher include SDL's bundled SDL_opengl.h instead, and\n"
+        "FindOpenGL is pointed here only so it stops requiring a header that\n"
+        "nothing in the build reads.\n")
+    set(OPENGL_INCLUDE_DIR "${_stage}" CACHE PATH
+        "GL headers come from SDL; host has none (see psx_gl_headerless/README.txt)"
+        FORCE)
+    if(OPENGL_glx_LIBRARY AND NOT OPENGL_GLX_INCLUDE_DIR)
+        # With GLVND libraries present FindOpenGL builds OpenGL::GL out of
+        # OpenGL::OpenGL + OpenGL::GLX, and the GLX target needs glx.h too.
+        set(OPENGL_GLX_INCLUDE_DIR "${_stage}" CACHE PATH
+            "GLX headers not on this host; nothing in the build includes them"
+            FORCE)
+    endif()
+    message(STATUS
+        "psxrecomp: no GL/gl.h on this host (SteamOS?) - using SDL's GL headers "
+        "and linking ${_gl} for the GL 1.1 symbols")
+endfunction()
+
 function(psxrecomp_add_runtime_target target)
     # PGXP: build this target's objects with -DPSX_PGXP=1 so the PGXP_*()
     # hook macros the emitter writes into ALL generated C become real calls
@@ -1521,6 +1592,9 @@ function(psxrecomp_add_runtime_target target)
                 "entry) to pick up the ON default.")
         endif()
         set(RECOMP_UI_SDL3 ${PSX_SDL3})
+        # recomp-ui's GL discovery is find_package(OpenGL REQUIRED); make it
+        # survive a host with no GL headers first (Steam Deck).
+        psxrecomp_tolerate_headerless_gl()
         include("${RECOMP_UI_ROOT}/recomp_ui.cmake")
 
         # Asset staging is console-scoped in recomp-ui. Select PSX once here so
@@ -1564,9 +1638,19 @@ function(psxrecomp_add_runtime_target target)
         if(CMAKE_DL_LIBS)
             target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
         endif()
+        psxrecomp_tolerate_headerless_gl()
         find_package(OpenGL)
-        if(OpenGL_FOUND)
+        # OpenGL_FOUND does not guarantee OpenGL::GL: a GLVND host with no
+        # legacy libGL and no glx.h reports found but never defines it, and a
+        # link to a missing target fails at generate time. Take what exists.
+        if(TARGET OpenGL::GL)
             target_link_libraries(${target} PRIVATE OpenGL::GL)
+        elseif(TARGET OpenGL::OpenGL)
+            target_link_libraries(${target} PRIVATE OpenGL::OpenGL)
+        elseif(OPENGL_gl_LIBRARY)
+            target_link_libraries(${target} PRIVATE "${OPENGL_gl_LIBRARY}")
+        elseif(OPENGL_opengl_LIBRARY)
+            target_link_libraries(${target} PRIVATE "${OPENGL_opengl_LIBRARY}")
         endif()
         # Async lobby connect (psx_lobby_client.c) uses pthread on Unix.
         if(PSXRECOMP_HAS_LOBBY_CLIENT)

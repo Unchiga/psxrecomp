@@ -82,9 +82,17 @@ unlike most runtime options. It records a developer's compatibility finding, not
 a preference. A player re-enabling OpenBIOS on a title known to break under it
 produces confusing bug reports and no benefit.
 
-There is no third mode. A title either allows OpenBIOS (and still honours an
-explicit retail choice) or requires retail. "OpenBIOS only, retail forbidden"
-would take away a working option from players for no reason.
+There is no third mode in `[runtime]`. A title either allows OpenBIOS (and
+still honours an explicit retail choice) or requires retail.
+
+A title that was only ever verified against OpenBIOS can still decline to
+offer retail at all, and does it at build time rather than in the config:
+link only the bundled backend with `PSXRECOMP_BIOS_STEMS=OpenBIOS` (the
+runtime then runs bundled-only: no BIOS row, `bios.cfg` ignored), and set
+`openbios_only` in the title's `PsxrecompCodegenHostConfig` so the first-run
+wizard shows no BIOS step and setup never adopts a dump found beside the
+install. The retail image is then not a working option that was taken away;
+it is one the title never shipped.
 
 ## Boot behaviour does not depend on which BIOS runs
 

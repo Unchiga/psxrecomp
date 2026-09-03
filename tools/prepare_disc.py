@@ -252,6 +252,43 @@ def load_config(project_root: Path, config_path: Path | None, out_dir_cli: str |
     )
 
 
+_RAW_IMAGE_EXTS = (".bin", ".img", ".iso", ".car")
+
+
+def _find_cue_file(cue_path: Path, name: str, allow_stem: bool) -> Path | None:
+    """The file a cue's FILE line names, found beside the cue.
+
+    Players rename dumps, and a cue renamed alongside its bin still names the
+    old bin. The runtime already tolerates that (disc_path.cpp mounts the
+    sibling image); this is the same rule, so a cue the wizard just accepted
+    cannot then fail here with "missing bin":
+
+      exact name -> same name ignoring case -> (data track only) the file
+      with the cue's own stem and a raw-image extension, ignoring case.
+    """
+    cand = Path(name)
+    if not cand.is_absolute():
+        cand = cue_path.parent / cand
+    if cand.is_file():
+        return cand
+    try:
+        entries = list(cue_path.parent.iterdir())
+    except OSError:
+        return None
+    base = cand.name.lower()
+    for e in entries:
+        if e.is_file() and e.name.lower() == base:
+            return e
+    if allow_stem:
+        stem = cue_path.stem.lower()
+        for ext in _RAW_IMAGE_EXTS:
+            for e in entries:
+                if (e.is_file() and e.stem.lower() == stem
+                        and e.suffix.lower() == ext):
+                    return e
+    return None
+
+
 def list_cue_bins(cue_path: Path) -> list[Path]:
     """Return every BINARY FILE referenced by a cue, in order."""
     text = cue_path.read_text(encoding="utf-8", errors="replace")
@@ -259,15 +296,22 @@ def list_cue_bins(cue_path: Path) -> list[Path]:
     if not names:
         names = re.findall(r"FILE\s+(\S+)\s+BINARY", text, flags=re.I)
     if not names:
-        raise SystemExit(f"no BINARY FILE in cue: {cue_path}")
+        raise SystemExit(
+            f"{cue_path} names no BINARY file, so it is not a usable cue "
+            "sheet. Point the setup at the disc's .bin instead."
+        )
     out: list[Path] = []
-    for name in names:
-        cand = Path(name)
-        if not cand.is_absolute():
-            cand = cue_path.parent / cand
-        if not cand.is_file():
-            raise SystemExit(f"cue references missing bin: {cand}")
-        out.append(cand.resolve())
+    for i, name in enumerate(names):
+        found = _find_cue_file(cue_path, name, allow_stem=(i == 0))
+        if found is None:
+            raise SystemExit(
+                f'{cue_path.name} refers to "{name}", which is not next to '
+                "it. Put the .bin beside the .cue without renaming either, "
+                "or point the setup at the .bin itself."
+            )
+        if found.name != Path(name).name:
+            print(f'cue names "{name}"; using {found.name} beside it')
+        out.append(found.resolve())
     return out
 
 
@@ -292,9 +336,14 @@ def stage_multitrack_cue(
     if cue_dest.resolve() != cue_src.resolve():
         # Rewrite FILE lines to basenames so the cue stays portable if the
         # source used absolute/relative paths with directories.
+        # ... and to the names actually resolved, in case the cue named a
+        # file that only exists beside it under another name.
         text = cue_src.read_text(encoding="utf-8", errors="replace")
+        resolved = iter(bins)
         def _basename_file(m: re.Match[str]) -> str:
-            return f'FILE "{Path(m.group(1)).name}" BINARY'
+            real = next(resolved, None)
+            name = real.name if real is not None else Path(m.group(1)).name
+            return f'FILE "{name}" BINARY'
         text = re.sub(
             r'FILE\s+"([^"]+)"\s+BINARY', _basename_file, text, flags=re.I
         )
