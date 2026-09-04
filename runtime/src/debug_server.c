@@ -13442,6 +13442,16 @@ void debug_server_shutdown(void)
      * blocking accept(), then join. */
     s_io_running = 0;
     if (s_listen != SOCK_INVALID) {
+        /* On Linux, close() alone does NOT wake a thread blocked in accept()
+         * (the descriptor stays referenced by the syscall), so the join below
+         * hung the window forever and the desktop reported it unresponsive.
+         * shutdown() does wake it; on Windows closesocket() already aborts
+         * the accept and shutdown() on a listener just fails harmlessly. */
+#ifdef _WIN32
+        shutdown(s_listen, SD_BOTH);
+#else
+        shutdown(s_listen, SHUT_RDWR);
+#endif
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
     }

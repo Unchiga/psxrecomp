@@ -1,4 +1,4 @@
-﻿/* main.cpp — Phase 3 runtime entry point.
+/* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
  * the recompiled reset vector. BIOS drives execution; SDL presents
@@ -360,6 +360,17 @@ extern "C" uint8_t  psx_guest_read_byte(uint32_t addr);
 /* ---- SDL state ---- */
 extern "C" {
 SDL_Window* sdl_window = nullptr;
+
+/* The keyboard as the GAME sees it. SDL_GetKeyboardState() is global to the
+ * process, so with a tool window open (Card Manager, Drop Table Manager)
+ * every letter typed into its search box or a field was also a held key here
+ * and mapped straight onto a pad button: the game played itself while the
+ * player typed. Keys count only while the game window has keyboard focus. */
+static const Uint8* game_keys(void) {
+    static Uint8 s_none[512];   /* SDL_SCANCODE_COUNT on SDL3, SDL_NUM_SCANCODES on SDL2 */
+    if (sdl_window && SDL_GetKeyboardFocus() != sdl_window) return s_none;
+    return SDL_GetKeyboardState(NULL);
+}
 }
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
@@ -3548,7 +3559,7 @@ static uint16_t pad_from_keyboard(int player) {
      * The PS1 pad word is inverted, so all-bits-set means nothing pressed. */
     if (psx_video_menu_is_open())
         return 0xFFFF;
-    const Uint8* keys = SDL_GetKeyboardState(NULL);
+    const Uint8* keys = game_keys();
     return psx_keybinds_pad_word(keys, player);
 }
 
@@ -3652,7 +3663,7 @@ static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], boo
         /* Keyboard analog: the configurable left/right stick-direction binds
          * (default = arrow keys on the LEFT stick; RIGHT stick unbound), so the
          * old keyboard analog behaviour is preserved unless the user rebinds. */
-        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        const Uint8* keys = game_keys();
         psx_keybinds_sticks(keys, player, out);
         return;
     }
@@ -3836,7 +3847,7 @@ static bool hybrid_dpad_active(const PlayerInput& p, int player,
         }
     }
     if (src.keybinds) {
-        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        const Uint8* keys = game_keys();
         if (psx_keybinds_dpad_active(keys, player)) return true;
     }
     return false;
@@ -3941,7 +3952,7 @@ static int any_controller_button_down(void) {
 }
 
 int psx_savestate_host_resume_inputs_held(void) {
-    const Uint8* keys = SDL_GetKeyboardState(NULL);
+    const Uint8* keys = game_keys();
     if (keys) {
         if (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER] ||
             keys[SDL_SCANCODE_SPACE] || keys[SDL_SCANCODE_L])
@@ -4093,7 +4104,7 @@ static int capture_pad_slot(int s, PsxNetPad* out) {
      * applying it twice is idempotent. */
     if (eff_analog) {
         if (src.keybinds) {
-            const Uint8* keys = SDL_GetKeyboardState(NULL);
+            const Uint8* keys = game_keys();
             psx_keybinds_sticks(keys, player, st);
         }
         if (src.all_pads)
@@ -5698,7 +5709,7 @@ static void savestate_menu_poll_toggle_buttons(void) {
 }
 
 static void rewind_poll_nav(uint32_t now_ms) {
-    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    const Uint8 *keys = game_keys();
     int left = keys[SDL_SCANCODE_LEFT] ? 1 : 0;
     int right = keys[SDL_SCANCODE_RIGHT] ? 1 : 0;
     /* Overlay: A/Cross load, B/Circle close. Also Enter/Space/Esc. */
@@ -6669,7 +6680,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * audio is less hostile. PSX_FAST_FORWARD_SPEED=2..16 changes the cap;
      * PSX_FAST_FORWARD_SPEED=max restores the old unbounded simulation rate. */
     {
-        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        const Uint8* keys = game_keys();
         static int turbo_skip = 0;
         static int turbo_was_down = 0;
         if (host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState())) {

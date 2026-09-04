@@ -1,4 +1,4 @@
-﻿#ifndef PSXRECOMP_CDROM_H
+#ifndef PSXRECOMP_CDROM_H
 #define PSXRECOMP_CDROM_H
 
 #include <stdint.h>
@@ -30,6 +30,17 @@ void cdrom_notify_game_started(void);
 /* LBA of the most recent SetLoc command (-1 if none yet). Used by the DMA
  * ring buffer to correlate each sector transfer with its disc position. */
 int  cdrom_get_setloc_lba(void);
+
+/* Sector overrides: replace the 2048 user-data bytes delivered for a data
+ * sector (mods use this through psx_mod_cd_override_*). size < 2048 pads
+ * with zeros. Emulation thread only. */
+int      cdrom_override_set(uint32_t lba, const uint8_t* data, uint32_t size);
+int      cdrom_override_clear(uint32_t lba);
+void     cdrom_override_clear_all(void);
+uint32_t cdrom_override_count(void);
+int      cdrom_override_get(uint32_t lba, uint8_t* out2048);
+/* The mounted image's own bytes for a data sector, overrides ignored. */
+int      cdrom_read_stock_sector(uint32_t lba, uint8_t* out2048);
 
 /* 'instant' per-frame sector-IRQ budget (step 3). Clamped to [1, 4096];
  * the per-sector period additionally floors at CDROM_MIN_DELAY. Writers:

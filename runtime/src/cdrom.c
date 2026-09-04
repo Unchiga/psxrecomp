@@ -719,6 +719,104 @@ static void exec_command(uint8_t cmd);
 
 /* ISO reader */
 static void* iso_handle = NULL;
+
+/* ---- sector overrides ------------------------------------------------------
+ * A mod may replace the 2048 user-data bytes the drive delivers for a data
+ * sector. This is the disc-level equivalent of patching the image: every
+ * reader of that sector -- CD DMA, the CPU FIFO path, whole-sector reads --
+ * sees the replacement, so a replaced card record shows up in every screen
+ * that streams it without per-screen hooks. XA/audio sectors are never
+ * substituted (the classifier still runs on the raw bytes). The table is a
+ * small open-addressing hash keyed by LBA; the emulation thread is the only
+ * caller, as with every psx_mod_* memory service. */
+typedef struct { int32_t lba; uint8_t *data; } CDROMOverride;
+static CDROMOverride *s_ovr;
+static uint32_t s_ovr_cap, s_ovr_count;
+
+static uint32_t ovr_hash(uint32_t lba) { return lba * 2654435761u; }
+
+static CDROMOverride *ovr_find(int32_t lba) {
+    if (!s_ovr_cap) return NULL;
+    uint32_t i = ovr_hash((uint32_t)lba) & (s_ovr_cap - 1u);
+    for (uint32_t n = 0; n < s_ovr_cap; n++, i = (i + 1u) & (s_ovr_cap - 1u)) {
+        if (s_ovr[i].lba == lba) return &s_ovr[i];
+        if (s_ovr[i].lba < 0 && !s_ovr[i].data) return NULL;   /* never used */
+    }
+    return NULL;
+}
+
+static int ovr_grow(void) {
+    uint32_t ncap = s_ovr_cap ? s_ovr_cap * 2u : 1024u;
+    CDROMOverride *n = (CDROMOverride *)malloc(ncap * sizeof *n);
+    if (!n) return 0;
+    for (uint32_t i = 0; i < ncap; i++) { n[i].lba = -1; n[i].data = NULL; }
+    for (uint32_t i = 0; i < s_ovr_cap; i++) {
+        if (s_ovr[i].lba < 0) continue;
+        uint32_t j = ovr_hash((uint32_t)s_ovr[i].lba) & (ncap - 1u);
+        while (n[j].lba >= 0) j = (j + 1u) & (ncap - 1u);
+        n[j] = s_ovr[i];
+    }
+    free(s_ovr);
+    s_ovr = n; s_ovr_cap = ncap;
+    return 1;
+}
+
+int cdrom_override_set(uint32_t lba, const uint8_t *data, uint32_t size) {
+    if (!data || size > SECTOR_SIZE || lba > 0x7FFFFFFFu) return 0;
+    CDROMOverride *e = ovr_find((int32_t)lba);
+    if (!e) {
+        if ((s_ovr_count + 1u) * 2u > s_ovr_cap && !ovr_grow()) return 0;
+        uint32_t i = ovr_hash(lba) & (s_ovr_cap - 1u);
+        while (s_ovr[i].lba >= 0) i = (i + 1u) & (s_ovr_cap - 1u);
+        e = &s_ovr[i];
+        free(e->data);                      /* a reused tombstone */
+        e->data = (uint8_t *)malloc(SECTOR_SIZE);
+        if (!e->data) return 0;
+        e->lba = (int32_t)lba;
+        s_ovr_count++;
+    }
+    memcpy(e->data, data, size);
+    if (size < SECTOR_SIZE) memset(e->data + size, 0, SECTOR_SIZE - size);
+    return 1;
+}
+
+int cdrom_override_clear(uint32_t lba) {
+    CDROMOverride *e = lba <= 0x7FFFFFFFu ? ovr_find((int32_t)lba) : NULL;
+    if (!e) return 0;
+    /* Tombstone: keep data non-NULL so probes keep walking past it. */
+    free(e->data);
+    e->data = (uint8_t *)malloc(1);
+    e->lba = -1;
+    s_ovr_count--;
+    return 1;
+}
+
+void cdrom_override_clear_all(void) {
+    for (uint32_t i = 0; i < s_ovr_cap; i++) { free(s_ovr[i].data); s_ovr[i].data = NULL; s_ovr[i].lba = -1; }
+    s_ovr_count = 0;
+}
+
+uint32_t cdrom_override_count(void) { return s_ovr_count; }
+
+int cdrom_override_get(uint32_t lba, uint8_t *out) {
+    CDROMOverride *e = lba <= 0x7FFFFFFFu ? ovr_find((int32_t)lba) : NULL;
+    if (!e) return 0;
+    if (out) memcpy(out, e->data, SECTOR_SIZE);
+    return 1;
+}
+
+/* The stock bytes of a data sector, straight from the mounted image and
+ * ignoring any override. What a mod starts from when it wants to change one
+ * field of a record and keep the rest. */
+int cdrom_read_stock_sector(uint32_t lba, uint8_t *out) {
+    uint8_t raw[RAW_SECTOR_SIZE];
+    if (!iso_handle || !out) return 0;
+    if (iso_read_raw_sector(iso_handle, lba, raw, RAW_SECTOR_SIZE)) {
+        memcpy(out, raw + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
+        return 1;
+    }
+    return iso_read_sector(iso_handle, lba, out, SECTOR_SIZE) ? 1 : 0;
+}
 static uint8_t last_valid_subq[12];
 static int last_valid_subq_available;
 static int subq_replacements_active;
@@ -1420,6 +1518,16 @@ static int read_sector_at(int min, int sec, int sect) {
         if (subq_replacements_active) update_last_valid_subq((uint32_t)lba);
     } else {
         memset(user_data, 0, sizeof(user_data));
+    }
+    /* Mod-supplied replacement for this sector's user data. Applied to both
+     * copies so a whole-sector (mode 0x20) read carries it as well; the EDC/
+     * ECC trailer goes stale, which no PS1 software path checks. Audio and
+     * XA sectors keep their bytes: the classifier below decides on the raw
+     * subheader, and a replacement only makes sense for data. */
+    if (s_ovr_count && lba >= 0 &&
+        (!have_raw || !(raw_data[XA_SUBHEADER_OFFSET + 2] & 0x04u))) {
+        if (cdrom_override_get((uint32_t)lba, user_data) && have_raw)
+            memcpy(raw_data + RAW_USER_DATA_OFFSET, user_data, SECTOR_SIZE);
     }
 
     delivery = classify_raw_sector(raw_data, have_raw);

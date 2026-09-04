@@ -4,6 +4,7 @@
 #include "iso_reader.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "cdrom.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -1222,6 +1223,20 @@ extern "C" void mod_runtime_on_vblank(void) {
 extern "C" const char *psx_mod_host_player_data_dir(void);
 extern "C" const char *psx_mod_player_data_dir(void) {
     return psx_mod_host_player_data_dir();
+}
+
+extern "C" int psx_mod_cd_override_set(uint32_t lba, const void *data,
+                                       uint32_t size) {
+    return cdrom_override_set(lba, (const uint8_t *)data, size);
+}
+extern "C" int psx_mod_cd_override_clear(uint32_t lba) {
+    return cdrom_override_clear(lba);
+}
+extern "C" void psx_mod_cd_override_clear_all(void) {
+    cdrom_override_clear_all();
+}
+extern "C" int psx_mod_cd_read_stock_sector(uint32_t lba, void *out2048) {
+    return cdrom_read_stock_sector(lba, (uint8_t *)out2048);
 }
 
 extern "C" int psx_mod_game_started(void) {
