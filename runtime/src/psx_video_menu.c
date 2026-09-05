@@ -192,7 +192,7 @@ enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
  * the cursor. */
 enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT = 2 };
 
-#define VM_EDIT_MAX 5   /* digits; 32767 is the widest useful value */
+#define VM_EDIT_MAX 6   /* digits; the 999999 StarChips row is the widest */
 /* Named once: panel_rect reserves width for it so the panel cannot resize
  * the moment a field opens, and row_hint prints it. Two copies of the
  * string is two chances for the reservation to stop matching the text. */
@@ -1565,7 +1565,7 @@ static void redraw(void) {
             } else if (v && editing_here) {
                 /* Active field: a boxed, left-aligned entry so the caret and
                  * the digits are unmistakable against the row highlight. */
-                int bw = text_w("00000", fr) + S(VM_ROW_PAD_X) * 2;
+                int bw = text_w("000000", fr) + S(VM_ROW_PAD_X) * 2;
                 int bx = inset + iw - bw - S(VM_ROW_PAD_X);
                 int bh = rh - S(4.0f);
                 round_rect(bx, ry + S(2.0f), bw, bh, VM_ROW_R * s_unit * 0.6f,
