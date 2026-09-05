@@ -1,13 +1,18 @@
 /* psx_game_hooks.c — see psx_game_hooks.h. */
 
 #include "psx_game_hooks.h"
+#include <stdio.h>
 
 /* Fixed capacity, no allocation: registration happens during static
- * initialisation, before anything could report a failure usefully, and a title
- * needing more hooks than this has a structure problem rather than a capacity
- * one. Registration order is call order, which is what makes a title's own
- * ordering predictable. */
-#define PSX_GAME_HOOK_MAX 16
+ * initialisation, before anything could report a failure usefully.
+ * Registration order is call order, which is what makes a title's own
+ * ordering predictable -- but that order is the linker's constructor order,
+ * so a full table drops a DIFFERENT set of hooks on each platform (a title
+ * with 21 per-frame hooks lost its Card Manager tick on Windows only, at
+ * the old limit of 16, and the window stayed blank). Overflows are counted
+ * and reported when the start hooks run, when stdio is certainly up. */
+#define PSX_GAME_HOOK_MAX 64
+static int s_dropped;
 
 static PsxGameHook s_start[PSX_GAME_HOOK_MAX];
 static int         s_start_count;
@@ -19,25 +24,29 @@ static PsxGameEventHook s_event[PSX_GAME_HOOK_MAX];
 static int              s_event_count;
 
 int psx_game_add_start_hook(PsxGameHook fn) {
-    if (!fn || s_start_count >= PSX_GAME_HOOK_MAX) return 0;
+    if (!fn) return 0;
+    if (s_start_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
     s_start[s_start_count++] = fn;
     return 1;
 }
 
 int psx_game_add_frame_hook(PsxGameHook fn) {
-    if (!fn || s_frame_count >= PSX_GAME_HOOK_MAX) return 0;
+    if (!fn) return 0;
+    if (s_frame_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
     s_frame[s_frame_count++] = fn;
     return 1;
 }
 
 int psx_game_add_vblank_hook(PsxGameHook fn) {
-    if (!fn || s_vblank_count >= PSX_GAME_HOOK_MAX) return 0;
+    if (!fn) return 0;
+    if (s_vblank_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
     s_vblank[s_vblank_count++] = fn;
     return 1;
 }
 
 int psx_game_add_event_hook(PsxGameEventHook fn) {
-    if (!fn || s_event_count >= PSX_GAME_HOOK_MAX) return 0;
+    if (!fn) return 0;
+    if (s_event_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
     s_event[s_event_count++] = fn;
     return 1;
 }
@@ -51,6 +60,7 @@ int psx_game_run_event_hooks(const void *sdl_event) {
 }
 
 void psx_game_run_start_hooks(void) {
+    if (s_dropped) fprintf(stderr, "psx_game_hooks: %d hook(s) not registered: the table (%d per kind) is full\n", s_dropped, PSX_GAME_HOOK_MAX);
     for (int i = 0; i < s_start_count; i++) s_start[i]();
 }
 
