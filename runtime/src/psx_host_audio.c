@@ -431,9 +431,7 @@ int psx_host_audio_open(int want_freq) {
     want.channels = 2;
     want.samples = 1024;
     legacy = audio_legacy_mode() ? 1 : 0;
-    /* Never let the device pick another rate: the bridge then resamples
-     * 44100 -> 44100 (identity) and SDL does any device conversion itself. */
-    want.allow_frequency_change = 0;
+    want.allow_frequency_change = legacy ? 0 : 1;
     if (!legacy)
         want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
     sdl_audio_device = psx_sdl_audio_open(&want, &have);

@@ -753,11 +753,7 @@ static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderle
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
-/* The host device request. Locked at 44100 Hz: the SPU renders at exactly
- * that rate, and opening the device at anything else means a resampling
- * bridge between the two, which was suspected in blanked-out screens on
- * some machines. The launcher row and settings key are ignored. */
-static const int     g_audio_freq     = 44100;
+static int           g_audio_freq     = 44100; /* host device request */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
@@ -11471,7 +11467,7 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
             g_video_aspect_num = us.aspect_num;
             g_video_aspect_den = us.aspect_den;
         }
-        (void)us.audio_freq;     /* the host device is locked at 44100 Hz, the SPU's own rate */
+        if (us.has_audio_freq)     g_audio_freq      = us.audio_freq;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
         if (us.has_rewind_depth)  g_rewind_depth   = us.rewind_depth;
         if (us.has_rewind_interval) g_rewind_interval = us.rewind_interval;
@@ -11989,7 +11985,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
             seed.has_frame_interpolation_fps = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
-            seed.audio_freq = 44100;                      seed.has_audio_freq = true;
+            seed.audio_freq = g_audio_freq;               seed.has_audio_freq = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             seed.rewind_depth = g_rewind_depth;           seed.has_rewind_depth = true;
             seed.rewind_interval = g_rewind_interval;     seed.has_rewind_interval = true;
@@ -12136,7 +12132,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
             ls.widescreen     = (seed.aspect_num == 16 && seed.aspect_den == 9) ? 1 : 0;
             ls.widescreen_hud = ls.widescreen;
             ls.enable_audio   = 1;
-            ls.audio_freq     = 44100;
+            ls.audio_freq     = seed.audio_freq;
             ls.volume         = host_volume_get();
             {
                 const int n = std::min(PSX_MAX_PLAYERS, RECOMP_LAUNCHER_MAX_PLAYERS);
@@ -12643,7 +12639,7 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                 g_frame_interpolation_fps = seed.frame_interpolation_fps;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
-                (void)seed.audio_freq;   /* locked at 44100 Hz */
+                g_audio_freq      = seed.audio_freq;
                 g_audio_spu_hq    = seed.spu_hq;
                 g_rewind_depth   = seed.has_rewind_depth && seed.rewind_depth > 0
                     ? seed.rewind_depth : 50;
@@ -14420,7 +14416,7 @@ soft_return_lobby:
             (g_video_aspect_num == 16 && g_video_aspect_den == 9) ? 1 : 0;
         ls.widescreen_hud = ls.widescreen;
         ls.enable_audio = 1;
-        ls.audio_freq = 44100;
+        ls.audio_freq = g_audio_freq;
         ls.volume = host_volume_get();
         ls.window_width = g_video_win_w;
         ls.renderer = g_video_renderer;
@@ -14757,7 +14753,7 @@ soft_return_lobby:
             g_fullscreen = ls.fullscreen != 0;
             g_frame_interpolation = ls.frame_interp ? 1 : 0;
             g_frame_interpolation_fps = ls.frame_interp_fps;
-            (void)ls.audio_freq;         /* locked at 44100 Hz */
+            g_audio_freq = ls.audio_freq;
             g_audio_spu_hq = ls.spu_hq != 0;
             if (ls.rewind_depth > 0) {
                 g_rewind_depth = ls.rewind_depth;
