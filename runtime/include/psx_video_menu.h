@@ -292,6 +292,25 @@ int  psx_video_menu_is_restoring(void);
 int  psx_video_menu_get_row(int row_handle);
 void psx_video_menu_set_row(int row_handle, int value);
 
+/* Display order within a menu: rows sort by this, then by registration.
+ * Default 0. A row that must stay at the bottom of its menu whatever
+ * registers after it (constructor order is link order) asks for a high
+ * value. */
+void psx_video_menu_set_row_order(int row_handle, int order);
+
+/* Walk the registered rows: handles are 0..count-1. settings_key is NULL for
+ * a row that does not persist. A title that bundles its settings into a
+ * share file reads and drives rows through this and psx_video_menu_get_row /
+ * _set_row, then calls psx_video_menu_note_change so the host writes
+ * menu_settings.ini the way it does after a click. */
+int  psx_video_menu_row_count(void);
+int  psx_video_menu_row_info(int row_handle, int *menu, int *kind,
+                             const char **settings_key, const char **label);
+void psx_video_menu_note_change(void);
+/* The registered rows of one menu in DISPLAY order (after its built-in
+ * rows): nth = 0.. until it returns 0. What a test reads to check an order. */
+int  psx_video_menu_menu_row_label(int menu, int nth, const char **label);
+
 /* Bar height in DESIGN UNITS: a 480-tall screen's worth. The menu lays itself
  * out in these and scales them by the canvas height, so this is a PROPORTION,
  * not a pixel count, and multiplying it by the ui scale no longer gives

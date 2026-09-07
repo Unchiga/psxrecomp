@@ -140,7 +140,7 @@ enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2, AUD_SPEED_GOV = 3 };
  * the guest starts and a title registering more than this has a design
  * problem, not an allocation problem. */
 #define VM_MENU_MAX 12
-#define VM_REG_MAX  32
+#define VM_REG_MAX  64
 
 typedef struct VmRegRow {
     int   menu;
@@ -154,6 +154,7 @@ typedef struct VmRegRow {
     int   slider;
     int   mark;              /* notch on the track, or -1 */
     const char *key;         /* menu_settings.ini name; NULL = not persisted */
+    int   order;             /* rows of a menu sort by this, then by registration; 0 default */
     int   value;
     int   restored;          /* value came from the settings file, not the
                               * registered default -- see
@@ -176,14 +177,23 @@ static int reg_count_for(int m) {
 /* Defined below, next to builtin_rows: the dispatch chains above need it. */
 static struct VmRegRow *row_reg(int m, int row);
 
+/* The nth registered row of a menu, in display order: by `order`, then by
+ * registration. A row that must sit at the bottom whatever links after it
+ * (a title's "export everything" action) asks for a high order; everyone
+ * else stays at 0 and keeps the old registration order. Stable insertion
+ * sort on a scratch index: rows are few and this runs per draw and hit. */
 static VmRegRow *reg_at(int m, int nth) {
+    int idx[VM_REG_MAX];
     int i, n = 0;
-    for (i = 0; i < s_reg_count; i++) {
-        if (s_reg[i].menu != m) continue;
-        if (n == nth) return &s_reg[i];
-        n++;
+    for (i = 0; i < s_reg_count; i++) if (s_reg[i].menu == m) idx[n++] = i;
+    for (i = 1; i < n; i++) {
+        const int v = idx[i];
+        int j = i - 1;
+        while (j >= 0 && s_reg[idx[j]].order > s_reg[v].order) { idx[j + 1] = idx[j]; j--; }
+        idx[j + 1] = v;
     }
-    return NULL;
+    if (nth < 0 || nth >= n) return NULL;
+    return &s_reg[idx[nth]];
 }
 enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
 /* ACT_DISC sits between CLOSE and QUIT so QUIT stays the last row, where
@@ -2158,6 +2168,34 @@ void psx_video_menu_set_row_mark(int row_handle, int value) {
     if (row_handle < 0 || row_handle >= s_reg_count) return;
     s_reg[row_handle].mark = value;
     s_dirty = 1;
+}
+
+void psx_video_menu_set_row_order(int row_handle, int order) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return;
+    s_reg[row_handle].order = order;
+    s_dirty = 1;
+}
+
+int psx_video_menu_row_count(void) { return s_reg_count; }
+
+int psx_video_menu_row_info(int row_handle, int *menu, int *kind,
+                            const char **settings_key, const char **label) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return 0;
+    const VmRegRow *r = &s_reg[row_handle];
+    if (menu) *menu = r->menu;
+    if (kind) *kind = r->kind;
+    if (settings_key) *settings_key = r->key;
+    if (label) *label = r->label;
+    return 1;
+}
+
+void psx_video_menu_note_change(void) { s_changed = 1; s_dirty = 1; }
+
+int psx_video_menu_menu_row_label(int menu, int nth, const char **label) {
+    const VmRegRow *r = (menu >= 0 && menu < s_menu_total) ? reg_at(menu, nth) : NULL;
+    if (!r) return 0;
+    if (label) *label = r->label;
+    return 1;
 }
 
 int psx_video_menu_get_row(int row_handle) {
