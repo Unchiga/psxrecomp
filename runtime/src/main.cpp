@@ -10719,8 +10719,24 @@ namespace {
     };
 
     void ae_rui_set_sidecar_paths(const char* argv0) {
+        namespace fs = std::filesystem;
         const auto exe = exe_dir_from_argv(argv0 ? argv0 : "");
-        g_rui_keybinds_path = (exe / "keybinds.ini").string();
+        /* keybinds.ini is the one the game reads: the player-data folder
+         * (Documents\My Games\... unless the install is portable). The
+         * launcher used to keep its own copy beside the exe, so a rebind
+         * made there never reached the game and the keyboard looked dead
+         * (issue #17). A copy beside the exe that is newer than the
+         * player's is that lost rebind, carried across once here. */
+        const fs::path data = psx_user_data_dir(argv0 ? argv0 : "");
+        const fs::path kb = (data.empty() ? exe : data) / "keybinds.ini";
+        const fs::path legacy = exe / "keybinds.ini";
+        std::error_code ec;
+        if (!fs::equivalent(kb, legacy, ec) && fs::is_regular_file(legacy, ec)) {
+            const bool newer = !fs::exists(kb, ec) ||
+                               fs::last_write_time(legacy, ec) > fs::last_write_time(kb, ec);
+            if (newer) fs::copy_file(legacy, kb, fs::copy_options::overwrite_existing, ec);
+        }
+        g_rui_keybinds_path = kb.string();
         g_rui_config_ini_path = (exe / "config.ini").string();
     }
 
