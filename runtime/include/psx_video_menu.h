@@ -183,6 +183,10 @@ void psx_video_menu_mouse_release(void);
 /* Pointer left the window: cancels the hover-to-open dwell and clears the
  * hover highlight, so a menu never opens itself after the mouse has gone. */
 void psx_video_menu_mouse_leave(void);
+/* The window came or went (first show, minimize, restore, focus change):
+ * collapse, cancel the dwell, and hold hover-to-open until the pointer has
+ * been seen somewhere off the bar. */
+void psx_video_menu_quiet(void);
 
 /* Feed the module a millisecond clock once per frame. Drives hover-to-open:
  * resting on a title opens its dropdown after a short dwell. The module keeps

@@ -243,6 +243,10 @@ static int s_hover_menu = -1, s_hover_row = -1;
 static int          s_hover_title = -1;
 static unsigned int s_hover_title_ms;
 static unsigned int s_now_ms;
+/* Set by psx_video_menu_quiet: no hover-to-open until the pointer has been
+ * seen somewhere in the window that is NOT a title. A pointer that is simply
+ * already over the bar when the window comes back must not open anything. */
+static int          s_hover_gate;
 
 /* Designated: the old positional list had 7 values for 8 fields, so every
  * member from texture_filter on was initialised with its neighbour's value
@@ -1830,12 +1834,16 @@ void psx_video_menu_mouse_move(int win_x, int win_y) {
         if (s_expanded) {
             if (t != s_menu) { s_menu = t; s_dirty = 1; }
             s_hover_title = -1;
+        } else if (s_hover_gate) {
+            /* arrived on the bar without crossing the window first: wait */
+            s_hover_title = -1;
         } else if (t != s_hover_title) {
             s_hover_title = t;
             s_hover_title_ms = s_now_ms;
         }
     } else {
         s_hover_title = -1;
+        s_hover_gate = 0;
     }
 }
 
@@ -1860,6 +1868,15 @@ void psx_video_menu_mouse_leave(void) {
         s_hover_menu = s_hover_row = -1;
         s_dirty = 1;
     }
+}
+
+/* The window changed underneath the bar (shown, minimized, restored, focus
+ * moved): close the dropdown, drop the dwell, and refuse to arm a new dwell
+ * until the pointer has been seen off the bar. The bar itself stays. */
+void psx_video_menu_quiet(void) {
+    psx_video_menu_mouse_leave();
+    psx_video_menu_collapse();
+    s_hover_gate = 1;
 }
 
 void psx_video_menu_tick(unsigned int now_ms) {

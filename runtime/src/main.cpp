@@ -406,10 +406,22 @@ static void menu_quiet_across_window_changes(void) {
                      ((f & SDL_WINDOW_INPUT_FOCUS) == 0);
     if (was_away < 0) { was_away = away; return; }   /* the first frame is not a change */
     if (away != was_away) {
-        psx_video_menu_mouse_leave();
-        psx_video_menu_collapse();
+        psx_video_menu_quiet();
         was_away = away;
     }
+}
+
+/* Only the game window's own mouse drives the menu bar. Tool windows a mod
+ * opens (the Card Manager and its siblings) take their events first through
+ * the event hooks, but nothing else was filtered: a window that has just
+ * been destroyed can still have events in the queue with its id, and any
+ * other window the process owns has its own. A motion event from one of
+ * those in the top strip read as a pointer on the bar and armed the
+ * hover-to-open; a click there landed on a row. Not reproduced on demand
+ * (the tool windows consume their own events), so this is belt and braces
+ * for the reports of a menu opening by itself. */
+static int mouse_event_is_ours(Uint32 window_id) {
+    return sdl_window && window_id == SDL_GetWindowID(sdl_window);
 }
 
 static int game_window_focused(void) {
@@ -5999,7 +6011,8 @@ static void savestate_menu_host_pause_loop(void) {
                 } else {
                     savestate_menu_handle_key(key, (int)mod, repeat);
                 }
-            } else if (ev.type == SDL_MOUSEMOTION) {
+            } else if (ev.type == SDL_MOUSEMOTION &&
+                       mouse_event_is_ours(ev.motion.windowID)) {
                 int mx, my, dw, dh;
                 mouse_to_drawable(ev.motion.x, ev.motion.y, &mx, &my, &dw, &dh);
                 if (psx_video_menu_is_visible())
@@ -6013,7 +6026,8 @@ static void savestate_menu_host_pause_loop(void) {
                  * sub-code — this file is SDL3 with the oldnames shim, so the
                  * SDL2 spelling compiles to a rename-trap macro.) */
                 psx_video_menu_mouse_leave();
-            } else if (ev.type == SDL_MOUSEBUTTONUP) {
+            } else if (ev.type == SDL_MOUSEBUTTONUP &&
+                       mouse_event_is_ours(ev.button.windowID)) {
                 psx_video_menu_mouse_release();
             } else if (ev.type == SDL_MOUSEWHEEL) {
                 /* Wheel scrolls the slot list. The list has no scroll position
@@ -6023,7 +6037,8 @@ static void savestate_menu_host_pause_loop(void) {
                 if (dy > 0) savestate_menu_move(-1);
                 else if (dy < 0) savestate_menu_move(+1);
             } else if (ev.type == SDL_MOUSEBUTTONDOWN &&
-                       ev.button.button == SDL_BUTTON_LEFT) {
+                       ev.button.button == SDL_BUTTON_LEFT &&
+                       mouse_event_is_ours(ev.button.windowID)) {
                 int mx, my, dw, dh;
                 mouse_to_drawable(ev.button.x, ev.button.y, &mx, &my, &dw, &dh);
                 /* Offer the click to the menu bar first — it is the topmost
@@ -6276,16 +6291,20 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                        ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
                 /* A window that has just appeared -- first show, or back from
                  * the taskbar -- comes up with the menu bar quiet: no dropdown
-                 * left open from before, and no hover dwell still counting
-                 * down from wherever the pointer happened to be sitting.
-                 * Without it a restore can open a menu by itself over the
-                 * game, which is the same complaint as a menu the mouse
-                 * merely passed over on its way out of the window.
+                 * left open from before, no hover dwell still counting down
+                 * from wherever the pointer happened to be sitting, and no
+                 * hover-to-open at all until the pointer has been seen off
+                 * the bar. Without the last part a restore with the pointer
+                 * already over a title opened that menu by itself 350 ms
+                 * later (the platform reports the pointer's position as a
+                 * motion event when the window comes back), and the click
+                 * meant for the game landed on a row.
                  *
-                 * FOCUS_LOST only cancels the dwell: someone who alt-tabs
-                 * with a dropdown deliberately open keeps it. */
-                psx_video_menu_mouse_leave();
-                psx_video_menu_collapse();
+                 * FOCUS_LOST is in the list on purpose: a dropdown left open
+                 * over a game nobody is looking at is the other half of the
+                 * same complaint, and the poll above closes it on that edge
+                 * anyway. */
+                psx_video_menu_quiet();
             } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
                 refresh_player_devices();
             } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -6442,12 +6461,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
              * the overlay is laid out against the DRAWABLE, which differs on
              * HiDPI displays, so scale before handing them over. */
             else if (psx_video_menu_is_visible() &&
-                     ev.type == SDL_MOUSEBUTTONUP) {
+                     ev.type == SDL_MOUSEBUTTONUP &&
+                     mouse_event_is_ours(ev.button.windowID)) {
                 psx_video_menu_mouse_release();
             }
             else if (psx_video_menu_is_visible() &&
-                     (ev.type == SDL_MOUSEMOTION ||
-                      ev.type == SDL_MOUSEBUTTONDOWN)) {
+                     ((ev.type == SDL_MOUSEMOTION &&
+                       mouse_event_is_ours(ev.motion.windowID)) ||
+                      (ev.type == SDL_MOUSEBUTTONDOWN &&
+                       mouse_event_is_ours(ev.button.windowID)))) {
                 int win_w = 0, win_h = 0, drw = 0, drh = 0;
                 int rawx, rawy, mx, my;
                 SDL_GetWindowSize(sdl_window, &win_w, &win_h);
