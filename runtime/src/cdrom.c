@@ -2025,8 +2025,18 @@ static void queue_or_exec_command(uint8_t cmd) {
  * disc-speed divisors / 'instant' mode must never compress this latency back
  * into the race window. Call BEFORE stop_read_stream()/CDSTAT_READ clear. */
 static int pause_complete_delay_cycles(void) {
+    /* Already paused: the second response used to come 5000 cycles later,
+     * which is exactly CDROM_IRQ_PRESENT_DELAY, so INT2 (complete) was raised
+     * at the very instant INT3 (ack) was presented and could be consumed by
+     * the ack's own handling without ever being seen. Forbidden Memories'
+     * duel effect scripts issue Pause on an idle drive at every step, and a
+     * lost completion leaves the script's gate bit set forever: the
+     * intermittent mid-duel freeze (psx_freeze_report.c), reproduced from a
+     * reporter's state on 2026-09-07 with a pending Pause whose completion
+     * had been acked unpresented. Give it the same order of latency as Init:
+     * well past the ack's handler, still single-digit milliseconds. */
     if (!reading && !(stat_reg & (CDSTAT_READ | CDSTAT_PLAY)))
-        return 5000;
+        return 131072;
     int lba = reading ? msf_to_lba(read_min, read_sec, read_sect)
                       : last_sector_lba;
     if (lba < 0) lba = 0;
