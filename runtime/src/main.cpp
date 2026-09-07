@@ -384,6 +384,34 @@ static const Uint8* game_keys(void) {
  *
  * Hotkeys and the overlays they drive ask this; ordinary pad play does not,
  * so a player who deliberately runs the window unfocused still plays. */
+/* The menu bar comes back quiet.
+ *
+ * A window the player has just come back to -- from the taskbar, from another
+ * window, from its first appearance -- must not still be showing a dropdown
+ * from before, and must not have a hover dwell counting down from wherever
+ * the pointer was left. This is a POLL rather than a window-event handler
+ * because minimize and restore do not always arrive as events: measured on
+ * KDE Wayland, a full minimize / restore cycle delivered no window event at
+ * all, while Windows sends MINIMIZED and RESTORED as expected. Asking the
+ * window what it is costs one flags read a frame and is true everywhere.
+ *
+ * Both edges are taken. Closing it on the way OUT is what stops a dropdown
+ * being left open over a game nobody is looking at; closing it on the way
+ * back is what the player actually asked for. */
+static void menu_quiet_across_window_changes(void) {
+    static int was_away = -1;
+    if (!sdl_window) return;
+    const Uint32 f = SDL_GetWindowFlags(sdl_window);
+    const int away = ((f & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0) ||
+                     ((f & SDL_WINDOW_INPUT_FOCUS) == 0);
+    if (was_away < 0) { was_away = away; return; }   /* the first frame is not a change */
+    if (away != was_away) {
+        psx_video_menu_mouse_leave();
+        psx_video_menu_collapse();
+        was_away = away;
+    }
+}
+
 static int game_window_focused(void) {
     if (!sdl_window) return 1;              /* before the window exists, do not gate */
     if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) return 1;
@@ -6241,6 +6269,23 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
                 shutdown_runtime();
                 std::exit(0);
+            } else if (ev.type == SDL_EVENT_WINDOW_SHOWN ||
+                       ev.type == SDL_EVENT_WINDOW_RESTORED ||
+                       ev.type == SDL_EVENT_WINDOW_MAXIMIZED ||
+                       ev.type == SDL_EVENT_WINDOW_MINIMIZED ||
+                       ev.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                /* A window that has just appeared -- first show, or back from
+                 * the taskbar -- comes up with the menu bar quiet: no dropdown
+                 * left open from before, and no hover dwell still counting
+                 * down from wherever the pointer happened to be sitting.
+                 * Without it a restore can open a menu by itself over the
+                 * game, which is the same complaint as a menu the mouse
+                 * merely passed over on its way out of the window.
+                 *
+                 * FOCUS_LOST only cancels the dwell: someone who alt-tabs
+                 * with a dropdown deliberately open keeps it. */
+                psx_video_menu_mouse_leave();
+                psx_video_menu_collapse();
             } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
                 refresh_player_devices();
             } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -6434,6 +6479,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Whatever this title registered for itself. */
         psx_game_run_frame_hooks();
         /* Drives the menu's hover-to-open dwell; the module keeps no clock. */
+        menu_quiet_across_window_changes();
         psx_video_menu_tick((unsigned int)SDL_GetTicks());
         /* A newer release, if the background check found one. Polled once a
          * frame and answered at most once a run — the module latches, so this
