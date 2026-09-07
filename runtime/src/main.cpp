@@ -12958,8 +12958,11 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                 std::snprintf(ls.memcard_path[0], sizeof(ls.memcard_path[0]), "%s", mc1.c_str());
                 std::snprintf(ls.memcard_path[1], sizeof(ls.memcard_path[1]), "%s", mc2.c_str());
             }
-            ls.memcard_enabled[0] = seed.memcard1_enabled ? 1 : 0;
-            ls.memcard_enabled[1] = seed.memcard2_enabled ? 1 : 0;
+            /* -1 = disabled. To the launcher 0 means "unset" (a host that
+             * predates the field) and defaults to enabled, so a card the
+             * user switched off used to show — and then persist — as on. */
+            ls.memcard_enabled[0] = seed.memcard1_enabled ? 1 : -1;
+            ls.memcard_enabled[1] = seed.memcard2_enabled ? 1 : -1;
 #if defined(RECOMP_LAUNCHER_HAS_MULTITAP_ENABLED)
             ls.multitap_enabled = seed.multitap_enabled ? 1 : 0;
 #endif
@@ -13197,8 +13200,8 @@ static LauncherOutcome run_launcher_session(int argc, char** argv,
                     seed.has_bios_path = false;
                 }
                 /* Memory-card slots: enable flags + any Browse/New paths. */
-                seed.memcard1_enabled = ls.memcard_enabled[0] != 0; seed.has_memcard1_enabled = true;
-                seed.memcard2_enabled = ls.memcard_enabled[1] != 0; seed.has_memcard2_enabled = true;
+                seed.memcard1_enabled = ls.memcard_enabled[0] > 0; seed.has_memcard1_enabled = true;
+                seed.memcard2_enabled = ls.memcard_enabled[1] > 0; seed.has_memcard2_enabled = true;
 #if defined(RECOMP_LAUNCHER_HAS_MULTITAP_ENABLED)
                 seed.multitap_enabled = ls.multitap_enabled != 0;
                 seed.has_multitap_enabled = true;
@@ -15213,6 +15216,26 @@ soft_return_lobby:
                 }
             }
         }
+        /* Memory-card slots: the same PERSONAL cards the first-boot launcher
+         * shows — an explicit settings.toml path, else the <memcard_dir>/
+         * cardN.mcd default the runtime derives. psx_netplay_shutdown has
+         * already unbound the match-time netplay sandbox (guest mirror /
+         * host guest_card2.mcd), so those files are never what the player's
+         * launcher inspects. Left empty, the panel had nothing to inspect
+         * and fell back to a placeholder block pattern that read as foreign
+         * save data after a match; left 0, both slots re-armed as enabled. */
+        {
+            std::string mc1 = boot.memcard1_path.empty()
+                                  ? (boot.memcard_dir / "card1.mcd").string()
+                                  : boot.memcard1_path.string();
+            std::string mc2 = boot.memcard2_path.empty()
+                                  ? (boot.memcard_dir / "card2.mcd").string()
+                                  : boot.memcard2_path.string();
+            std::snprintf(ls.memcard_path[0], sizeof(ls.memcard_path[0]), "%s", mc1.c_str());
+            std::snprintf(ls.memcard_path[1], sizeof(ls.memcard_path[1]), "%s", mc2.c_str());
+        }
+        ls.memcard_enabled[0] = boot.memcard1_enabled ? 1 : -1;
+        ls.memcard_enabled[1] = boot.memcard2_enabled ? 1 : -1;
 #if defined(RECOMP_LAUNCHER_HAS_MULTITAP_ENABLED)
         ls.multitap_enabled = boot.multitap_enabled ? 1 : 0;
 #endif
@@ -15414,6 +15437,26 @@ soft_return_lobby:
                         boot.game_config_path, "multitap_analog", boot.multitap_analog);
                 }
 #endif
+                /* Memory-card slots: same fold as the first-boot exit path, so
+                 * a card toggled or browsed in from the rematch launcher
+                 * reaches memcard_init_slots at session_reboot and
+                 * settings.toml — instead of the rematch silently replaying
+                 * the pre-match slot config. A --memcard-dir fleet override
+                 * keeps winning over paths, as it does at first boot. */
+                boot.memcard1_enabled = ls.memcard_enabled[0] > 0;
+                boot.memcard2_enabled = ls.memcard_enabled[1] > 0;
+                us.memcard1_enabled = boot.memcard1_enabled; us.has_memcard1_enabled = true;
+                us.memcard2_enabled = boot.memcard2_enabled; us.has_memcard2_enabled = true;
+                if (!boot.cli_memcard_dir) {
+                    if (ls.memcard_path[0][0]) {
+                        boot.memcard1_path = ls.memcard_path[0];
+                        us.memcard1_path = boot.memcard1_path; us.has_memcard1_path = true;
+                    }
+                    if (ls.memcard_path[1][0]) {
+                        boot.memcard2_path = ls.memcard_path[1];
+                        us.memcard2_path = boot.memcard2_path; us.has_memcard2_path = true;
+                    }
+                }
                 us.renderer = ls.renderer;
                 us.has_renderer = true;
                 us.supersampling = ls.supersampling;
