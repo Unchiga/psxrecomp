@@ -1772,10 +1772,11 @@ static void flush_tex_batch(void) {
 /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
  * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
  * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
-#define FLATBATCH_MAXV 8190                 /* multiple of 3 */
+#define FLATBATCH_MAXV 8190                 /* a multiple of 3 and of 2: triangles or lines */
 static float s_fb[FLATBATCH_MAXV * 6];
 static int   s_fb_n = 0;
 static int   s_fb_semi = -2;
+static GLenum s_fb_mode = GL_TRIANGLES;    /* GL_TRIANGLES or GL_LINES, one per batch */
 static int   s_fb_mask = -1;
 
 static int mirror_flat_batch_center_only(int nverts) {
@@ -1792,17 +1793,19 @@ static int mirror_flat_batch_center_only(int nverts) {
 static void flush_flat_batch(void) {
     if (s_fb_n == 0) return;
     int nverts = s_fb_n, semi = s_fb_semi, mask = s_fb_mask;
+    const GLenum mode = s_fb_mode;
     s_fb_n = 0;
 
     hr_begin(1);
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
+    if (mode == GL_LINES) glLineWidth((float)s_scale);
     p_glUseProgram(s_geo_prog);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * 6 * sizeof(float)),
                    s_fb, PSXGL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, nverts);
+    glDrawArrays(mode, 0, nverts);
 
     if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
         !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
@@ -1812,7 +1815,7 @@ static void flush_flat_batch(void) {
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, nverts);
+        if (s_ws_ablate != 2) glDrawArrays(mode, 0, nverts);
         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
@@ -1830,8 +1833,17 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     /* Sub-pixel positions only describe a 3-vertex projected triangle. */
     const int precise = s_pc_valid && mode == GL_TRIANGLES && n == 3;
 
-    /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
-    if (mode != GL_TRIANGLES || n < 3) {
+    /* Triangles batch (MotK 0x68 starfields) and so do lines, in batches of
+     * their own kind: a batch is one mode, one blend, one mask. Lines used
+     * to be drawn one at a time as "rare", and each one paid the whole
+     * pipeline -- FBO bind, blend and stencil state, program, a fresh
+     * glBufferData, the draw, the widescreen mirror draw, and the teardown.
+     * Forbidden Memories' credits are wireframe monsters of 1000 to 1300
+     * lines a frame, and that path measured 6 to 16 ms of GPU time per
+     * frame on an RTX 4090 (2026-09-06, frame_perf: per_prim_us 6.3 to
+     * 12.8), which is a pinned 60 fps at 3x speed here and a slideshow on a
+     * laptop GPU. Batched, the same frames are a handful of draws. */
+    if (!((mode == GL_TRIANGLES && n == 3) || (mode == GL_LINES && n == 2))) {
         flush_flat_batch();
         float verts[3 * 6];
         float mask_a = s_mask_set ? 1.0f : 0.0f;
@@ -1869,12 +1881,13 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         return;
     }
 
-    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
+    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set || s_fb_mode != mode))
         flush_flat_batch();
     if (s_fb_n + n > FLATBATCH_MAXV)
         flush_flat_batch();
     s_fb_semi = semi;
     s_fb_mask = (int)s_mask_set;
+    s_fb_mode = mode;
 
     float mask_a = s_mask_set ? 1.0f : 0.0f;
     for (int i = 0; i < n; i++) {
