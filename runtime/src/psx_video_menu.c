@@ -155,6 +155,7 @@ typedef struct VmRegRow {
     int   mark;              /* notch on the track, or -1 */
     const char *key;         /* menu_settings.ini name; NULL = not persisted */
     int   order;             /* rows of a menu sort by this, then by registration; 0 default */
+    int   initial;           /* the value registered with: what "back to stock" means */
     int   value;
     int   restored;          /* value came from the settings file, not the
                               * registered default -- see
@@ -2131,6 +2132,7 @@ int psx_video_menu_add_option(int menu, const char *label, const char *hint,
     r->choice_count = choice_count;
     r->key = settings_key;
     r->value = (initial >= 0 && initial < choice_count) ? initial : 0;
+    r->initial = r->value;
     r->on_change = on_change;
     return h;
 }
@@ -2146,6 +2148,7 @@ int psx_video_menu_add_number(int menu, const char *label, const char *hint,
     r->slider = slider;
     r->key = settings_key;
     r->value = (initial < lo) ? lo : (initial > hi) ? hi : initial;
+    r->initial = r->value;
     r->on_change = on_change;
     return h;
 }
@@ -2190,6 +2193,14 @@ int psx_video_menu_row_info(int row_handle, int *menu, int *kind,
 }
 
 void psx_video_menu_note_change(void) { s_changed = 1; s_dirty = 1; }
+
+int psx_video_menu_reset_row(int row_handle) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return 0;
+    const VmRegRow *r = &s_reg[row_handle];
+    if (r->kind == PSX_VM_ROW_ACTION || r->value == r->initial) return 0;
+    psx_video_menu_set_row(row_handle, r->initial);
+    return 1;
+}
 
 int psx_video_menu_menu_row_label(int menu, int nth, const char **label) {
     const VmRegRow *r = (menu >= 0 && menu < s_menu_total) ? reg_at(menu, nth) : NULL;

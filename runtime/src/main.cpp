@@ -11774,6 +11774,15 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
         fprintf(stdout, "psxrecomp: player data in %s%s\n",
                 g_player_data_dir.c_str(),
                 g_player_data_migrated ? " (migrated from the install folder)" : "");
+    } else {
+        /* --memcard-dir (or a portable install) skips the migration above,
+         * and used to skip THIS too: the mods' player folder stayed empty,
+         * so a run meant to be isolated wrote its cards, portraits and inis
+         * into whatever the mods fell back on -- measured 2026-09-06 as the
+         * real per-user folder, under another instance that was reading it.
+         * Writable state is wherever the memory cards are, in every case. */
+        g_player_data_dir = boot.memcard_dir.string();
+        fprintf(stdout, "psxrecomp: player data in %s\n", g_player_data_dir.c_str());
     }
 
     /* The game's OWN native OPTION settings (game_options.toml, next to

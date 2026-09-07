@@ -307,6 +307,9 @@ int  psx_video_menu_row_count(void);
 int  psx_video_menu_row_info(int row_handle, int *menu, int *kind,
                              const char **settings_key, const char **label);
 void psx_video_menu_note_change(void);
+/* Put a row back to the value it registered with (its mod's default), firing
+ * on_change like a click. 1 when it changed. */
+int  psx_video_menu_reset_row(int row_handle);
 /* The registered rows of one menu in DISPLAY order (after its built-in
  * rows): nth = 0.. until it returns 0. What a test reads to check an order. */
 int  psx_video_menu_menu_row_label(int menu, int nth, const char **label);
