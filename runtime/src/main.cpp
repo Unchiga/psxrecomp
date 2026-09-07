@@ -371,6 +371,26 @@ static const Uint8* game_keys(void) {
     if (sdl_window && SDL_GetKeyboardFocus() != sdl_window) return s_none;
     return SDL_GetKeyboardState(NULL);
 }
+
+/* Is the game window the one the player is using?
+ *
+ * The keyboard already answers this by itself (game_keys above), but a
+ * CONTROLLER does not: SDL keeps SDL_GameControllerGetButton live whoever is
+ * in front, so every pad HOTKEY -- the save state menu, rewind -- fired while
+ * the game sat in the background. Reported from a player who alt-tabbed away
+ * to watch television with the pad still in hand: the save state menu opened
+ * behind their back, the pad walked the slot list, and the next X they
+ * pressed loaded an old state over their game.
+ *
+ * Hotkeys and the overlays they drive ask this; ordinary pad play does not,
+ * so a player who deliberately runs the window unfocused still plays. */
+static int game_window_focused(void) {
+    if (!sdl_window) return 1;              /* before the window exists, do not gate */
+    if (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) return 1;
+    /* Two ways of asking the same question, because the cost of getting it
+     * wrong is a player whose hotkeys stopped working. */
+    return SDL_GetKeyboardFocus() == sdl_window;
+}
 }
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
@@ -5161,6 +5181,9 @@ static int hotkey_pad_binding_down(int binding) {
     SDL_GameController *h = g_players[0].handle;
     if (!h || binding == 0)
         return 0;
+    /* A hotkey belongs to the focused window. */
+    if (!game_window_focused())
+        return 0;
     if (PSX_HOTKEY_PAD_IS_BUTTON_COMBO(binding)) {
         uint32_t mask = (uint32_t)PSX_HOTKEY_PAD_BUTTON_COMBO_MASK(binding);
         if (!mask)
@@ -5633,6 +5656,15 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     int prev = 0, next = 0, load = 0, save = 0, cancel = 0;
     int dir = 0;
 
+    /* Unfocused: read nothing, and forget what was held. Coming back with a
+     * button still down must not read as a fresh press -- that is how a menu
+     * opened in the background turned into a load on the way back. */
+    if (!game_window_focused()) {
+        prev_load = prev_save = prev_cancel = prev_toggle = 0;
+        held_dir = 0;
+        return;
+    }
+
     SDL_GameController *h = g_players[0].handle;
     if (h) {
         const Sint16 lx =
@@ -5694,6 +5726,7 @@ static int rewind_toggle_buttons_down(void) {
 
 static void rewind_poll_toggle_buttons(void) {
     static int was_down;
+    if (!game_window_focused()) { was_down = 0; return; }
     int down = rewind_toggle_buttons_down();
     if (down && !was_down && !psx_rewind_is_open())
         psx_rewind_toggle();
@@ -5702,6 +5735,7 @@ static void rewind_poll_toggle_buttons(void) {
 
 static void savestate_menu_poll_toggle_buttons(void) {
     static int was_down;
+    if (!game_window_focused()) { was_down = 0; return; }
     int down = hotkey_pad_binding_down(g_hotkey_pad_save_state_menu);
     if (down && !was_down && !psx_rewind_is_open())
         savestate_menu_toggle(0);
@@ -5709,6 +5743,9 @@ static void savestate_menu_poll_toggle_buttons(void) {
 }
 
 static void rewind_poll_nav(uint32_t now_ms) {
+    /* Same rule as the save state menu: an overlay the player is not looking
+     * at does not take pad input. */
+    if (!game_window_focused()) return;
     const Uint8 *keys = game_keys();
     int left = keys[SDL_SCANCODE_LEFT] ? 1 : 0;
     int right = keys[SDL_SCANCODE_RIGHT] ? 1 : 0;
