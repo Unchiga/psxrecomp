@@ -1990,12 +1990,24 @@ static void try_execute_queued_command(void) {
     exec_command(cmd);
 }
 
+static uint64_t s_cmd_queue_overwrites;
+
 static void queue_or_exec_command(uint8_t cmd) {
     if (irq_flag == 0) {
         exec_command(cmd);
         return;
     }
 
+    if (queued_cmd.pending) {
+        /* One slot: the command already waiting here is lost. Not a fix,
+         * a tripwire (cdrom_state / the freeze report), because the guest
+         * side of this is a wait that never ends. */
+        s_cmd_queue_overwrites++;
+        fprintf(stderr, "cdrom: command 0x%02X queued over unexecuted 0x%02X "
+                        "(irq_flag 0x%02X, #%llu)\n",
+                cmd, queued_cmd.cmd, (unsigned)irq_flag,
+                (unsigned long long)s_cmd_queue_overwrites);
+    }
     queued_cmd.cmd = cmd;
     queued_cmd.param_count = param_count;
     if (queued_cmd.param_count < 0) queued_cmd.param_count = 0;
@@ -3048,6 +3060,8 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->int_last_lost_old = s_int_last_lost_old;
     out->int_last_lost_new = s_int_last_lost_new;
     out->int_last_lost_gen = s_int_last_lost_gen;
+    out->cmd_queue_overwrites = s_cmd_queue_overwrites;
+    memcpy(out->response_fifo, response_fifo, sizeof(out->response_fifo));
     out->pending_pending = pending.pending;
     out->pending_delay = pending_rem_cycles();
     out->pending_phase = pending.phase;

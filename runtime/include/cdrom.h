@@ -208,6 +208,13 @@ typedef struct CDROMDebugState {
     uint8_t  int_last_lost_old;
     uint8_t  int_last_lost_new;
     uint32_t int_last_lost_gen;
+    /* A command written while one was already queued behind an unacked INT
+     * replaces it: the earlier command is never executed and the guest waits
+     * for its response forever. Counted so a freeze report can say whether
+     * that happened (2026-09-07, Forbidden Memories' XA position poll). */
+    uint64_t cmd_queue_overwrites;
+    /* The response FIFO as it stands, response_count bytes valid. */
+    uint8_t  response_fifo[16];
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {

@@ -644,6 +644,8 @@ void handle_cdrom_state(int id, const char *json)
              "\"int_lost_unseen\":[%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"int_acked_unpresented\":[%llu,%llu,%llu,%llu,%llu,%llu],"
              "\"int_last_lost\":{\"old\":%u,\"new\":%u,\"gen\":%u},"
+             "\"queue_overwrites\":%llu,"
+             "\"response_fifo\":\"%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\","
              "\"i_stat\":\"0x%08X\"}",
              id, (unsigned long long)s.seq, s.has_disc,
              s.index_reg, s.stat_reg, s.request_reg, s.irq_enable, s.irq_flag,
@@ -668,6 +670,11 @@ void handle_cdrom_state(int id, const char *json)
              CD_INT6(s.int_clobbered), CD_INT6(s.int_lost_unseen),
              CD_INT6(s.int_acked_unpresented),
              s.int_last_lost_old, s.int_last_lost_new, s.int_last_lost_gen,
+             (unsigned long long)s.cmd_queue_overwrites,
+             s.response_fifo[0], s.response_fifo[1], s.response_fifo[2], s.response_fifo[3],
+             s.response_fifo[4], s.response_fifo[5], s.response_fifo[6], s.response_fifo[7],
+             s.response_fifo[8], s.response_fifo[9], s.response_fifo[10], s.response_fifo[11],
+             s.response_fifo[12], s.response_fifo[13], s.response_fifo[14], s.response_fifo[15],
              s.i_stat);
 }
 
