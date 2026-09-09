@@ -4036,6 +4036,19 @@ int psx_savestate_host_resume_inputs_held(void) {
 static void apply_input_override_to_sio(int override_word) {
     PlayerInput& p = g_players[0];
     const uint16_t w = (uint16_t)override_word;
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* `slot: 1` drives port 2 as a plain digital pad and leaves port 1
+     * released, so a two-controller screen can be walked from a script. */
+    if (debug_server_get_input_slot() == 1 && PSX_MAX_PLAYERS >= 2) {
+        savestate_diag_note("ovr", 1, w, w, 0);
+        sio_set_pad_connected(1, 1);
+        sio_set_pad_state_slot(0, 0xFFFFu);
+        sio_set_pad_state_slot(1, w);
+        sio_set_pad_sticks(1, 0x80, 0x80, 0x80, 0x80);
+        sio_request_pad_type(1, 0);
+        return;
+    }
+#endif
     savestate_diag_note("ovr", 0, w, w, 0);
     sio_set_pad_state_slot(0, w);
 

@@ -318,6 +318,9 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+/* Which SIO pad the override drives: 0 (port 1, default) or 1 (port 2).
+ * `slot` on set_input / press; two-controller screens (2P DUEL) need it. */
+static int s_input_slot     = 0;
 /* Optional analog-stick override (set_input lx/ly/rx/ry, 0..255, 0x80 =
  * centre). Lets injected input drive analog-mode movement; consumed by the
  * pad sampler alongside the button word. */
@@ -6196,6 +6199,7 @@ static void handle_set_input(int id, const char *json)
     }
     s_input_override = (int)hex_to_u32(val_str);
     s_input_frames = 0;
+    s_input_slot = json_get_int(json, "slot", 0) == 1 ? 1 : 0;
     /* Optional stick override: any of lx/ly/rx/ry (0..255) arms it; omitted
      * axes centre. Absent entirely -> released (buttons-only injection). */
     int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
@@ -6215,6 +6219,7 @@ static void handle_press(int id, const char *json)
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
     s_input_override = buttons;
     s_input_frames   = frames;
+    s_input_slot     = json_get_int(json, "slot", 0) == 1 ? 1 : 0;
     int ax[4] = { json_get_int(json, "lx", -1), json_get_int(json, "ly", -1),
                   json_get_int(json, "rx", -1), json_get_int(json, "ry", -1) };
     s_axis_override = (ax[0] >= 0 || ax[1] >= 0 || ax[2] >= 0 || ax[3] >= 0);
@@ -6263,6 +6268,7 @@ static void handle_clear_input(int id, const char *json)
     s_input_route_remaining = 0;
     s_input_override = -1;
     s_input_frames   = 0;
+    s_input_slot     = 0;
     s_axis_override  = 0;
     s_axis_st[0] = s_axis_st[1] = s_axis_st[2] = s_axis_st[3] = 0x80;
     send_ok(id);
@@ -13495,6 +13501,11 @@ int debug_server_get_input_override(void)
             s_input_override = -1;
     }
     return current;
+}
+
+int debug_server_get_input_slot(void)
+{
+    return s_input_slot;
 }
 
 int debug_server_get_axis_override(unsigned char st[4])

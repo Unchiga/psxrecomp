@@ -204,6 +204,8 @@ int debug_server_get_input_override(void);
  * 0..255, 0x80 = centre). Returns 1 and fills st[lx,ly,rx,ry] when armed,
  * 0 when the injection is buttons-only. */
 int debug_server_get_axis_override(unsigned char st[4]);
+/* SIO pad slot the current override targets (0 = port 1, 1 = port 2). */
+int debug_server_get_input_slot(void);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and
  * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */
