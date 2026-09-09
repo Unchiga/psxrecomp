@@ -200,9 +200,17 @@ def clamp_future_mtimes(
                 continue
             if mtime > stamp:
                 try:
-                    os.utime(p, (stamp, stamp), follow_symlinks=False)
+                    # follow_symlinks=False is unsupported on Windows (utime
+                    # raises NotImplementedError), and NotImplementedError is
+                    # not an OSError, so it would escape. Only pass the flag
+                    # where the platform supports it; otherwise stamp through
+                    # the link, which is fine for clamping a future mtime.
+                    if os.utime in os.supports_follow_symlinks:
+                        os.utime(p, (stamp, stamp), follow_symlinks=False)
+                    else:
+                        os.utime(p, (stamp, stamp))
                     n += 1
-                except OSError:
+                except (OSError, NotImplementedError):
                     pass
     return n
 
