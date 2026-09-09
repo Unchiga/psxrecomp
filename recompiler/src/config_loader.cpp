@@ -1202,10 +1202,13 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::string netplay_required_disc_fp;
     std::string netplay_local_viewport;
     std::string netplay_local_viewport_aspect;
+    bool netplay_guest_memcard_default = false;
     if (cfg.contains("netplay")) {
         const toml::value& np = toml::find(cfg, "netplay");
         if (np.contains("require_cue"))
             netplay_require_cue = toml::find<bool>(np, "require_cue");
+        if (np.contains("guest_memcard_default"))
+            netplay_guest_memcard_default = toml::find<bool>(np, "guest_memcard_default");
         if (np.contains("required_tracks"))
             netplay_required_tracks = toml::find<int>(np, "required_tracks");
         if (np.contains("required_leadout_lba")) {
@@ -2037,6 +2040,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*netplay_required_disc_fp*/ netplay_required_disc_fp,
         /*netplay_local_viewport*/ netplay_local_viewport,
         /*netplay_local_viewport_aspect*/ netplay_local_viewport_aspect,
+        /*netplay_guest_memcard_default*/ netplay_guest_memcard_default,
         /*seeds_path*/       seeds_path,
         /*bios_thunks_path*/ bios_thunks_path,
         /*bios_config_path*/ bios_config_path,

@@ -1165,6 +1165,9 @@ static int           g_ws_adaptive_max_den = 9;
  * present only this peer's native split-screen half and stretch it to the
  * window. Presentation-only; the guest still renders the original framebuffer. */
 static int g_netplay_local_viewport = 0; /* 0 off, 1 vertical split */
+/* game.toml [netplay] guest_memcard_default: seat 2 offers its own card as
+ * soon as it sits down (the lobby glyph starts lit). */
+static bool g_netplay_guest_memcard_default = false;
 /* Optional aspect for netplay local-view extraction. Mirrors trusted mod aspect
  * activation, but remains game.toml opt-in so normal netplay stays vanilla. */
 static int g_netplay_local_viewport_aspect = 0; /* 0 off, 1 16:9, 2 21:9, 3 adaptive */
@@ -9453,6 +9456,9 @@ namespace {
     /* Bring-your-own memory card callbacks (see recomp_launcher.h). */
     int ae_np_memcard_offer_set(void*, int has_card, int share) {
         PsxLobbyMemcardOffer next = g_lnch_memcard_offer;
+        /* First publication with no explicit choice: the title's default. */
+        if (!g_lnch_memcard_offer.valid && share < 0 && g_netplay_guest_memcard_default)
+            next.share = 1;
         next.valid = 1;
         next.has_card = has_card ? 1 : 0;
         if (share >= 0) next.share = share ? 1 : 0;
@@ -11720,6 +11726,7 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
             g_netplay_disc_expect.required_leadout_lba =
                 gc.netplay_required_leadout_lba;
             g_netplay_disc_expect.required_disc_fp = gc.netplay_required_disc_fp;
+            g_netplay_guest_memcard_default = gc.netplay_guest_memcard_default;
             g_netplay_local_viewport =
                 (gc.netplay_local_viewport == "vertical_split") ? 1 : 0;
             g_netplay_local_viewport_aspect =
