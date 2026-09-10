@@ -8,6 +8,8 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "psx_icache.h"    /* g_psx_icache_tv — fetch-cost tags in BS_SEC_ICACHE */
+#include "mod_memory.h"
+#include "mod_runtime.h"
 #include "pst_wire.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -370,7 +372,12 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 16;
+    h.section_count = 18;
+
+    /* Plugins publish their host mirrors into snapshot-backed guest memory
+     * before any section is captured. This path is shared by disk, rewind,
+     * delay-sync, and rollback saves. */
+    mod_runtime_before_savestate_save();
 
     ok = write_header_le(o, &h);
 
@@ -443,6 +450,12 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
             ok = pst_w_u32(&w, g_psx_icache_tv[i]);
         if (ok) ok = write_section(o, BS_SEC_ICACHE, ib, sizeof ib);
     }
+    if (ok) ok = write_module_section(o, BS_SEC_MODMEM,
+                                      psx_mod_memory_snapshot_bytes,
+                                      psx_mod_memory_snapshot_write);
+    if (ok) ok = write_module_section(o, BS_SEC_MODGPU,
+                                      psx_mod_gpu_dma_memory_snapshot_bytes,
+                                      psx_mod_gpu_dma_memory_snapshot_write);
     if (ok) {
         uint32_t wc = dirty_ram_get_bitmap_word_count();
         uint64_t nbytes = (uint64_t)wc * 4u;
@@ -676,6 +689,10 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
             if (!pst_r_u32(&r, &g_psx_icache_tv[i])) return 0;
         return 1;
     }
+    case BS_SEC_MODMEM:
+        return psx_mod_memory_snapshot_read(p, len);
+    case BS_SEC_MODGPU:
+        return psx_mod_gpu_dma_memory_snapshot_read(p, len);
     default:
         /* Unknown section: SKIP, never fail. This was `return 0`, which made
          * every state written by a build with one extra section a poison pill
@@ -896,6 +913,13 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 
     if (!ok || (seen & required) != required)
         return 0;
+
+    /* Older v7 snapshots legitimately have no plugin-memory sections. Do not
+     * leak the current/future timeline into them: restore the old all-zero
+     * state, then let each plugin rebuild its host mirrors. */
+    if (!(seen & (1u << BS_SEC_MODMEM))) psx_mod_memory_snapshot_reset();
+    if (!(seen & (1u << BS_SEC_MODGPU))) psx_mod_gpu_dma_memory_snapshot_reset();
+    mod_runtime_after_savestate_load();
 
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();

@@ -733,8 +733,14 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
     powershell.exe -NoProfile -NonInteractive -Command \
       "Compress-Archive -Path '.\\*' -DestinationPath '$(cygpath -w "${DIST}/${ZIP_NAME}" 2>/dev/null || echo "${DIST}/${ZIP_NAME}")' -Force" \
       || { echo "error: Compress-Archive failed" >&2; exit 1; }
+  elif command -v cmake >/dev/null 2>&1; then
+    # CMake is already required to build the setup host and its portable
+    # archive mode is available on minimal Linux builders that do not ship a
+    # standalone zip utility.
+    cmake -E tar cf "${DIST}/${ZIP_NAME}" --format=zip . \
+      || { echo "error: cmake ZIP creation failed" >&2; exit 1; }
   else
-    echo "error: no zip, 7z, or powershell.exe available to build the archive" >&2
+    echo "error: no zip, 7z, powershell.exe, or cmake available to build the archive" >&2
     exit 1
   fi
 )

@@ -105,6 +105,8 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    BS_SEC_MODMEM = 0x11,  /* allocated trusted-plugin Expansion 1 bytes       */
+    BS_SEC_MODGPU = 0x12,  /* allocated trusted-plugin GPU DMA aperture bytes  */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

@@ -30,8 +30,8 @@ require(
     "host-refresh matching must compare against guest cadence, not effective host period",
 )
 require(
-    "g_frame_period_ms = g_guest_frame_period_ms;\n    if (host_refresh_matches_guest_cadence())",
-    "mismatched display probes must restore guest pacing before deciding vsync ownership",
+    "g_frame_period_base_ms = g_guest_frame_period_ms;\n    frame_period_refresh();\n    if (host_refresh_matches_guest_cadence())",
+    "mismatched display probes must restore speed-adjusted guest pacing before deciding vsync ownership",
 )
 require(
     "refresh_host_display_cadence(1, 1);",
@@ -50,8 +50,8 @@ require(
     "runtime probe must still refresh same-display mode changes periodically",
 )
 
-if MAIN.count("SDL_GetWindowDisplayIndex(sdl_window)") != 1:
-    raise AssertionError("window display probing should have one shared owner")
+if MAIN.count("const int disp_idx = SDL_GetWindowDisplayIndex(sdl_window);") != 1:
+    raise AssertionError("cadence-related window display probing should have one shared owner")
 
 startup = MAIN.index("refresh_host_display_cadence(1, 1);")
 runtime = MAIN.index("refresh_host_display_cadence(0, 0);")

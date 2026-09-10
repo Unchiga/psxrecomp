@@ -8,6 +8,7 @@ extern "C" {
 
 typedef void (*PSXModVBlankCallback)(void);
 typedef void (*PSXModActivationCallback)(void);
+typedef void (*PSXModStateCallback)(void);
 struct CPUState;
 typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
                                             uint32_t address);
@@ -21,6 +22,16 @@ int psx_mod_register_activation_plugin(const char* id,
                                        PSXModActivationCallback callback);
 int psx_mod_register_vblank_plugin(const char* id,
                                    PSXModVBlankCallback callback);
+/*
+ * Register host-state synchronization for full-machine snapshots. The save
+ * callback must copy the plugin's authoritative host state into memory
+ * obtained from psx_mod_alloc_guest_memory(); the load callback restores its
+ * host mirrors from that memory. Both disk savestates and rollback snapshots
+ * use these callbacks.
+ */
+int psx_mod_register_state_plugin(const char* id,
+                                  PSXModStateCallback before_save,
+                                  PSXModStateCallback after_load);
 int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback);
 /* Called only from generated functions explicitly listed by the game config. */

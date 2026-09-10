@@ -16592,12 +16592,12 @@ session_reboot:
     std::fprintf(stderr, "ORACLE: running with BP at 0x8005A5BC (VSync incrementer)...\n");
     std::fflush(stderr);
 
+    uint64_t total_executed = 0;
+    uint32_t vsync_hits = 0;
     for (;;) {
         uint32_t ran = interp_step(&cpu, 1000000);
-        uint64_t total_executed = 0;
         total_executed += ran;
         if (interp_hit_breakpoint()) {
-            uint32_t vsync_hits = 0;
             vsync_hits++;
             if (vsync_hits <= 3 || (vsync_hits % 100 == 0)) {
                 std::fprintf(stderr, "ORACLE: VSync hit #%u at %llu instructions, ra=0x%08X, gte_exec=%llu\n",

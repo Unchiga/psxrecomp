@@ -5,6 +5,7 @@
 
 #include "gpu.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -19,6 +20,8 @@ static std::array<uint8_t, 2 * 1024 * 1024> ram;
 static int failures;
 static int activation_calls;
 static int plugin_calls;
+static int state_save_calls;
+static int state_load_calls;
 
 extern "C" uint8_t psx_read_byte(uint32_t address) {
     return ram[address & 0x1fffffu];
@@ -72,6 +75,14 @@ extern "C" void gpu_get_display_info(GpuDisplayInfo* out) {
 
 extern "C" void dirty_ram_mark_executable_range(uint32_t, uint32_t) {}
 extern "C" int fntrace_is_game_started(void) { return 1; }
+extern "C" const char* psx_mod_host_player_data_dir(void) { return "."; }
+extern "C" int cdrom_override_set(uint32_t, const uint8_t*, uint32_t) { return 1; }
+extern "C" int cdrom_override_clear(uint32_t) { return 1; }
+extern "C" void cdrom_override_clear_all(void) {}
+extern "C" int cdrom_read_stock_sector(uint32_t, uint8_t* out) {
+    if (out) std::fill(out, out + 2048, 0);
+    return out != nullptr;
+}
 
 static void test_vblank_plugin(void) {
     plugin_calls++;
@@ -80,6 +91,9 @@ static void test_vblank_plugin(void) {
 static void test_activation_plugin(void) {
     activation_calls++;
 }
+
+static void test_state_save(void) { state_save_calls++; }
+static void test_state_load(void) { state_load_calls++; }
 
 static void check(bool value, const char* message) {
     if (!value) {
@@ -307,6 +321,16 @@ int main() {
     check(PSXRecompV4::mod_register_vblank_plugin(
               "runtime.test-vblank", test_vblank_plugin),
           "runtime test plugin must register");
+    check(psx_mod_register_state_plugin(
+              "runtime.test-state", test_state_save, test_state_load),
+          "runtime state plugin must register");
+    check(!psx_mod_register_state_plugin(
+               "runtime.test-state", test_state_save, test_state_load),
+          "duplicate runtime state plugin ids must be rejected");
+    mod_runtime_before_savestate_save();
+    mod_runtime_after_savestate_load();
+    check(state_save_calls == 1 && state_load_calls == 1,
+          "common savestate callbacks must invoke both plugin state hooks");
     check(PSXRecompV4::mod_runtime_initialize(
               root, "SLUS-RUNTIME", 0x80002000, {}, &error),
           error.c_str());

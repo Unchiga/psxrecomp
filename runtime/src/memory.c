@@ -43,6 +43,39 @@ static uint32_t mod_memory_used;
 static uint8_t mod_gpu_dma_memory[PSX_MOD_GPU_DMA_APERTURE_SIZE];
 static uint32_t mod_gpu_dma_memory_used;
 
+uint32_t psx_mod_memory_snapshot_bytes(void) { return mod_memory_used; }
+void psx_mod_memory_snapshot_write(uint8_t *out) {
+    if (mod_memory_used) memcpy(out, mod_memory, mod_memory_used);
+}
+int psx_mod_memory_snapshot_read(const uint8_t *in, uint32_t len) {
+    if (len > mod_memory_used) return 0;
+    if (mod_memory_used) memset(mod_memory, 0, mod_memory_used);
+    if (len) memcpy(mod_memory, in, len);
+    return 1;
+}
+void psx_mod_memory_snapshot_reset(void) {
+    if (mod_memory_used) memset(mod_memory, 0, mod_memory_used);
+}
+
+uint32_t psx_mod_gpu_dma_memory_snapshot_bytes(void) {
+    return mod_gpu_dma_memory_used;
+}
+void psx_mod_gpu_dma_memory_snapshot_write(uint8_t *out) {
+    if (mod_gpu_dma_memory_used)
+        memcpy(out, mod_gpu_dma_memory, mod_gpu_dma_memory_used);
+}
+int psx_mod_gpu_dma_memory_snapshot_read(const uint8_t *in, uint32_t len) {
+    if (len > mod_gpu_dma_memory_used) return 0;
+    if (mod_gpu_dma_memory_used)
+        memset(mod_gpu_dma_memory, 0, mod_gpu_dma_memory_used);
+    if (len) memcpy(mod_gpu_dma_memory, in, len);
+    return 1;
+}
+void psx_mod_gpu_dma_memory_snapshot_reset(void) {
+    if (mod_gpu_dma_memory_used)
+        memset(mod_gpu_dma_memory, 0, mod_gpu_dma_memory_used);
+}
+
 /*
  * Trusted mods may opt into host-backed guest memory in Expansion 1. Before
  * the first allocation this entire region retains hardware open-bus behavior.

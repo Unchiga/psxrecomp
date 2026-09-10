@@ -30,5 +30,5 @@ assert "0x00010000u" in window, "config floor must keep the kernel-window clamp"
 
 assert "build_toolchain_cmd(\"gcc\")" in MAIN, "bundled toolchain must be able to drive gcc"
 assert "build_toolchain_cmd(\"tcc\")" in MAIN
-assert "(deferred_has_overlay_ac || tk_present)" in MAIN, "gcc availability must count the bundle"
+assert "(boot.deferred_has_overlay_ac || tk_present)" in MAIN, "gcc availability must count the bundle"
 print("overlay_region_floor config + bundled-gcc guards: OK")

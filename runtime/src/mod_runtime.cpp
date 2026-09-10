@@ -84,8 +84,19 @@ struct FunctionEntryPlugin {
     PSXModFunctionEntryCallback callback = nullptr;
 };
 
+struct StatePlugin {
+    std::string id;
+    PSXModStateCallback before_save = nullptr;
+    PSXModStateCallback after_load = nullptr;
+};
+
 std::vector<FunctionEntryPlugin>& function_entry_plugins() {
     static std::vector<FunctionEntryPlugin> value;
+    return value;
+}
+
+std::vector<StatePlugin>& state_plugins() {
+    static std::vector<StatePlugin> value;
     return value;
 }
 
@@ -1459,6 +1470,31 @@ extern "C" int psx_mod_register_function_entry_plugin(
     if (duplicate != plugins.end()) return 0;
     plugins.push_back(FunctionEntryPlugin{id, address, callback});
     return 1;
+}
+
+extern "C" int psx_mod_register_state_plugin(
+    const char* id, PSXModStateCallback before_save,
+    PSXModStateCallback after_load) {
+    using namespace PSXRecompV4;
+    if (!id || !*id || !before_save || !after_load) return 0;
+    auto& plugins = state_plugins();
+    const auto duplicate = std::find_if(
+        plugins.begin(), plugins.end(), [&](const StatePlugin& item) {
+            return item.id == id;
+        });
+    if (duplicate != plugins.end()) return 0;
+    plugins.push_back(StatePlugin{id, before_save, after_load});
+    return 1;
+}
+
+extern "C" void mod_runtime_before_savestate_save(void) {
+    using namespace PSXRecompV4;
+    for (const StatePlugin& plugin : state_plugins()) plugin.before_save();
+}
+
+extern "C" void mod_runtime_after_savestate_load(void) {
+    using namespace PSXRecompV4;
+    for (const StatePlugin& plugin : state_plugins()) plugin.after_load();
 }
 
 extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
