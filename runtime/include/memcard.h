@@ -72,6 +72,7 @@ int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
 
 /* Export / import a full 128KB card image (present cards only for export).
  * import marks dirty and flushes to the bound filepath. Returns 0 on success. */
+int memcard_mirror_to(int card, const char *path);
 int memcard_export_raw(int card, uint8_t *dst);
 int memcard_import_raw(int card, const uint8_t *src);
 

@@ -794,6 +794,11 @@ struct GameConfig {
     // "16:9", "21:9", or "adaptive" (initial 16:9, live-window capped 21:9).
     // Unset keeps netplay at the title's normal mod-cleared aspect.
     std::string           netplay_local_viewport_aspect;
+    // guest_memcard_default = true: seat 2 offers its own slot-1 card the
+    // moment it sits down (the lobby glyph starts lit); off keeps the host's
+    // cards unless P2 clicks the glyph. For titles whose 2P mode loads one
+    // save per player (Forbidden Memories).
+    bool                  netplay_guest_memcard_default = false;
 
     // [recompiler] block
     std::filesystem::path seeds_path;     // absolute path to seeds (text or json)

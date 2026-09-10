@@ -106,6 +106,8 @@ int  psx_netplay_active(void);
 int  psx_netplay_is_running(void);
 /* "ice" | "lan" | "none" */
 const char *psx_netplay_transport_name(void);
+/* Display name behind a seat (online lobby, else LAN lobby). 0 = unknown. */
+int psx_netplay_seat_name(int slot, char *out, size_t cap);
 /* 1 when ICE agent reached FAILED (online path). */
 int  psx_netplay_ice_failed(void);
 /* Optional JSONL samples when PSX_NET_DIAG=1 (saves/netplay/net_diag.jsonl). */

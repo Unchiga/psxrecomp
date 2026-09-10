@@ -360,6 +360,19 @@ int memcard_rebind_path(int card, const char *path) {
     return 0;
 }
 
+/* Point a slot at another file and write its current image there, so the
+ * slot keeps playing from RAM while every later flush lands in the mirror
+ * and the file it came from is never touched again until it is rebound. */
+int memcard_mirror_to(int card, const char *path) {
+    if (card < 0 || card >= MAX_CARDS || !path || !path[0]) return -1;
+    if (!cards[card].present) return -1;
+    memcard_flush(card);
+    if (memcard_rebind_path(card, path) != 0) return -1;
+    cards[card].dirty = 1;
+    memcard_flush(card);
+    return cards[card].dirty ? -1 : 0;
+}
+
 int memcard_reload_bound(void) {
     int i;
     for (i = 0; i < MAX_CARDS; i++) {

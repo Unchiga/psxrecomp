@@ -1,7 +1,7 @@
 [submodule "lib/recomp-net"]
 	path = lib/recomp-net
-	url = https://github.com/RetroPortingToolKit/recomp-net.git
-	branch = main
+	url = https://github.com/Unchiga/recomp-net.git
+	branch = ygofm-upstream-2026-09-09
 
 [submodule "lib/retcomm-rbengine"]
 	path = lib/retcomm-rbengine

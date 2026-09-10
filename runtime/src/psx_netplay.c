@@ -589,8 +589,21 @@ typedef struct {
     int          guest_memcard;
     int          mc_guest_done;
     int          mc_guest_sent;
+    /* Seat 1: the card image it uploaded, so what the match wrote to slot 2
+     * can be told from the probe scribbles when the sandbox is left. */
+    uint8_t     *mc_guest_upload;
+    /* Seat 1: the host's SRAM blob arrived and its slot 2 IS the uploaded
+     * card. Until then the sandbox's slot 2 is this machine's own card 2
+     * (blank on most installs) and must never be carried back. */
+    int          mc_guest_applied;
     int          host_card_sandbox;
     int          personal_mc1_bound; /* host: slot 2 had a file before sandbox */
+    /* Host: its own present cards play from a mirror under netplay/ for the
+     * match, so the personal files are only ever replaced afterwards by
+     * np_carry_back, never written mid-match and never by a broken run. */
+    int          host_mirror[2];
+    char         host_mirror_personal[2][512];
+    uint8_t     *host_mirror_before[2];
     int          local_save_staged;
     int          local_save_acked;   /* guest: coord reply already sent */
     uint32_t     save_target_tick;   /* both peers save during this sim_tick */
@@ -1265,10 +1278,119 @@ static void np_enter_guest_sandbox(void)
     fflush(stdout);
 }
 
+/* Block 0's last frame is the card probe's scratch and is not evidence. */
+#define NP_MC_PROBE_SCRATCH_AT   0x1F80u
+#define NP_MC_PROBE_SCRATCH_LEN  0x80u
+
+static int np_mc_image_same(const uint8_t *a, const uint8_t *b)
+{
+    const size_t skip_at = NP_MC_PROBE_SCRATCH_AT, skip_len = NP_MC_PROBE_SCRATCH_LEN;
+    return memcmp(a, b, skip_at) == 0 &&
+           memcmp(a + skip_at + skip_len, b + skip_at + skip_len,
+                  MEMCARD_SIZE - skip_at - skip_len) == 0;
+}
+
+/* Seat 1: the host's SRAM blob just landed. Only when its slot 2 is the card
+ * this seat uploaded is there a card worth carrying back afterwards. Without
+ * this gate the sandbox's slot 2 is the guest's own personal card 2 -- blank on
+ * most installs -- and a session that ended before the sync completed (the
+ * common first-connection failure) carried that blank back over the personal
+ * card 1. That is the "my save was deleted" report. */
+static void np_note_guest_card_applied(const uint8_t *blob, size_t size)
+{
+    if (g_np.local_slot != np_guest_card_slot() || !g_np.guest_memcard || !g_np.mc_guest_upload) return;
+    if (!blob || size < NP_MC_BLOB_BYTES || !blob[1]) return;
+    if (!np_mc_image_same(blob + 4 + MEMCARD_SIZE, g_np.mc_guest_upload)) {
+        printf("psxrecomp: netplay guest card — the host's slot 2 is not the card "
+               "this seat uploaded; it will not be carried back after the match\n");
+        fflush(stdout);
+        return;
+    }
+    g_np.mc_guest_applied = 1;
+}
+
+/* Carry a card the match played from (slot, now) back to the personal file
+ * it came from, keeping the pre-match image beside it with a timestamp.
+ *
+ * Two things must hold, or the personal card is left alone and the log says
+ * so: the card still carries the pre-match directory (frames 1..15 of block
+ * 0: a duel result or a trade rewrites file data, never the directory, so a
+ * different directory means a different card), and the image differs from
+ * the pre-match one outside the probe scratch. */
+static void np_carry_back(int slot, const uint8_t *before, const char *personal, const char *what)
+{
+    uint8_t *now;
+    if (!before || !personal || !personal[0]) return;
+    now = (uint8_t *)malloc(MEMCARD_SIZE);
+    if (!now) return;
+    if (memcard_export_raw(slot, now) != 0) {
+        printf("psxrecomp: netplay %s — slot %d holds no card now; %s is left as it was\n",
+               what, slot + 1, personal);
+        fflush(stdout);
+        free(now);
+        return;
+    }
+    if (memcmp(now + 0x80, before + 0x80, 0x800 - 0x80) != 0) {
+        printf("psxrecomp: netplay %s — slot %d no longer holds the card that went in "
+               "(directory differs); %s is left as it was\n", what, slot + 1, personal);
+        fflush(stdout);
+        free(now);
+        return;
+    }
+    if (np_mc_image_same(now, before)) {
+        printf("psxrecomp: netplay %s — the match did not write to it; %s is unchanged\n",
+               what, personal);
+        fflush(stdout);
+    } else {
+        char backup[640];
+        FILE *f;
+        time_t t = time(NULL);
+        struct tm *tm = localtime(&t);
+        char stamp[32];
+        if (tm && strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm) > 0)
+            snprintf(backup, sizeof(backup), "%s.pre-netplay-%s", personal, stamp);
+        else
+            snprintf(backup, sizeof(backup), "%s.pre-netplay", personal);
+        f = fopen(backup, "wb");
+        if (f) { fwrite(before, 1, MEMCARD_SIZE, f); fclose(f); }
+        f = fopen(personal, "wb");
+        if (f) {
+            fwrite(now, 1, MEMCARD_SIZE, f);
+            fclose(f);
+            printf("psxrecomp: netplay %s — the match wrote to your card; carried back "
+                   "to %s (the pre-match card is %s)\n", what, personal, backup);
+        } else {
+            printf("psxrecomp: netplay %s — could not write %s; the match's card "
+                   "stays in the sandbox\n", what, personal);
+        }
+        fflush(stdout);
+    }
+    free(now);
+}
+
+/* Seat 1 brought its own card and the match wrote to it (a 2P duel records
+ * the result on both cards): carry the match's slot-2 image back to the
+ * personal slot-1 card it came from -- but only once the host confirmed it
+ * installed this seat's card as slot 2 (np_note_guest_card_applied). */
+static void np_guest_card_writeback(void)
+{
+    if (!g_np.guest_memcard || g_np.local_slot != np_guest_card_slot() || !g_np.mc_guest_sent ||
+        !g_np.mc_guest_upload || !g_np.personal_mc0[0])
+        return;
+    if (!g_np.mc_guest_applied) {
+        printf("psxrecomp: netplay guest card — the match never received this "
+               "seat's card; %s is left as it was\n", g_np.personal_mc0);
+        fflush(stdout);
+        return;
+    }
+    np_carry_back(1, g_np.mc_guest_upload, g_np.personal_mc0, "guest card");
+}
+
 static void np_leave_guest_sandbox(void)
 {
     if (!g_np.guest_sandbox) return;
     memcard_flush_all();
+    np_guest_card_writeback();
     /* Per-slot restore: an empty personal path means the player had that
      * slot disabled, so unbind it rather than leaving the sandbox file
      * attached (reload would otherwise resurrect a card they never had). */
@@ -1331,6 +1453,75 @@ static void np_leave_host_card_sandbox(void)
     (void)memcard_rebind_path(1, g_np.personal_mc1_bound ? g_np.personal_mc1 : NULL);
     (void)memcard_reload_bound();
     g_np.host_card_sandbox = 0;
+}
+
+/* Host: every present card of its own plays from a mirror for the match.
+ * Slot 2 is skipped when the guest's card is going to take it (that path has
+ * its own file). The personal file is untouched until np_host_mirror_leave
+ * carries the played card back through the same checks as the guest's. */
+static void np_host_mirror_enter(void)
+{
+    const char *root = savestate_root_dir();
+    const char *dir = (root && root[0]) ? root : savestate_dir();
+    char base[512];
+    int i;
+
+    base[0] = '\0';
+    if (dir && dir[0]) {
+        size_t n;
+        strncpy(base, dir, sizeof(base) - 1);
+        n = strlen(base);
+        while (n > 0 && (base[n - 1] == '/' || base[n - 1] == '\\'))
+            base[--n] = '\0';
+    }
+    for (i = 0; i < 2; ++i) {
+        const char *p = NULL;
+        char path[600];
+        if (g_np.host_mirror[i]) continue;
+        if (i == 1 && g_np.guest_memcard) continue;
+        if (!memcard_is_present(i)) continue;
+        (void)memcard_debug_info(i, &p, NULL, NULL, NULL);
+        if (!p || !p[0]) continue;
+        if (!g_np.host_mirror_before[i])
+            g_np.host_mirror_before[i] = (uint8_t *)malloc(MEMCARD_SIZE);
+        if (!g_np.host_mirror_before[i]) continue;
+        if (memcard_export_raw(i, g_np.host_mirror_before[i]) != 0) continue;
+        strncpy(g_np.host_mirror_personal[i], p, sizeof(g_np.host_mirror_personal[i]) - 1);
+        if (base[0])
+            snprintf(path, sizeof(path), "%s/netplay/host_card%d.mcd", base, i + 1);
+        else
+            snprintf(path, sizeof(path), "%s/host_card%d.mcd", NP_SANDBOX_FALLBACK, i + 1);
+        if (memcard_mirror_to(i, path) != 0) {
+            printf("psxrecomp: netplay host card %d — could not mirror to %s; "
+                   "it plays from %s directly\n", i + 1, path, p);
+            fflush(stdout);
+            g_np.host_mirror_personal[i][0] = '\0';
+            continue;
+        }
+        g_np.host_mirror[i] = 1;
+        printf("psxrecomp: netplay host card %d -> %s (personal %s untouched until the match ends)\n",
+               i + 1, path, p);
+        fflush(stdout);
+    }
+}
+
+static void np_host_mirror_leave(void)
+{
+    int i, any = 0;
+    for (i = 0; i < 2; ++i) {
+        if (!g_np.host_mirror[i]) continue;
+        memcard_flush(i);
+        np_carry_back(i, g_np.host_mirror_before[i], g_np.host_mirror_personal[i],
+                      i == 0 ? "host card 1" : "host card 2");
+        (void)memcard_rebind_path(i, g_np.host_mirror_personal[i]);
+        g_np.host_mirror[i] = 0;
+        any = 1;
+    }
+    if (any) (void)memcard_reload_bound();
+    for (i = 0; i < 2; ++i) {
+        free(g_np.host_mirror_before[i]);
+        g_np.host_mirror_before[i] = NULL;
+    }
 }
 
 /* Seat 1: its LOCAL slot-1 card (the one it plays with at home), raw. A
@@ -1406,6 +1597,8 @@ static void np_apply_ready_state(void)
             g_np.xfer = NP_XFER_NONE;
             return;
         }
+        if (g_np.local_slot != 0)
+            np_note_guest_card_applied((const uint8_t *)data, size);
         g_np.mc_sync_done = 1;
         rnet_session_state_finish(g_np.session, 0);
         g_np.xfer = NP_XFER_NONE;
@@ -1988,8 +2181,12 @@ static void np_maybe_upload_guest_card(void)
         free(blob);
         return;
     }
-    free(blob);
     g_np.mc_guest_sent = 1;
+    if (sz == NP_MC_GUEST_BLOB_BYTES) {
+        if (!g_np.mc_guest_upload) g_np.mc_guest_upload = (uint8_t *)malloc(MEMCARD_SIZE);
+        if (g_np.mc_guest_upload) memcpy(g_np.mc_guest_upload, blob + 4, MEMCARD_SIZE);
+    }
+    free(blob);
     g_np.xfer = NP_XFER_MC_UPLOAD;
     printf("psxrecomp: netplay MEMCARD upload — sending local slot-1 card to host "
            "(%u bytes)\n", (unsigned)sz);
@@ -4116,6 +4313,7 @@ void psx_netplay_bind_guest_saves(void)
          * even for the frames before seat 1's card lands. */
         if (g_np.guest_memcard && !g_np.host_card_sandbox)
             np_enter_host_card_sandbox();
+        np_host_mirror_enter();
         return;
     }
     if (g_np.guest_sandbox)
@@ -4238,6 +4436,9 @@ void psx_netplay_shutdown(void)
     np_leave_host_card_sandbox();
     g_np_host_spectates = 0;
     g_np_port_map_valid = 0;
+    np_host_mirror_leave();
+    free(g_np.mc_guest_upload);
+    g_np.mc_guest_upload = NULL;
     {
         CPUState *saved_cpu = g_np.cpu;
         memset(&g_np, 0, sizeof(g_np));

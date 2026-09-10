@@ -1056,8 +1056,8 @@ static void match_caps_clear(PsxLobbyMatchCaps *c)
     memset(c, 0, sizeof(*c));
     c->aspect_num = 4;
     c->aspect_den = 3;
-    c->input_delay = 6;
-    c->input_prediction = 10;
+    c->input_delay = 2;
+    c->input_prediction = 4;
     c->guest_memcard = 1;
 }
 
