@@ -8011,6 +8011,26 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
         int ow = 0, oh = 0;
         uint8_t *packed = NULL;
+        /* Read the whole window, including UI outside the game's viewport. */
+        SDL_Rect saved_viewport;
+        float saved_sx = 1.0f, saved_sy = 1.0f;
+        int saved_lw = 0, saved_lh = 0;
+#if defined(PSX_SDL3)
+        SDL_RendererLogicalPresentation saved_mode;
+        SDL_GetRenderLogicalPresentation(sdl_renderer, &saved_lw, &saved_lh, &saved_mode);
+        SDL_GetRenderViewport(sdl_renderer, &saved_viewport);
+        SDL_GetRenderScale(sdl_renderer, &saved_sx, &saved_sy);
+        SDL_SetRenderLogicalPresentation(sdl_renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+        SDL_SetRenderScale(sdl_renderer, 1.0f, 1.0f);
+        SDL_SetRenderViewport(sdl_renderer, NULL);
+#else
+        SDL_RenderGetLogicalSize(sdl_renderer, &saved_lw, &saved_lh);
+        SDL_RenderGetViewport(sdl_renderer, &saved_viewport);
+        SDL_RenderGetScale(sdl_renderer, &saved_sx, &saved_sy);
+        SDL_RenderSetLogicalSize(sdl_renderer, 0, 0);
+        SDL_RenderSetScale(sdl_renderer, 1.0f, 1.0f);
+        SDL_RenderSetViewport(sdl_renderer, NULL);
+#endif
 #if defined(PSX_SDL3)
         SDL_Surface *surf = SDL_RenderReadPixels(sdl_renderer, NULL);
         if (surf) {
@@ -8060,6 +8080,15 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
         }
         std::free(packed);
+#if defined(PSX_SDL3)
+        SDL_SetRenderLogicalPresentation(sdl_renderer, saved_lw, saved_lh, saved_mode);
+        SDL_SetRenderScale(sdl_renderer, saved_sx, saved_sy);
+        SDL_SetRenderViewport(sdl_renderer, &saved_viewport);
+#else
+        SDL_RenderSetLogicalSize(sdl_renderer, saved_lw, saved_lh);
+        SDL_RenderSetScale(sdl_renderer, saved_sx, saved_sy);
+        SDL_RenderSetViewport(sdl_renderer, &saved_viewport);
+#endif
         present_shot_done(wrote);
     }
     /* §33: remember active rect for resim hold-last (not full 640x512). */
@@ -16315,6 +16344,7 @@ session_reboot:
          * final present or in-game textures. These are presentation choices, not
          * emulation behaviour — the frame the guest renders is unchanged. */
         vms.scaling        = PSX_VM_SCALING_INTEGER;
+        vms.windowed_scale = PSX_VM_WINDOWED_SCALE_DEFAULT;
         vms.filter         = PSX_VM_FILTER_NEAREST;
         vms.texture_filter = PSX_VM_FILTER_NEAREST;
         vms.screen  = (g_fullscreen >= 0 && g_fullscreen <= 2) ? g_fullscreen

@@ -34,6 +34,7 @@
 #include "host_osd.h"
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
+#include "psx_video_menu.h"
 #include "psx_sdl.h"
 #include "psx_ui_draw.h"
 
@@ -135,6 +136,9 @@ static int          s_sdl_rw_th;
 static SDL_Texture *s_sdl_ssm_tex;
 static int          s_sdl_ssm_tw;
 static int          s_sdl_ssm_th;
+static SDL_Texture *s_sdl_menu_tex;
+static int          s_sdl_menu_tw;
+static int          s_sdl_menu_th;
 static SDL_Renderer *s_sdl_ren;
 #endif
 
@@ -508,6 +512,57 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
         if (psx_savestate_menu_overlay_image(&px, &w, &h) && px)
             sdl_blit_argb(renderer, &s_sdl_ssm_tex, &s_sdl_ssm_tw,
                           &s_sdl_ssm_th, px, w, h, 0, 0, lw, lh);
+    }
+    /* F10 is host UI, in drawable pixels rather than the game's letterboxed
+     * logical coordinates. The SDL present path used to process its input
+     * and reserve the bar inset without ever compositing this image. */
+    if (psx_video_menu_is_visible()) {
+        const uint32_t *px = NULL;
+        int w = 0, h = 0, ow = 0, oh = 0, old_w = 0, old_h = 0;
+        float sx = 1.0f, sy = 1.0f;
+        SDL_Rect viewport, clip;
+#if defined(PSX_SDL3)
+        SDL_RendererLogicalPresentation mode;
+        const int clipped = SDL_RenderClipEnabled(renderer);
+        SDL_GetRenderLogicalPresentation(renderer, &old_w, &old_h, &mode);
+        SDL_GetRenderViewport(renderer, &viewport);
+        SDL_GetRenderClipRect(renderer, &clip);
+        SDL_GetRenderScale(renderer, &sx, &sy);
+        SDL_GetRenderOutputSize(renderer, &ow, &oh);
+        SDL_SetRenderLogicalPresentation(renderer, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+        SDL_SetRenderScale(renderer, 1.0f, 1.0f);
+        SDL_SetRenderViewport(renderer, NULL);
+        SDL_SetRenderClipRect(renderer, NULL);
+#else
+        const int clipped = SDL_RenderIsClipEnabled(renderer);
+        SDL_RenderGetLogicalSize(renderer, &old_w, &old_h);
+        SDL_RenderGetViewport(renderer, &viewport);
+        SDL_RenderGetClipRect(renderer, &clip);
+        SDL_RenderGetScale(renderer, &sx, &sy);
+        SDL_GetRendererOutputSize(renderer, &ow, &oh);
+        SDL_RenderSetLogicalSize(renderer, 0, 0);
+        SDL_RenderSetScale(renderer, 1.0f, 1.0f);
+        SDL_RenderSetViewport(renderer, NULL);
+        SDL_RenderSetClipRect(renderer, NULL);
+#endif
+        if (ow > 0 && oh > 0) {
+            const int ui = psx_video_menu_ui_scale(ow, oh);
+            psx_video_menu_set_layout(ow / ui, oh / ui, ui);
+            if (psx_video_menu_overlay_image(&px, &w, &h) && px)
+                sdl_blit_argb(renderer, &s_sdl_menu_tex, &s_sdl_menu_tw,
+                              &s_sdl_menu_th, px, w, h, 0, 0, w * ui, h * ui);
+        }
+#if defined(PSX_SDL3)
+        SDL_SetRenderLogicalPresentation(renderer, old_w, old_h, mode);
+        SDL_SetRenderScale(renderer, sx, sy);
+        SDL_SetRenderViewport(renderer, &viewport);
+        SDL_SetRenderClipRect(renderer, clipped ? &clip : NULL);
+#else
+        SDL_RenderSetLogicalSize(renderer, old_w, old_h);
+        SDL_RenderSetScale(renderer, sx, sy);
+        SDL_RenderSetViewport(renderer, &viewport);
+        SDL_RenderSetClipRect(renderer, clipped ? &clip : NULL);
+#endif
     }
 #else
     (void)renderer;
