@@ -52,6 +52,7 @@
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
 #include "lockstep.h"
+#include "psx_netplay.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -4733,8 +4734,30 @@ const char *json_get_str(const char *json, const char *key,
     if (*p == '"') {
         p++;
         int i = 0;
-        while (*p && *p != '"' && i < out_sz - 1)
-            out[i++] = *p++;
+        while (*p && *p != '"' && i < out_sz - 1) {
+            if (*p != '\\') {
+                out[i++] = *p++;
+                continue;
+            }
+            p++;
+            if (!*p) break;
+            switch (*p) {
+            case '"':  out[i++] = '"';  p++; break;
+            case '\\': out[i++] = '\\'; p++; break;
+            case '/':  out[i++] = '/';  p++; break;
+            case 'b':  out[i++] = '\b'; p++; break;
+            case 'f':  out[i++] = '\f'; p++; break;
+            case 'n':  out[i++] = '\n'; p++; break;
+            case 'r':  out[i++] = '\r'; p++; break;
+            case 't':  out[i++] = '\t'; p++; break;
+            default:
+                /* Requests are generated JSON. Preserve a malformed escape
+                 * visibly instead of silently discarding its backslash. */
+                if (i < out_sz - 2) out[i++] = '\\';
+                out[i++] = *p++;
+                break;
+            }
+        }
         out[i] = '\0';
         return out;
     }
@@ -6905,10 +6928,6 @@ static void handle_savestate(int id, const char *json)
 {
     extern int savestate_request_save(int slot);
     extern int savestate_request_load(int slot);
-    extern int psx_netplay_active(void);
-    extern int psx_netplay_is_host(void);
-    extern int psx_netplay_request_save(int slot);
-    extern int psx_netplay_request_load(int slot);
     extern const char* savestate_dir(void);
     extern int savestate_slot_path(int slot, char* out, size_t cap);
     int slot = json_get_int(json, "slot", -1);
@@ -6956,12 +6975,8 @@ static void handle_savestate(int id, const char *json)
         return;
     }
     if (psx_netplay_active()) {
-        if (!psx_netplay_is_host()) {
-            send_err(id, "savestate refused (netplay guest; host-only)");
-            return;
-        }
-        staged = !strcmp(op, "save") ? psx_netplay_request_save(slot)
-                                     : psx_netplay_request_load(slot);
+        send_err(id, "savestate unavailable during stock netplay");
+        return;
     } else if (!strcmp(op, "save")) {
         staged = savestate_request_save(slot);
     } else {
@@ -6996,6 +7011,11 @@ static void handle_turbo(int id, const char *json)
     }
     if (enabled < 0) {
         send_err(id, "missing enabled");
+        return;
+    }
+    if (enabled && psx_netplay_active()) {
+        s_turbo_enabled = 0;
+        send_err(id, "turbo unavailable during netplay");
         return;
     }
     s_turbo_enabled = enabled ? 1 : 0;
@@ -10764,6 +10784,11 @@ static void handle_turbo_loads(int id, const char *json)
     extern uint64_t g_turbo_loads_frames;
     extern int      fntrace_is_game_started(void);
     int n = json_get_int(json, "n", -1);
+    if (n == 1 && psx_netplay_active()) {
+        g_turbo_loads_enabled = 0;
+        send_err(id, "turbo loads unavailable during netplay");
+        return;
+    }
     if (n == 0 || n == 1) g_turbo_loads_enabled = n;
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"load_active\":%d,"
              "\"game_started\":%d,\"turbo_frames\":%llu}\n",
@@ -13811,5 +13836,5 @@ int debug_server_get_axis_override(unsigned char st[4])
 
 int debug_server_turbo_enabled(void)
 {
-    return s_turbo_enabled != 0;
+    return !psx_netplay_active() && s_turbo_enabled != 0;
 }

@@ -16,6 +16,8 @@ static int s_dropped;
 
 static PsxGameHook s_start[PSX_GAME_HOOK_MAX];
 static int         s_start_count;
+static PsxGameHook s_stop[PSX_GAME_HOOK_MAX];
+static int         s_stop_count;
 static PsxGameHook s_frame[PSX_GAME_HOOK_MAX];
 static int         s_frame_count;
 static PsxGameHook s_vblank[PSX_GAME_HOOK_MAX];
@@ -27,6 +29,13 @@ int psx_game_add_start_hook(PsxGameHook fn) {
     if (!fn) return 0;
     if (s_start_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
     s_start[s_start_count++] = fn;
+    return 1;
+}
+
+int psx_game_add_stop_hook(PsxGameHook fn) {
+    if (!fn) return 0;
+    if (s_stop_count >= PSX_GAME_HOOK_MAX) { s_dropped++; return 0; }
+    s_stop[s_stop_count++] = fn;
     return 1;
 }
 
@@ -62,6 +71,12 @@ int psx_game_run_event_hooks(const void *sdl_event) {
 void psx_game_run_start_hooks(void) {
     if (s_dropped) fprintf(stderr, "psx_game_hooks: %d hook(s) not registered: the table (%d per kind) is full\n", s_dropped, PSX_GAME_HOOK_MAX);
     for (int i = 0; i < s_start_count; i++) s_start[i]();
+}
+
+void psx_game_run_stop_hooks(void) {
+    /* Reverse registration mirrors destructor order and lets coordinators
+     * registered early release after the clients they own. */
+    for (int i = s_stop_count - 1; i >= 0; i--) s_stop[i]();
 }
 
 void psx_game_run_frame_hooks(void) {

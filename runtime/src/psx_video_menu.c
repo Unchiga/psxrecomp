@@ -162,12 +162,16 @@ typedef struct VmRegRow {
                               * psx_video_menu_apply_restored */
     void (*on_change)(int);
     void (*on_activate)(void);
+    int enabled;
+    const char *disabled_hint;
 } VmRegRow;
 
 static VmRegRow    s_reg[VM_REG_MAX];
 static int         s_reg_count;
 static const char *s_menu_extra_title[VM_MENU_MAX];
 static int         s_menu_total = MENU_COUNT;
+static uint8_t     s_menu_enabled[VM_MENU_MAX] = { 1,1,1,1,1,1,1,1,1,1,1,1 };
+static const char *s_menu_disabled_hint[VM_MENU_MAX];
 
 /* Registered rows for menu m, and the n-th of them. */
 static int reg_count_for(int m) {
@@ -201,7 +205,7 @@ enum { IT_OPTION = 0, IT_ACTION = 1, IT_NUMBER = 2 };
  * players expect it. Safe to renumber: unlike s_item[]'s MENU_* index, these
  * row constants are never persisted — menu_settings.ini stores options, not
  * the cursor. */
-enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT = 2 };
+enum { ACT_CLOSE = 0, ACT_DISC = 1, ACT_QUIT_LAUNCHER = 2, ACT_QUIT_DESKTOP = 3 };
 
 #define VM_EDIT_MAX 6   /* digits; the 999999 StarChips row is the widest */
 /* Named once: panel_rect reserves width for it so the panel cannot resize
@@ -240,6 +244,8 @@ static int s_dirty = 1;
 static int s_canvas_ready;
 static int s_changed;
 static int s_quit;
+static int s_quit_launcher;
+static int s_launcher_available;
 static int s_savestate;
 static int s_rewind;
 static int s_pick_disc;
@@ -392,7 +398,7 @@ static unsigned menu_icon(int m) {
 }
 
 static int builtin_rows(int m) {
-    if (m == MENU_FILE) return 3;
+    if (m == MENU_FILE) return s_launcher_available ? 4 : 3;
     if (m == MENU_VIEW) return 1;
     if (m == MENU_VIDEO) return 7;
     if (m == MENU_AUDIO) return 4;
@@ -410,6 +416,17 @@ static VmRegRow *row_reg(int m, int row) {
     const int b = builtin_rows(m);
     if (row < b) return NULL;
     return reg_at(m, row - b);
+}
+
+static int row_enabled(int m, int row) {
+    VmRegRow *r;
+    if (m < 0 || m >= s_menu_total || !s_menu_enabled[m]) return 0;
+    r = row_reg(m, row);
+    return r ? r->enabled : 1;
+}
+
+static int file_desktop_row(void) {
+    return s_launcher_available ? ACT_QUIT_DESKTOP : ACT_QUIT_LAUNCHER;
 }
 
 static int row_kind(int m, int row) {
@@ -440,6 +457,7 @@ static int row_kind(int m, int row) {
 static const char *lp_text(int v);   /* defined below; used by edit_nudge */
 
 static void edit_begin(void) {
+    if (!row_enabled(s_menu, s_item[s_menu])) return;
     s_edit_len = 0;
     s_edit_buf[0] = '\0';
     s_editing = 1;
@@ -519,7 +537,9 @@ static const char *row_label(int m, int row) {
     if (m == MENU_FILE)
         return (row == 0) ? "Close menu"
              : (row == 1) ? "Change game disc"
-                          : "Quit";
+             : (s_launcher_available && row == ACT_QUIT_LAUNCHER)
+                          ? "Quit to Launcher"
+                          : "Quit to Desktop";
     if (m == MENU_VIEW) return "Menu bar";
     if (m == MENU_GAME)
         return (row == 0) ? "Speed"
@@ -628,6 +648,13 @@ static const char *row_value(int m, int row) {
 
 static const char *row_hint(int m, int row) {
     int lo, hi;
+    if (!row_enabled(m, row)) {
+        VmRegRow *dr = row_reg(m, row);
+        if (dr && dr->disabled_hint) return dr->disabled_hint;
+        if (m >= 0 && m < s_menu_total && s_menu_disabled_hint[m])
+            return s_menu_disabled_hint[m];
+        return "Unavailable right now";
+    }
     {
         VmRegRow *r = row_reg(m, row);
         if (r && !(s_editing && m == s_menu && row == s_item[s_menu])) {
@@ -643,7 +670,9 @@ static const char *row_hint(int m, int row) {
     if (m == MENU_FILE)
         return (row == 0) ? "Close this menu"
              : (row == 1) ? "Pick your disc again if it moved \xe2\x80\x94 applies on restart"
-                          : "Exit the game";
+             : (s_launcher_available && row == ACT_QUIT_LAUNCHER)
+                          ? "End this session and return to the launcher"
+                          : "End this session and close the application";
     if (m == MENU_VIEW) return "Press F10 any time to show or hide";
     if (m == MENU_GAME && row == 1)
         return s_state.fast_loads == PSX_VM_LOADS_OFF
@@ -734,6 +763,7 @@ static int row_choices(int m, int row) {
 }
 
 static void cycle_row(int m, int row, int delta) {
+    if (!row_enabled(m, row)) return;
     {
         VmRegRow *r = row_reg(m, row);
         if (r) {
@@ -1070,7 +1100,7 @@ static void slider_travel(int sx, int sw, int *x0, int *span) {
 
 static void slider_set_from_x(int m, int row, int lx) {
     int sx, sy, sw, sh, lo = 0, hi = 0, v, tx0, span;
-    if (!num_range(m, row, &lo, &hi)) return;
+    if (!row_enabled(m, row) || !num_range(m, row, &lo, &hi)) return;
     slider_rect(m, row, &sx, &sy, &sw, &sh);
     if (sw <= 1) return;
     slider_travel(sx, sw, &tx0, &span);
@@ -1404,7 +1434,7 @@ static int baseline_in(int y, int h, const PsxUiFace *f) {
     return y + (h - (a + d)) / 2 + a;
 }
 
-static void draw_slider(int m, int row, int sel) {
+static void draw_slider(int m, int row, int sel, int enabled) {
     int sx, sy, sw, sh, lo = 0, hi = 0, knob, tx0, span, cx;
     slider_rect(m, row, &sx, &sy, &sw, &sh);
     num_range(m, row, &lo, &hi);
@@ -1415,7 +1445,7 @@ static void draw_slider(int m, int row, int sel) {
     round_rect(sx, sy, sw, sh, (float)sh * 0.5f, COL_TRACK);
     if (cx > sx)
         round_rect(sx, sy, cx - sx, sh, (float)sh * 0.5f,
-                   sel ? COL_ACCENT : COL_TEXT);
+                   !enabled ? COL_DIM : (sel ? COL_ACCENT : COL_TEXT));
 
     /* Notches, one per selectable value, on short ranges only.
      *
@@ -1448,7 +1478,7 @@ static void draw_slider(int m, int row, int sel) {
     }
     /* The knob. What makes the track look draggable rather than like a meter. */
     round_rect(cx - knob, sy + sh / 2 - knob, knob * 2, knob * 2,
-               (float)knob, sel ? COL_ACCENT : COL_TEXT);
+               (float)knob, !enabled ? COL_DIM : (sel ? COL_ACCENT : COL_TEXT));
 }
 
 static void redraw(void) {
@@ -1489,13 +1519,14 @@ static void redraw(void) {
         /* A title is only "active" while its dropdown is actually open. With
          * the bar collapsed nothing is selected, so the last-used menu must not
          * stay highlighted — it would read as an open menu that isn't. */
-        int active = (s_expanded && i == s_menu);
+        int enabled = s_menu_enabled[i] != 0;
+        int active = enabled && (s_expanded && i == s_menu);
         if (active)
             round_rect(tx, chip_y, tw, chip_h, VM_TITLE_R * s_unit, COL_SEL_BG);
         else if (i == s_hover_menu)
             round_rect(tx, chip_y, tw, chip_h, VM_TITLE_R * s_unit, COL_HOVER_BG);
         {
-            const uint32_t col = active ? COL_ACCENT : COL_TEXT;
+            const uint32_t col = !enabled ? COL_DIM : (active ? COL_ACCENT : COL_TEXT);
             int lx = tx + S(VM_TITLE_PAD);
             const PsxUiFace *fi = face_icon();
             int slot = icon_slot_w();
@@ -1536,8 +1567,9 @@ static void redraw(void) {
     }
 
     for (i = 0; i < rows; i++) {
-        int sel = (i == s_item[s_menu]);
-        int hov = (s_hover_row == i && s_hover_menu == s_menu);
+        int enabled = row_enabled(s_menu, i);
+        int sel = enabled && (i == s_item[s_menu]);
+        int hov = enabled && (s_hover_row == i && s_hover_menu == s_menu);
         int ry  = row_y(s_menu, i);
         int rh  = S(VM_ROW_H);
         int inset = px + S(VM_PANEL_PAD);
@@ -1572,11 +1604,11 @@ static void redraw(void) {
             if (row_is_slider(s_menu, i) && !editing_here) {
                 int sx, sy, sw, sh;
                 slider_rect(s_menu, i, &sx, &sy, &sw, &sh);
-                draw_slider(s_menu, i, sel);
+                draw_slider(s_menu, i, sel, enabled);
                 label_max = sx - tx - S(VM_VALUE_GAP);
                 if (v)
                     draw_text(sx + sw + S(VM_ROW_PAD_X), base, v,
-                              sel ? COL_ACCENT : COL_DIM, fr);
+                              !enabled ? COL_DIM : (sel ? COL_ACCENT : COL_DIM), fr);
             } else if (v && editing_here) {
                 /* Active field: a boxed, left-aligned entry so the caret and
                  * the digits are unmistakable against the row highlight. */
@@ -1611,7 +1643,7 @@ static void redraw(void) {
                 label_max = vx - tx - S(VM_VALUE_GAP);
             }
             draw_text_clip(tx, base, row_label(s_menu, i),
-                           sel ? COL_ACCENT : COL_TEXT, fr, label_max);
+                           !enabled ? COL_DIM : (sel ? COL_ACCENT : COL_TEXT), fr, label_max);
         }
     }
 
@@ -1668,6 +1700,7 @@ void psx_video_menu_init(const PsxVideoMenuState *initial) {
     for (int i = 0; i < VM_MENU_MAX; i++) s_item[i] = 0;
     s_changed = 0;
     s_quit = 0;
+    s_quit_launcher = 0;
     s_savestate = 0;
     s_rewind = 0;
     s_pick_disc = 0;
@@ -1753,6 +1786,10 @@ void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out) {
  * and it is what clicking into the game or picking an item drops back to. */
 void psx_video_menu_toggle(void) {
     edit_cancel();
+    if (!s_menu_enabled[s_menu]) {
+        for (int i = 0; i < s_menu_total; i++)
+            if (s_menu_enabled[i]) { s_menu = i; break; }
+    }
     s_visible = !s_visible;
     s_expanded = s_visible;
     s_hover_menu = s_hover_row = -1;
@@ -1908,6 +1945,11 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
     to_logical(win_x, win_y, &lx, &ly);
     t = hit_title(lx, ly);
     if (t >= 0) {
+        if (!s_menu_enabled[t]) {
+            psx_video_menu_collapse();
+            s_hover_menu = t; s_dirty = 1;
+            return 1;
+        }
         if (s_editing) edit_commit();
         /* Clicking the already-open menu's own title closes it, like a real
          * menu bar; any other title switches to it and opens. */
@@ -1924,6 +1966,11 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
     r = hit_row(lx, ly);
     if (r >= 0) {
         int k;
+        if (!row_enabled(s_menu, r)) {
+            s_item[s_menu] = r;
+            s_dirty = 1;
+            return 1;
+        }
         if (s_editing && r != s_item[s_menu]) edit_commit();
         s_item[s_menu] = r;
         /* Slider rows: clicking anywhere on the track jumps there and starts a
@@ -1943,7 +1990,13 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
         }
         k = row_kind(s_menu, r);
         if (k == IT_ACTION) {
-            if (s_menu == MENU_FILE && r == ACT_QUIT) s_quit = 1;
+            if (s_menu == MENU_FILE && r == file_desktop_row()) {
+                s_quit = 1; psx_video_menu_collapse();
+            }
+            else if (s_menu == MENU_FILE && s_launcher_available &&
+                     r == ACT_QUIT_LAUNCHER) {
+                s_quit_launcher = 1; psx_video_menu_collapse();
+            }
             /* VIEW's builtin row 0 is MENU BAR, which hides. Testing the MENU
              * instead of the ROW here made every registered action row under
              * VIEW hide the bar rather than fire its callback. */
@@ -2020,28 +2073,48 @@ int psx_video_menu_handle_key(int key) {
             psx_video_menu_close();
             return 1;
         case SDLK_LEFT:
-            s_menu = (s_menu + s_menu_total - 1) % s_menu_total;
+            for (int n = 0; n < s_menu_total; n++) {
+                s_menu = (s_menu + s_menu_total - 1) % s_menu_total;
+                if (s_menu_enabled[s_menu]) break;
+            }
+            if (!row_enabled(s_menu, s_item[s_menu])) s_item[s_menu] = 0;
             s_dirty = 1;
             return 1;
         case SDLK_RIGHT:
-            s_menu = (s_menu + 1) % s_menu_total;
+            for (int n = 0; n < s_menu_total; n++) {
+                s_menu = (s_menu + 1) % s_menu_total;
+                if (s_menu_enabled[s_menu]) break;
+            }
+            if (!row_enabled(s_menu, s_item[s_menu])) s_item[s_menu] = 0;
             s_dirty = 1;
             return 1;
         case SDLK_UP:
-            s_item[s_menu] = (s_item[s_menu] + rows - 1) % rows;
+            for (int n = 0; n < rows; n++) {
+                s_item[s_menu] = (s_item[s_menu] + rows - 1) % rows;
+                if (row_enabled(s_menu, s_item[s_menu])) break;
+            }
             s_dirty = 1;
             return 1;
         case SDLK_DOWN:
-            s_item[s_menu] = (s_item[s_menu] + 1) % rows;
+            for (int n = 0; n < rows; n++) {
+                s_item[s_menu] = (s_item[s_menu] + 1) % rows;
+                if (row_enabled(s_menu, s_item[s_menu])) break;
+            }
             s_dirty = 1;
             return 1;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
         case SDLK_SPACE: {
+            if (!row_enabled(s_menu, s_item[s_menu])) return 1;
             int k = row_kind(s_menu, s_item[s_menu]);
             if (k == IT_ACTION) {
-                if (s_menu == MENU_FILE && s_item[s_menu] == ACT_QUIT)
-                    s_quit = 1;
+                if (s_menu == MENU_FILE && s_item[s_menu] == file_desktop_row()) {
+                    s_quit = 1; psx_video_menu_collapse();
+                }
+                else if (s_menu == MENU_FILE && s_launcher_available &&
+                         s_item[s_menu] == ACT_QUIT_LAUNCHER) {
+                    s_quit_launcher = 1; psx_video_menu_collapse();
+                }
                 else if (s_menu == MENU_VIEW &&
                          !row_reg(s_menu, s_item[s_menu]))
                     psx_video_menu_hide();
@@ -2087,6 +2160,20 @@ int psx_video_menu_take_quit(void) {
     return q;
 }
 
+int psx_video_menu_take_quit_to_launcher(void) {
+    int q = s_quit_launcher;
+    s_quit_launcher = 0;
+    return q;
+}
+
+void psx_video_menu_set_launcher_available(int available) {
+    const int v = available ? 1 : 0;
+    if (s_launcher_available == v) return;
+    s_launcher_available = v;
+    if (s_item[MENU_FILE] >= builtin_rows(MENU_FILE)) s_item[MENU_FILE] = 0;
+    s_dirty = 1;
+}
+
 int psx_video_menu_take_savestate(void) {
     int s = s_savestate;
     s_savestate = 0;
@@ -2103,6 +2190,7 @@ int psx_video_menu_add_menu(const char *title) {
     if (!title || s_menu_total >= VM_MENU_MAX) return -1;
     const int id = s_menu_total++;
     s_menu_extra_title[id] = title;
+    s_menu_enabled[id] = 1;
     s_dirty = 1;
     return id;
 }
@@ -2117,6 +2205,7 @@ static int vm_add(int menu, int kind, const char *label, const char *hint) {
     r->kind = kind;
     r->label = label;
     r->hint = hint;
+    r->enabled = 1;
     s_dirty = 1;
     return s_reg_count++;
 }
@@ -2179,6 +2268,33 @@ void psx_video_menu_set_row_order(int row_handle, int order) {
     s_dirty = 1;
 }
 
+void psx_video_menu_set_menu_enabled(int menu, int enabled, const char *reason) {
+    if (menu < 0 || menu >= s_menu_total) return;
+    s_menu_enabled[menu] = enabled ? 1u : 0u;
+    s_menu_disabled_hint[menu] = reason;
+    if (!enabled && s_menu == menu) psx_video_menu_collapse();
+    s_dirty = 1;
+}
+
+void psx_video_menu_set_row_enabled(int row_handle, int enabled, const char *reason) {
+    if (row_handle < 0 || row_handle >= s_reg_count) return;
+    VmRegRow *r = &s_reg[row_handle];
+    r->enabled = enabled ? 1 : 0;
+    r->disabled_hint = reason;
+    if (!enabled && s_editing && s_menu == r->menu &&
+        row_reg(s_menu, s_item[s_menu]) == r) edit_cancel();
+    s_dirty = 1;
+}
+
+int psx_video_menu_menu_enabled(int menu) {
+    return menu >= 0 && menu < s_menu_total && s_menu_enabled[menu];
+}
+
+int psx_video_menu_row_enabled(int row_handle) {
+    return row_handle >= 0 && row_handle < s_reg_count &&
+           s_menu_enabled[s_reg[row_handle].menu] && s_reg[row_handle].enabled;
+}
+
 int psx_video_menu_row_count(void) { return s_reg_count; }
 
 int psx_video_menu_row_info(int row_handle, int *menu, int *kind,
@@ -2217,6 +2333,7 @@ int psx_video_menu_get_row(int row_handle) {
 void psx_video_menu_set_row(int row_handle, int value) {
     if (row_handle < 0 || row_handle >= s_reg_count) return;
     VmRegRow *r = &s_reg[row_handle];
+    if (!r->enabled || !s_menu_enabled[r->menu]) return;
     if (r->kind == PSX_VM_ROW_NUMBER) {
         if (value < r->lo) value = r->lo;
         if (value > r->hi) value = r->hi;
@@ -2355,7 +2472,12 @@ void psx_video_menu_apply_restored(void) {
     s_applying_restored = 1;
     for (i = 0; i < s_reg_count; i++) {
         VmRegRow *r = &s_reg[i];
-        if (!r->restored || !r->on_change) continue;
+        /* A disabled row/menu is a policy boundary, not merely presentation.
+         * In particular, netplay disables guest-mutating title rows before
+         * this replay runs.  Replaying a stored value behind the grey UI
+         * would apply the forbidden mutation before the first game frame. */
+        if (!r->restored || !r->on_change || !r->enabled ||
+            !s_menu_enabled[r->menu]) continue;
         r->on_change(r->value);
     }
     s_applying_restored = 0;

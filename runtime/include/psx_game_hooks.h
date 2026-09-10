@@ -25,6 +25,10 @@ typedef void (*PsxGameHook)(void);
 /* Runs once, after the guest and its devices are up and the game may be
  * touched. Use for anything that has to arm against a running machine. */
 int psx_game_add_start_hook(PsxGameHook fn);
+/* Runs while the session's SDL devices still exist, immediately before a
+ * launcher soft return or final runtime shutdown. Title windows and other
+ * host resources must be released here so an in-process relaunch is cold. */
+int psx_game_add_stop_hook(PsxGameHook fn);
 
 /* Runs once per presented frame, on the emulator thread. Keep it cheap: a
  * hook that does nothing when its feature is off costs a predictable call. */
@@ -54,6 +58,7 @@ int psx_game_add_event_hook(PsxGameEventHook fn);
 
 /* Called by the runtime. Not for titles. */
 void psx_game_run_start_hooks(void);
+void psx_game_run_stop_hooks(void);
 void psx_game_run_frame_hooks(void);
 void psx_game_run_vblank_hooks(void);
 /* Returns non-zero when a hook consumed the event. */

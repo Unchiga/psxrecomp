@@ -227,6 +227,139 @@ static int preview_menu(int w, int h, int menu, int row,
     return 1;
 }
 
+/* Behavioural checks for policy-sensitive input.  The controller path in
+ * main.cpp deliberately translates D-pad/A to these same key events, so one
+ * set of assertions covers keyboard and controller activation semantics. */
+static int s_test_changed;
+static void test_changed(int value) { s_test_changed = value; }
+
+static void test_seed(PsxVideoMenuState *st)
+{
+    memset(st, 0, sizeof *st);
+    st->scaling = PSX_VM_SCALING_INTEGER;
+    st->screen = PSX_VM_SCREEN_WINDOWED;
+    st->windowed_scale = PSX_VM_WINDOWED_SCALE_DEFAULT;
+    st->vsync = PSX_VM_VSYNC_OFF;
+    st->supersampling = 1;
+    st->speed = 1;
+    st->vol_master = st->vol_music = st->vol_sound = 100;
+    st->update_check = 1;
+    st->renderer = PSX_VM_RENDERER_UNSET;
+}
+
+static void test_open(void)
+{
+    /* init starts visible/collapsed; F10 twice returns visible/expanded. */
+    psx_video_menu_toggle();
+    psx_video_menu_toggle();
+    /* init remembers VIDEO as the useful default; walk to FILE. */
+    psx_video_menu_handle_key(1073741904); /* left: View */
+    psx_video_menu_handle_key(1073741904); /* left: File */
+}
+
+static int menu_selftest(void)
+{
+    PsxVideoMenuState st;
+    PsxVideoMenuDebug d;
+    static const char *const choices[] = { "Off", "On" };
+    int row;
+
+#define CHECK(x) do { if (!(x)) { \
+    fprintf(stderr, "menu selftest failed at line %d: %s\n", __LINE__, #x); \
+    return 1; } } while (0)
+
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(1);
+    psx_video_menu_init(&st);
+    test_open();
+    psx_video_menu_handle_key(1073741905); /* down: Change disc */
+    psx_video_menu_handle_key(1073741905); /* down: Quit to Launcher */
+    psx_video_menu_handle_key(13);
+    CHECK(psx_video_menu_take_quit_to_launcher() == 1);
+    CHECK(psx_video_menu_take_quit() == 0);
+
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(1);
+    psx_video_menu_init(&st);
+    test_open();
+    psx_video_menu_handle_key(1073741905);
+    psx_video_menu_handle_key(1073741905);
+    psx_video_menu_handle_key(1073741905); /* Quit to Desktop */
+    psx_video_menu_handle_key(13);
+    CHECK(psx_video_menu_take_quit() == 1);
+    CHECK(psx_video_menu_take_quit_to_launcher() == 0);
+
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(0);
+    psx_video_menu_init(&st);
+    test_open();
+    psx_video_menu_handle_key(1073741905);
+    psx_video_menu_handle_key(1073741905); /* only Quit to Desktop remains */
+    psx_video_menu_handle_key(13);
+    CHECK(psx_video_menu_take_quit() == 1);
+    CHECK(psx_video_menu_take_quit_to_launcher() == 0);
+
+    /* Mouse activation goes through the geometric hit test rather than the
+     * keyboard/controller cursor. At the default 640x480 layout FILE starts
+     * at x=7, rows start at y=31, and each row is 19 pixels high. */
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(1);
+    psx_video_menu_init(&st);
+    CHECK(psx_video_menu_mouse_click(20, 10) == 1);
+    CHECK(psx_video_menu_mouse_click(20, 78) == 1); /* Quit to Launcher */
+    CHECK(psx_video_menu_take_quit_to_launcher() == 1);
+    CHECK(psx_video_menu_take_quit() == 0);
+
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(1);
+    psx_video_menu_init(&st);
+    CHECK(psx_video_menu_mouse_click(20, 10) == 1);
+    CHECK(psx_video_menu_mouse_click(20, 97) == 1); /* Quit to Desktop */
+    CHECK(psx_video_menu_take_quit() == 1);
+    CHECK(psx_video_menu_take_quit_to_launcher() == 0);
+
+    test_seed(&st);
+    psx_video_menu_set_launcher_available(0);
+    psx_video_menu_init(&st);
+    CHECK(psx_video_menu_mouse_click(20, 10) == 1);
+    CHECK(psx_video_menu_mouse_click(20, 78) == 1); /* only desktop remains */
+    CHECK(psx_video_menu_take_quit() == 1);
+    CHECK(psx_video_menu_take_quit_to_launcher() == 0);
+
+    row = psx_video_menu_add_option(PSX_VM_MENU_VIEW, "Policy test", "test",
+                                    choices, 2, NULL, 0, test_changed);
+    CHECK(row >= 0);
+    s_test_changed = 0;
+    psx_video_menu_set_row_enabled(row, 0, "disabled for test");
+    psx_video_menu_set_row(row, 1);
+    CHECK(psx_video_menu_get_row(row) == 0);
+    CHECK(s_test_changed == 0);
+    psx_video_menu_set_row_enabled(row, 1, NULL);
+    psx_video_menu_set_row(row, 1);
+    CHECK(psx_video_menu_get_row(row) == 1);
+    CHECK(s_test_changed == 1);
+
+    test_seed(&st);
+    psx_video_menu_init(&st);
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_GAME, 0, "netplay");
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_CHEATS, 0, "netplay");
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_MODS, 0, "netplay");
+    test_open();
+    psx_video_menu_handle_key(1073741903); /* File -> View */
+    psx_video_menu_handle_key(1073741903); /* View -> Video */
+    psx_video_menu_handle_key(1073741903); /* Video -> Audio */
+    psx_video_menu_handle_key(1073741903); /* skips disabled tail -> File */
+    psx_video_menu_debug_snapshot(&d);
+    CHECK(d.menu == PSX_VM_MENU_FILE);
+    CHECK(psx_video_menu_menu_enabled(PSX_VM_MENU_GAME) == 0);
+    CHECK(psx_video_menu_menu_enabled(PSX_VM_MENU_CHEATS) == 0);
+    CHECK(psx_video_menu_menu_enabled(PSX_VM_MENU_MODS) == 0);
+
+    puts("menu policy selftest: PASS");
+    return 0;
+#undef CHECK
+}
+
 static int preview_toast(int w, int h, const char *msg,
                          const uint32_t **px, int *ow, int *oh)
 {
@@ -268,6 +401,8 @@ int main(int argc, char **argv)
     enum { WHAT_MENU, WHAT_TOAST, WHAT_SLOTS } what = WHAT_MENU;
     int w = 1920, h = 1080, a = 2, b = 0, ow = 0, oh = 0, arg = 1, ok;
 
+    if (arg < argc && !strcmp(argv[arg], "--selftest"))
+        return menu_selftest();
     if (arg < argc && argv[arg][0] == '-' && argv[arg][1] == '-') {
         if (!strcmp(argv[arg], "--toast")) what = WHAT_TOAST;
         else if (!strcmp(argv[arg], "--slots")) what = WHAT_SLOTS;

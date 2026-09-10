@@ -2722,4 +2722,8 @@ if(PSX_DEBUG_TOOLS AND NOT TARGET menu_preview)
     if(NOT MSVC)
         target_link_libraries(menu_preview PRIVATE m)
     endif()
+    if(BUILD_TESTING)
+        add_test(NAME psx_video_menu_policy_test
+                 COMMAND menu_preview --selftest)
+    endif()
 endif()

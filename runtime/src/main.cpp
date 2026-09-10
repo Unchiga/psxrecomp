@@ -1055,6 +1055,7 @@ static void speed_apply_effective(int eff) {
 static void psx_speed_governor_reset(void);
 
 extern "C" void psx_set_game_speed(int mult) {
+    if (psx_netplay_active()) mult = 1;
     if (mult < 1)  mult = 1;
     if (mult > PSX_VM_SPEED_MAX) mult = PSX_VM_SPEED_MAX;
     g_speed_requested = mult;
@@ -3567,9 +3568,21 @@ static void netplay_soft_exit(const char *origin) {
     std::exit(0);
 }
 
+/* SDL_QUIT means the player asked to close the application (window close,
+ * debug quit, or File > Quit to Desktop). It must not inherit the lobby soft
+ * return merely because this match originally came from the launcher. */
+static void netplay_desktop_exit(const char *origin) {
+    psx_crash_trace_set_exit_origin(origin);
+    netplay_host_present_restore();
+    psx_netplay_shutdown();
+    shutdown_runtime();
+    std::exit(0);
+}
+
 static void shutdown_runtime(void) {
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
      * off-thread JIT worker here; the worker no longer exists.) */
+    psx_game_run_stop_hooks();
     psx_netplay_shutdown();
     psx_rewind_shutdown();
     memcard_flush_all();
@@ -3590,6 +3603,7 @@ static void shutdown_runtime(void) {
  * subsystems and the lobby WebSocket intact for the next launcher session. */
 static void teardown_game_session_keep_lobby(void) {
     netplay_host_present_restore();
+    psx_game_run_stop_hooks();
     psx_netplay_shutdown();
     psx_rewind_shutdown();
     memcard_flush_all();
@@ -5138,7 +5152,7 @@ static void netplay_barrier_admit(int override) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_QUIT) {
-                    netplay_soft_exit("sdl_window_close");
+                    netplay_desktop_exit("sdl_window_close");
                     if (psx_return_to_lobby_requested()) goto done;
                 }
                 if (ev.type == SDL_KEYDOWN) {
@@ -5293,6 +5307,11 @@ extern "C" void psx_host_lag_reset(void) {
  * steps, as an int) so a load can be timed at each setting from a script
  * without driving the menu. Returns the divisor now in force. */
 extern "C" int psx_host_set_fast_loads(int level) {
+    if (psx_netplay_active()) {
+        cdrom_set_speed(1);
+        cdrom_set_game_speed(1);
+        return 1;
+    }
     int divisor = 1;
     if (level == PSX_VM_LOADS_FAST)         divisor = PSX_FAST_LOADS_DIVISOR;
     else if (level == PSX_VM_LOADS_INSTANT) divisor = 0;
@@ -6213,8 +6232,10 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
      * only the first would be silently reverted by cdrom_notify_game_started. */
     {
         int divisor = 1, budget = 0;
-        if (s->fast_loads == PSX_VM_LOADS_FAST)         { divisor = PSX_FAST_LOADS_DIVISOR; }
-        else if (s->fast_loads == PSX_VM_LOADS_INSTANT) { divisor = 0; budget = PSX_FAST_LOADS_BUDGET; }
+        if (!psx_netplay_active()) {
+            if (s->fast_loads == PSX_VM_LOADS_FAST)         { divisor = PSX_FAST_LOADS_DIVISOR; }
+            else if (s->fast_loads == PSX_VM_LOADS_INSTANT) { divisor = 0; budget = PSX_FAST_LOADS_BUDGET; }
+        }
         cdrom_set_speed(divisor);
         cdrom_set_game_speed(divisor);
         if (budget > 0) cdrom_set_instant_rate(budget);
@@ -6302,6 +6323,7 @@ static int rewind_toggle_buttons_down(void) {
 
 static void rewind_poll_toggle_buttons(void) {
     static int was_down;
+    if (psx_netplay_active()) { was_down = 0; return; }
     if (!game_window_focused()) { was_down = 0; return; }
     int down = rewind_toggle_buttons_down();
     if (down && !was_down && !psx_rewind_is_open())
@@ -6311,6 +6333,7 @@ static void rewind_poll_toggle_buttons(void) {
 
 static void savestate_menu_poll_toggle_buttons(void) {
     static int was_down;
+    if (psx_netplay_active()) { was_down = 0; return; }
     if (!game_window_focused()) { was_down = 0; return; }
     int down = hotkey_pad_binding_down(g_hotkey_pad_save_state_menu);
     if (down && !was_down && !psx_rewind_is_open())
@@ -6326,6 +6349,11 @@ static int g_manual_turbo_latched = 0;
 
 static void fast_forward_toggle_flip(void) {
     char msg[40];
+    if (psx_netplay_active()) {
+        g_manual_turbo_latched = 0;
+        host_osd_push("Fast forward unavailable during netplay", 1200);
+        return;
+    }
     g_manual_turbo_latched = !g_manual_turbo_latched;
     if (!g_manual_turbo_latched) {
         host_osd_push("Fast forward: off", 900);
@@ -6341,6 +6369,7 @@ static void fast_forward_toggle_flip(void) {
 
 static void fast_forward_toggle_poll_buttons(void) {
     static int was_down;
+    if (psx_netplay_active()) { was_down = 0; return; }
     int down = hotkey_pad_binding_down(g_hotkey_pad_fast_forward_toggle);
     if (down && !was_down)
         fast_forward_toggle_flip();
@@ -6529,6 +6558,24 @@ extern "C" void psx_runtime_request_quit(void) {
     SDL_PushEvent(&q);
 }
 
+/* Drain the two explicit File actions without conflating their lifecycles. */
+static void video_menu_dispatch_quit(void) {
+    if (psx_video_menu_take_quit_to_launcher()) {
+        psx_crash_trace_set_exit_origin("menu_quit_to_launcher");
+        if (psx_netplay_active()) {
+            netplay_soft_exit("menu_quit_to_launcher");
+        } else {
+            psx_request_return_to_lobby();
+        }
+    }
+    if (psx_video_menu_take_quit()) {
+        SDL_Event q;
+        SDL_zero(q);
+        q.type = SDL_QUIT;
+        SDL_PushEvent(&q);
+    }
+}
+
 /* Drain the menu bar's one-shots from inside a modal pause loop.
  * Returns 1 when the caller's overlay should close (the player picked
  * GAME > SAVE / LOAD STATE again, which toggles). */
@@ -6539,12 +6586,7 @@ static int savestate_menu_pump_video_menu(void) {
         psx_apply_video_menu_state(&vms);
     if (psx_video_menu_take_savestate())
         close_me = 1;
-    if (psx_video_menu_take_quit()) {
-        SDL_Event q;
-        SDL_zero(q);
-        q.type = SDL_QUIT;
-        SDL_PushEvent(&q);
-    }
+    video_menu_dispatch_quit();
     return close_me;
 }
 
@@ -6865,7 +6907,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             if (psx_game_run_event_hooks(&ev)) continue;
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
-                    netplay_soft_exit("sdl_window_close");
+                    netplay_desktop_exit("sdl_window_close");
                     return ep;
                 }
                 psx_crash_trace_set_exit_origin("sdl_window_close");
@@ -6939,23 +6981,18 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                         (void)psx_video_menu_handle_key((int)key);
                         if (psx_video_menu_take_change(&vms))
                             psx_apply_video_menu_state(&vms);
-                        if (psx_video_menu_take_quit()) {
-                            SDL_Event q;
-                            SDL_zero(q);
-                            q.type = SDL_QUIT;
-                            SDL_PushEvent(&q);
-                        }
+                        video_menu_dispatch_quit();
                     }
                 }
                 else if (!key_repeat &&
                     host_keymap_match(HOST_KEYMAP_REWIND, (int)key, (int)mod)) {
-                    psx_rewind_toggle();
+                    if (!psx_netplay_active()) psx_rewind_toggle();
                 }
                 else if (!key_repeat &&
                          host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU,
                                                  (int)key, (int)scancode,
                                                  (int)mod)) {
-                    savestate_menu_toggle(key);
+                    if (!psx_netplay_active()) savestate_menu_toggle(key);
                 }
                 else if (key == SDLK_c && (mod & KMOD_CTRL)) {
                     std::fprintf(stdout, "[DEBUG] Forzando reinserción de CD...\n");
@@ -7059,12 +7096,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                         (void)psx_video_menu_handle_key(mapped);
                         if (psx_video_menu_take_change(&vms))
                             psx_apply_video_menu_state(&vms);
-                        if (psx_video_menu_take_quit()) {
-                            SDL_Event q;
-                            SDL_zero(q);
-                            q.type = SDL_QUIT;
-                            SDL_PushEvent(&q);
-                        }
+                        video_menu_dispatch_quit();
                     }
                 }
             }
@@ -7100,12 +7132,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                     (void)psx_video_menu_mouse_click(mx, my);
                     if (psx_video_menu_take_change(&vms))
                         psx_apply_video_menu_state(&vms);
-                    if (psx_video_menu_take_quit()) {
-                        SDL_Event q;
-                        SDL_zero(q);
-                        q.type = SDL_QUIT;
-                        SDL_PushEvent(&q);
-                    }
+                    video_menu_dispatch_quit();
                 }
             }
         }
@@ -7203,10 +7230,16 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             else
                 host_change_game_disc();
         }
-        savestate_menu_poll_toggle_buttons();
-        rewind_poll_toggle_buttons();
-        fast_forward_toggle_poll_buttons();
-        psx_rewind_note_frame();
+        if (!psx_netplay_active()) {
+            savestate_menu_poll_toggle_buttons();
+            rewind_poll_toggle_buttons();
+            fast_forward_toggle_poll_buttons();
+            psx_rewind_note_frame();
+        } else {
+            g_manual_turbo_latched = 0;
+            if (savestate_menu_open) savestate_menu_close();
+            if (psx_rewind_is_open()) psx_rewind_shutdown();
+        }
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
         if (savestate_menu_open)
             savestate_menu_host_pause_loop();
@@ -7385,7 +7418,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * simulation advancing and the debug server polling, but removes frontend
      * presentation and wall-clock pacing. */
 #ifndef PSX_NO_DEBUG_TOOLS
-    if (debug_server_turbo_enabled()) {
+    if (!psx_netplay_active() && debug_server_turbo_enabled()) {
         ep.skip_pace = 1;
         return ep;
     }
@@ -7409,8 +7442,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * fast_forward_toggle_pad) and drives the same path. */
         const bool kb_turbo = host_hotkey_input_focused() &&
             host_keymap_down(HOST_KEYMAP_TURBO, keys, (int)SDL_GetModState());
-        if (kb_turbo || g_manual_turbo_latched ||
-            hotkey_pad_binding_down(g_hotkey_pad_fast_forward)) {
+        if (!psx_netplay_active() &&
+            (kb_turbo || g_manual_turbo_latched ||
+             hotkey_pad_binding_down(g_hotkey_pad_fast_forward))) {
             const int mult = manual_fast_forward_multiplier();
             const int present_every = (mult < 0) ? 4 : (mult <= 4 ? 2 : 4);
             manual_turbo_active = true;
@@ -16064,6 +16098,12 @@ session_reboot:
      * (pad edges, dig0 latch, tip densify, FMV flags, IRQ resume).
      * Idempotent with BYE teardown; device *_init still runs below. */
     psx_netplay_cold_reset();
+    /* These flags survive the in-process launcher soft return.  Begin every
+     * new session permissive; a successfully started netplay session locks
+     * them again below before any restored title callback can run. */
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_GAME, 1, NULL);
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_CHEATS, 1, NULL);
+    psx_video_menu_set_menu_enabled(PSX_VM_MENU_MODS, 1, NULL);
     {
         extern uint64_t s_frame_count;
         extern uint32_t g_debug_current_func_addr;
@@ -16216,6 +16256,9 @@ session_reboot:
                 nrc, boot.net_cfg.local_slot, boot.net_cfg.bind_hostport, boot.net_cfg.peer_hostport);
             return 1;
         }
+        /* Lock deterministic session controls before CPU reset and the first
+         * simulated frame. Offline preferences stay persisted and are loaded
+         * again on the next session reboot. */
         apply_netplay_local_viewport_aspect(boot.net_cfg.enabled);
         std::printf("psxrecomp: netplay transport=%s slot=%d input_player=%d delay=%d "
                     "force_turn=%d bind=%s peer=%s session=%u\n",
@@ -16402,6 +16445,14 @@ session_reboot:
             (void)psx_video_menu_settings_load(g_menu_settings_path.c_str(), &vms);
         }
 
+#if defined(RECOMP_LAUNCHER)
+        psx_video_menu_set_launcher_available(
+            (boot.force_launcher ||
+             (!std::getenv("PSX_NO_LAUNCHER") && !boot.force_no_launcher &&
+              !boot.skip_launcher_setting)) ? 1 : 0);
+#else
+        psx_video_menu_set_launcher_available(0);
+#endif
         psx_video_menu_init(&vms);
         /* Tell the player their saves moved, once, on the launch that moved
          * them. Silently relocating someone's memory cards and leaving them to
@@ -16490,7 +16541,7 @@ session_reboot:
          * state only fires on a CHANGE. Set the game divisor rather than the
          * live one: boot deliberately runs at 1x so the BIOS disc-init sees
          * authentic timing, and cdrom_notify_game_started latches this. */
-        if (vms.fast_loads != PSX_VM_LOADS_OFF) {
+        if (!psx_netplay_active() && vms.fast_loads != PSX_VM_LOADS_OFF) {
             const int divisor = (vms.fast_loads == PSX_VM_LOADS_INSTANT)
                                     ? 0 : PSX_FAST_LOADS_DIVISOR;
             cdrom_set_game_speed(divisor);
@@ -16500,6 +16551,9 @@ session_reboot:
                          "psxrecomp: menu fast loading = %s (divisor %d)\n",
                          vms.fast_loads == PSX_VM_LOADS_INSTANT ? "instant" : "fast",
                          divisor);
+        } else if (psx_netplay_active()) {
+            cdrom_set_speed(1);
+            cdrom_set_game_speed(1);
         }
         /* Same reason as FAST LOADING above, for every row a title registered:
          * a change callback fires on a CHANGE, and a restore is not one, so a
@@ -16511,6 +16565,21 @@ session_reboot:
          * how CARD DROPS came to read 99 at startup while awarding one card.
          *
          * After the guest is up, because these callbacks touch it. */
+        if (psx_netplay_active()) {
+            /* This is the last policy boundary before title start hooks and
+             * the first simulated frame.  Keep the saved offline choices in
+             * vms/menu_settings.ini, but neither replay nor expose them. */
+            psx_set_game_speed(1);
+            psx_set_speed_governor(0);
+            g_manual_turbo_latched = 0;
+            g_turbo_loads_enabled = 0;
+            psx_video_menu_set_menu_enabled(
+                PSX_VM_MENU_GAME, 0, "Unavailable during netplay");
+            psx_video_menu_set_menu_enabled(
+                PSX_VM_MENU_CHEATS, 0, "Unavailable during netplay");
+            psx_video_menu_set_menu_enabled(
+                PSX_VM_MENU_MODS, 0, "Unavailable during netplay");
+        }
         psx_video_menu_apply_restored();
         psx_game_run_start_hooks();
         gl_renderer_set_integer_scale(vms.scaling == PSX_VM_SCALING_INTEGER);
@@ -16769,7 +16838,7 @@ session_reboot:
     }
 
     psx_scheduler_run(&cpu);
-    if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
+    if (psx_return_to_lobby_requested())
         goto soft_return_lobby;
 #endif
 
@@ -16843,11 +16912,13 @@ session_reboot:
     return 0;
 
 soft_return_lobby:
-    /* Netplay soft-exit: tear down the match, keep the lobby seat, and reopen
-     * the launcher on the LOBBY room so every peer can rematch. */
+    /* Session soft-exit: tear down every game-owned subsystem and reopen the
+     * same in-process launcher. Netplay returns to its room; an offline game
+     * returns to the ordinary Play surface. */
+    const bool return_to_netplay_room = g_netplay_from_lobby != 0;
     teardown_game_session_keep_lobby();
 #if defined(RECOMP_LAUNCHER) && defined(PSX_HAS_LOBBY_CLIENT)
-    ae_np_prepare_lobby_rematch();
+    if (return_to_netplay_room) ae_np_prepare_lobby_rematch();
     {
         std::string assets_dir_str = exe_dir_from_argv(argv[0]).string();
         std::string rui_title = (boot.game_name.empty() ? std::string("PSX") : boot.game_name)
@@ -17030,7 +17101,7 @@ soft_return_lobby:
             boot.ctrl_locked_mode[0],
             rui_lang_labels.empty() ? nullptr : rui_lang_labels.data(),
             (int)rui_lang_labels.size(),
-            /*resume_netplay_room=*/1);
+            /*resume_netplay_room=*/return_to_netplay_room ? 1 : 0);
         gi.discs = rui_discs.empty() ? nullptr : rui_discs.data();
         gi.num_discs = (int)rui_discs.size();
 #if defined(PSX_HAS_SETUP_WIZARD) && defined(PSX_HAS_CODEGEN_SETUP_HOST)

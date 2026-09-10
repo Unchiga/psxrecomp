@@ -202,8 +202,12 @@ int  psx_video_menu_handle_key(int key);
 /* 1 + fills *out when any option changed since the previous call. */
 int  psx_video_menu_take_change(PsxVideoMenuState *out);
 
-/* 1 exactly once after the player picks FILE > QUIT. */
+/* Desktop quit is kept under the legacy name for source compatibility. */
 int  psx_video_menu_take_quit(void);
+/* 1 exactly once after FILE > QUIT TO LAUNCHER. This row exists only when
+ * the current game session was entered through the in-process launcher. */
+int  psx_video_menu_take_quit_to_launcher(void);
+void psx_video_menu_set_launcher_available(int available);
 
 /* 1 exactly once after the player picks GAME > SAVE / LOAD STATE. The host
  * opens its save-state slot overlay; this module owns no part of that and only
@@ -250,7 +254,8 @@ int  psx_video_menu_take_pick_disc(void);
 enum { PSX_VM_ROW_OPTION = 0, PSX_VM_ROW_NUMBER = 1, PSX_VM_ROW_ACTION = 2 };
 
 /* Built-in menus a title may add rows to. */
-enum { PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_GAME = 4,
+enum { PSX_VM_MENU_FILE = 0, PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_VIDEO = 2,
+       PSX_VM_MENU_AUDIO = 3, PSX_VM_MENU_GAME = 4,
        PSX_VM_MENU_CHEATS = 5, PSX_VM_MENU_MODS = 6 };
 
 /* A new top-level menu. Returns its id, or -1 when full. */
@@ -297,6 +302,16 @@ void psx_video_menu_set_row(int row_handle, int value);
  * registers after it (constructor order is link order) asks for a high
  * value. */
 void psx_video_menu_set_row_order(int row_handle, int order);
+
+/* Reusable disabled state. Disabled menus remain visible but cannot be
+ * opened; disabled rows remain in layout but cannot be hit, selected,
+ * edited, cycled, activated, or driven through psx_video_menu_set_row().
+ * `reason` is shown as the hint if a row was selected when disabled and must
+ * outlive the process. */
+void psx_video_menu_set_menu_enabled(int menu, int enabled, const char *reason);
+void psx_video_menu_set_row_enabled(int row_handle, int enabled, const char *reason);
+int  psx_video_menu_menu_enabled(int menu);
+int  psx_video_menu_row_enabled(int row_handle);
 
 /* Walk the registered rows: handles are 0..count-1. settings_key is NULL for
  * a row that does not persist. A title that bundles its settings into a
