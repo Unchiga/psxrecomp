@@ -149,9 +149,68 @@ typedef struct {
     uint16_t env_level;     /* 0..0x7FFF — applied to raw decoded sample */
     uint32_t adsr_divider;  /* fixed-point counter; level updates on overflow */
     uint8_t  adsr_phase;    /* ADSR_ATTACK / DECAY / SUSTAIN / RELEASE */
+    uint8_t  bus;           /* SPU_BUS_MUSIC / SPU_BUS_SFX, latched at KEYON */
 } SpuVoice;
 
 static SpuVoice voices[SPU_VOICE_COUNT];
+
+/* ---- Music / SFX split --------------------------------------------------
+ *
+ * Real hardware has one mix: 24 voices summed into L/R with no notion of what
+ * a voice is FOR. Splitting music from sound effects therefore cannot be done
+ * by intercepting some "music" channel — it has to classify voices.
+ *
+ * The classifier runs at KEYON and is latched for the voice's lifetime (the
+ * ADSR registers can be rewritten while a voice plays; the bus must not move
+ * under it). Two rules, OR'd:
+ *
+ *   - an explicit per-game voice mask (spu_set_sfx_voice_mask), and
+ *   - ADSR == 0, i.e. an instant-attack instant-release one-shot.
+ *
+ * The ADSR rule is content-derived rather than a hardcoded voice range, and in
+ * Yu-Gi-Oh! Forbidden Memories it separates cleanly: across two independent
+ * captures every music voice carried a real envelope (0x80FF/0x4F8D and
+ * friends) and every SFX carried exactly 0x00000000. It is a heuristic, not a
+ * hardware fact — hence the mask escape hatch.
+ *
+ * Gains are 8.8 fixed point. At unity (256) the arithmetic is exactly
+ * ((x * 256) >> 8) == x, so a default build mixes byte-identically to before
+ * and parity/cosim surfaces are untouched until a slider actually moves. */
+enum { SPU_BUS_MUSIC = 0, SPU_BUS_SFX = 1 };
+#define SPU_GAIN_UNITY 256
+static int      s_gain_master = SPU_GAIN_UNITY;
+static int      s_gain_music  = SPU_GAIN_UNITY;
+static int      s_gain_sfx    = SPU_GAIN_UNITY;
+static uint32_t s_sfx_voice_mask;      /* explicit per-game override */
+static int      s_sfx_classify_adsr0 = 1;
+
+static inline uint16_t voice_reg(int voice, int reg);   /* defined below */
+
+static uint8_t spu_classify_bus(int v) {
+    uint32_t adsr;
+    if (s_sfx_voice_mask & (1u << v)) return SPU_BUS_SFX;
+    adsr = (uint32_t)voice_reg(v, 4) | ((uint32_t)voice_reg(v, 5) << 16);
+    if (s_sfx_classify_adsr0 && adsr == 0u) return SPU_BUS_SFX;
+    return SPU_BUS_MUSIC;
+}
+
+void spu_set_bus_gains(int master_pct, int music_pct, int sfx_pct) {
+    if (master_pct < 0) master_pct = 0; if (master_pct > 100) master_pct = 100;
+    if (music_pct  < 0) music_pct  = 0; if (music_pct  > 100) music_pct  = 100;
+    if (sfx_pct    < 0) sfx_pct    = 0; if (sfx_pct    > 100) sfx_pct    = 100;
+    s_gain_master = (master_pct * SPU_GAIN_UNITY) / 100;
+    s_gain_music  = (music_pct  * SPU_GAIN_UNITY) / 100;
+    s_gain_sfx    = (sfx_pct    * SPU_GAIN_UNITY) / 100;
+}
+
+void spu_set_sfx_voice_mask(uint32_t mask) { s_sfx_voice_mask = mask; }
+
+uint32_t spu_get_sfx_bus_mask(void) {
+    uint32_t m = 0;
+    for (int v = 0; v < SPU_VOICE_COUNT; v++)
+        if (voices[v].active && voices[v].bus == SPU_BUS_SFX) m |= (1u << v);
+    return m;
+}
 
 static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
@@ -909,9 +968,37 @@ static int16_t voice_next_sample(int idx) {
     return (int16_t)shaped;
 }
 
+/* Voices keyed ON since the last spu_render block.
+ *
+ * Hardware latches KON/KOFF and processes them together once per 44100Hz
+ * cycle, and a voice named by BOTH in the same cycle ends up playing — the
+ * key-on wins. Sound drivers rely on that: Yu-Gi-Oh! Forbidden Memories'
+ * menu-SFX path writes, within one frame,
+ *
+ *     KOFF v22   (stop whatever was there)
+ *     KON  v22   (start the new sample)
+ *     KOFF v22   (its bookkeeping still lists v22 as pending-stop)
+ *     KOFF v22
+ *
+ * and expects the sound. Applying each write the instant it arrives instead
+ * let the trailing KOFF win, dropping the voice into RELEASE; because these
+ * one-shots use ADSR = 0x00000000 (release shift 0), release is effectively
+ * instantaneous, so the SFX was silent. It was intermittent because it
+ * depended on whether a render happened to land between the KON and the
+ * trailing KOFF.
+ *
+ * Register writes still apply immediately, so everything the CPU can observe
+ * (notably KON clearing ENDX before the game polls it) keeps its timing. The
+ * only change is that a KOFF cannot cancel a KON issued in the same window.
+ * A fully tick-latched KON/KOFF is the more faithful model; it is not done
+ * here because deferring KON by a whole render block would move the ENDX
+ * clear far later than the ~22us hardware takes. */
+static uint32_t kon_this_block;
+
 static void key_on(uint32_t mask) {
     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
         if (!(mask & (1u << i))) continue;
+        kon_this_block |= (1u << i);
         SpuVoice *v = &voices[i];
         memset(v, 0, sizeof(*v));
         v->active = 1;
@@ -926,6 +1013,9 @@ static void key_on(uint32_t mask) {
         v->env_level = 0;
         v->adsr_divider = 0;
         v->adsr_phase = ADSR_ATTACK;
+        /* Latch the bus now: ADSR can be rewritten mid-voice, and a voice that
+         * changed bus while sounding would jump between volume sliders. */
+        v->bus = spu_classify_bus(i);
         key_on_count++;
         endx_latch &= ~(1u << i);  /* KEYON clears ENDX bit on real hw */
         spu_event_record(SPU_EV_KEYON, i, v->cur_addr);
@@ -940,6 +1030,8 @@ static void key_off(uint32_t mask) {
     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
         if (!(mask & (1u << i))) continue;
         if (!voices[i].active) continue;
+        /* Same-cycle KON wins (see kon_this_block). */
+        if (kon_this_block & (1u << i)) continue;
         spu_event_record(SPU_EV_KEYOFF, i, voices[i].cur_addr);
         voices[i].adsr_phase = ADSR_RELEASE;
         voices[i].adsr_divider = 0;
@@ -961,6 +1053,7 @@ void spu_init(void) {
     endx_latch = 0;
     kon_latch = 0;
     koff_latch = 0;
+    kon_this_block = 0;
     irq_flag = 0;
     /* Hardware power-on LFSR value is undocumented; 0 is safe because the
      * xor-1 parity term self-starts the register within 16 clocks. */
@@ -985,6 +1078,10 @@ void spu_init(void) {
 
 void spu_render(int16_t* out_stereo, int frames) {
     if (!out_stereo || frames <= 0) return;
+
+    /* Close the KON/KOFF window: writes that arrived while the CPU ran since
+     * the previous block are one "cycle" as far as key-on priority goes. */
+    kon_this_block = 0;
 
     uint16_t ctrl = spu_regs[reg_index(0x1F801DAAu)];
     int enabled  = (ctrl & 0x8000u) != 0;
@@ -1056,6 +1153,12 @@ void spu_render(int16_t* out_stereo, int frames) {
             if (cd_on) {
                 int32_t ccl = ((int32_t)cd_l * cd_vol_l) >> 15;
                 int32_t ccr = ((int32_t)cd_r * cd_vol_r) >> 15;
+                /* CD/XA is streamed music (and FMV audio), so it rides the
+                 * MUSIC bus. Applied before the reverb send, as for voices. */
+                if (s_gain_music != SPU_GAIN_UNITY) {
+                    ccl = (ccl * s_gain_music) >> 8;
+                    ccr = (ccr * s_gain_music) >> 8;
+                }
                 mix_l += ccl;
                 mix_r += ccr;
                 if (cd_rev) {
@@ -1099,6 +1202,12 @@ void spu_render(int16_t* out_stereo, int frames) {
             mix_r = clamp16(mix_r);
             mix_l = ((int32_t)mix_l * main_l) >> 15;
             mix_r = ((int32_t)mix_r * main_r) >> 15;
+            /* MASTER rides last, after the guest's own main volume, so it
+             * scales everything the SPU produces including reverb. */
+            if (s_gain_master != SPU_GAIN_UNITY) {
+                mix_l = (mix_l * s_gain_master) >> 8;
+                mix_r = (mix_r * s_gain_master) >> 8;
+            }
 
             out_stereo[f * 2 + 0] = clamp16(mix_l);
             out_stereo[f * 2 + 1] = clamp16(mix_r);
@@ -1167,6 +1276,17 @@ void spu_render(int16_t* out_stereo, int frames) {
                     if (!s) continue;
                     int32_t cl = ((int32_t)s * vl) >> 15;
                     int32_t cr = ((int32_t)s * vr) >> 15;
+                    /* Music/SFX bus gain. Applied BEFORE the reverb send so a
+                     * muted bus is muted in the wet path too. Unity is exact,
+                     * so a default build is bit-for-bit unchanged. */
+                    {
+                        const int g = (voices[v].bus == SPU_BUS_SFX) ? s_gain_sfx
+                                                                     : s_gain_music;
+                        if (g != SPU_GAIN_UNITY) {
+                            cl = (cl * g) >> 8;
+                            cr = (cr * g) >> 8;
+                        }
+                    }
                     voice_l += cl;
                     voice_r += cr;
                     /* Per-voice reverb send: EON voices feed the reverb input
@@ -1199,6 +1319,12 @@ void spu_render(int16_t* out_stereo, int frames) {
             if (cd_on) {
                 int32_t ccl = ((int32_t)cd_l * cd_vol_l) >> 15;
                 int32_t ccr = ((int32_t)cd_r * cd_vol_r) >> 15;
+                /* CD/XA is streamed music (and FMV audio), so it rides the
+                 * MUSIC bus. Applied before the reverb send, as for voices. */
+                if (s_gain_music != SPU_GAIN_UNITY) {
+                    ccl = (ccl * s_gain_music) >> 8;
+                    ccr = (ccr * s_gain_music) >> 8;
+                }
                 mix_l += ccl;
                 mix_r += ccr;
                 if (cd_rev) {
@@ -1265,6 +1391,12 @@ void spu_render(int16_t* out_stereo, int frames) {
             mix_r = clamp16(mix_r);
             mix_l = ((int32_t)mix_l * main_l) >> 15;
             mix_r = ((int32_t)mix_r * main_r) >> 15;
+            /* MASTER rides last, after the guest's own main volume, so it
+             * scales everything the SPU produces including reverb. */
+            if (s_gain_master != SPU_GAIN_UNITY) {
+                mix_l = (mix_l * s_gain_master) >> 8;
+                mix_r = (mix_r * s_gain_master) >> 8;
+            }
         }
 
         out_stereo[f * 2 + 0] = clamp16(mix_l);

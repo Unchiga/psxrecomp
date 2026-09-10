@@ -638,6 +638,36 @@ volatile int g_sio_timing_active = 0;
 #define SIO_BAUD_CYCLES_DEFAULT 1088
 #define SIO_ACK_CYCLES_DEFAULT  170
 static int sio_tick_quantum_cycles = 64;
+
+/* SIO scales WITH the CPU overclock, and that is the faithful model rather
+ * than a workaround.
+ *
+ * On real hardware the controller/memory-card serial clock is derived from the
+ * SYSTEM clock, so a machine with a faster CPU has a proportionally faster pad
+ * link. The SPU and the CD drive have their own oscillators and the video
+ * timing has its own, which is why those must NOT scale — that separation is
+ * the whole point of the overclock (music and disc keep real time).
+ *
+ * Leaving SIO on device time while the CPU runs K times faster is the one
+ * combination no real machine can produce, and it breaks guests concretely: a
+ * pad-read routine that bounds its ACK wait by loop iterations rather than by
+ * elapsed time gives up early and concludes no controller is attached. That is
+ * exactly what happened to Yu-Gi-Oh! FM at 16x on 2026-08-16 — input died
+ * while everything else kept running, and came straight back at 1x.
+ *
+ * Scaling these keeps instructions-per-ACK invariant across multipliers, which
+ * is the property such a routine actually depends on. */
+extern uint32_t g_psx_cpu_overclock;
+static inline int sio_oc_div(int v) {
+    uint32_t k = g_psx_cpu_overclock ? g_psx_cpu_overclock : 1u;
+    int r = v / (int)k;
+    return r < 1 ? 1 : r;
+}
+static inline int sio_baud_cycles(void)  { return sio_oc_div(SIO_BAUD_CYCLES_DEFAULT); }
+static inline int sio_ack_cycles(void)   { return sio_oc_div(SIO_ACK_CYCLES_DEFAULT); }
+/* The tick quantum scales too, or at 16x it would be coarser than a whole byte
+ * period (68 cycles) and the shifter would jump past its own completion. */
+static inline int sio_quantum_cycles(void) { return sio_oc_div(sio_tick_quantum_cycles); }
 static int     sio_shift_active     = 0;
 static uint8_t sio_shift_byte       = 0;
 static int     sio_shift_remaining  = 0;
@@ -2219,13 +2249,13 @@ void sio_write(uint32_t addr, uint32_t value) {
                      * same cycle-paced ack scheduler the card path uses, driven
                      * by sio_advance() from psx_advance_cycles(). */
                     sio_pending_ack        = 1;
-                    sio_ack_remaining      = SIO_BAUD_CYCLES_DEFAULT + SIO_ACK_CYCLES_DEFAULT;
+                    sio_ack_remaining      = sio_baud_cycles() + sio_ack_cycles();
                     sio_pending_ack_irq_en = 1;
                     g_sio_timing_active    = 1;
                     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_ack_remaining);
                     sio_irq_pending_source = SIO_IRQ_SRC_PAD_ACK;
                     sio_irq_pending_slot = (uint8_t)selected_slot;
-                    sio_irq_pending_delay = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
+                    sio_irq_pending_delay = (uint8_t)sio_ack_cycles();
                     sio_irq_pending_mc_state = (uint8_t)mc_state;
                     sio_irq_pending_byte_seq = sio_trace_seq;
                     armed_now = 1;
@@ -2248,7 +2278,7 @@ void sio_write(uint32_t addr, uint32_t value) {
             if (!sio_shift_active) {
                 sio_shift_byte      = b;
                 sio_shift_active    = 1;
-                sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+                sio_shift_remaining = sio_baud_cycles();
                 sio_shift_ack_irq_en = (sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0;
                 sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
                 g_sio_timing_active = 1;
@@ -2709,20 +2739,20 @@ static void sio_handle_shift_complete(void) {
     sio_irq_pending_source   = (active_device == DEV_MEMCARD)
                                ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
     sio_irq_pending_slot     = (uint8_t)selected_slot;
-    sio_irq_pending_delay    = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
+    sio_irq_pending_delay    = (uint8_t)sio_ack_cycles();
     sio_irq_pending_mc_state = (uint8_t)mc_state;
     sio_irq_pending_byte_seq = sio_trace_seq;
 
     if (acked) {
         sio_pending_ack   = 1;
-        sio_ack_remaining = SIO_ACK_CYCLES_DEFAULT;
+        sio_ack_remaining = sio_ack_cycles();
         sio_pending_ack_irq_en = sio_shift_ack_irq_en;
     }
 
     if (sio_tx_buffered) {
         sio_shift_byte      = sio_tx_buffer;
         sio_shift_active    = 1;
-        sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+        sio_shift_remaining = sio_baud_cycles();
         sio_shift_ack_irq_en = sio_tx_buffer_ack_irq_en;
         sio_tx_buffered     = 0;
         sio_tx_buffer_ack_irq_en = 0;
@@ -2883,7 +2913,7 @@ void sio_ape_card_unstick_pump(void) {
 
 void sio_tick_quantum(void) {
 #if SIO_MODEL_CYCLE_PACED
-    sio_tick(sio_tick_quantum_cycles);
+    sio_tick(sio_quantum_cycles());
 #endif
 }
 

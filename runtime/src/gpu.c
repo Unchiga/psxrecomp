@@ -229,10 +229,22 @@ static int ws_precise_nclip_cfg = 0;
 static uint32_t ws_gameplay_state_addr = 0;
 static uint32_t ws_gameplay_state_values[WS_GAMEPLAY_STATE_VALUES_MAX];
 static int ws_gameplay_state_value_count = 0;
-/* Any frame that projects a handful of vertices is "3D" (a low threshold so a
- * sparse close-up cutscene frame still counts — the flicker was frames dipping
- * below a high 16-vert bar and pillarboxing for a frame or two). */
-#define WS_GTE_GAME_MODE_MIN_VERTS 3u
+/* Two-threshold Schmitt trigger. ENTERING game mode takes real projection
+ * volume: a 3D world projects hundreds of verts per frame through RTPS/RTPT
+ * (same reasoning as WS_WORLD3D_MIN_VERTS below), while a menu's decorative
+ * GTE effect projects a quad or two. A single low bar (this was 3) let the
+ * YGO FM free-duel grid — whose cursor glint projects exactly 4 verts for a
+ * dozen frames every couple of seconds — arm game mode from a MENU, so the
+ * present flapped wide<->4:3 on the hysteresis cadence, a visible ~1 Hz
+ * pulse of the whole picture. Once ENTERED, the mode is HELD/refreshed by
+ * the original low bar, so a sparse close-up cutscene frame still counts —
+ * the flicker that low bar was added for (frames dipping below a high
+ * 16-vert bar and pillarboxing for a frame or two) stays fixed. A menu
+ * burst can only keep the mode alive if it lands within the hysteresis of
+ * a real 3D frame; bursts spaced wider than the hysteresis (the grid's
+ * ~2 s cadence vs 0.75 s) can never latch it. */
+#define WS_GTE_GAME_MODE_HOLD_VERTS  3u
+#define WS_GTE_GAME_MODE_ENTER_VERTS 48u
 /* STICKY: stay in native-wide for ~0.75s after the last 3D frame, so brief
  * low-poly frames in a real-time 3D cutscene never flip to a 4:3 pillarbox (the
  * intro-cutscene flicker). Only a genuine full-2D screen — no GTE projection for
@@ -315,8 +327,14 @@ void psx_ws_note_gte_project(int nverts) {
         ws_gte_frame = f; ws_gte_count = 0;
     }
     ws_gte_count += (uint32_t)nverts;
-    if (ws_gte_game_mode_cfg && ws_gte_count >= WS_GTE_GAME_MODE_MIN_VERTS)
-        ws_last_gte_stamp = f;
+    if (ws_gte_game_mode_cfg) {
+        /* held: a stamped frame lies within the hysteresis window (unsigned
+         * wrap at the boot sentinel makes this false until first entry). */
+        const int held = f - ws_last_gte_stamp <= WS_GTE_GAME_MODE_HYSTERESIS;
+        if (ws_gte_count >= WS_GTE_GAME_MODE_ENTER_VERTS ||
+            (held && ws_gte_count >= WS_GTE_GAME_MODE_HOLD_VERTS))
+            ws_last_gte_stamp = f;
+    }
     if (ws_gte_count >= WS_WORLD3D_MIN_VERTS && ws_last_world3d_stamp != f) {
         if (f == ws_last_world3d_stamp + 1u) ws_sust_world3d_stamp = f;
         ws_last_world3d_stamp = f;
@@ -3095,6 +3113,9 @@ void gpu_vblank_flush_present(void) {
 }
 
 void gpu_vblank_tick(void) {
+    /* Close out the frame's dimmer tally before anything reads it, so
+     * consumers always see a COMPLETE frame rather than a partial one. */
+    gpu_fade_dimmer_latch();
     lcf ^= 1;
     /* GPUSTAT.13 (interlace FIELD): on real hardware this alternates per
      * field while GP1(08h) vertical interlace is on, in antiphase with the
@@ -3482,6 +3503,26 @@ int gpu_texture_correction_enabled(void) {
     return s_texture_correction_enabled;
 }
 
+/* Rejection census. "Perspective triangles: 0" says the feature is inert on a
+ * title but not which of its three independent preconditions failed, and those
+ * have completely different meanings: no source address means the packet did
+ * not arrive by DMA from tracked RAM, no provenance means the position words
+ * were never written by an SWC2 projection store (the value-propagation gap of
+ * ENHANCEMENTS.md G1.2), and zero Z means the projection carries no usable
+ * depth. Without the split, "inert" invites a guess. */
+static uint32_t s_persp_attempts = 0;
+static uint32_t s_persp_no_src   = 0;
+static uint32_t s_persp_no_prov  = 0;
+static uint32_t s_persp_zero_z   = 0;
+
+void gpu_texture_provenance_stats(uint32_t *attempts, uint32_t *no_source,
+                                  uint32_t *no_provenance, uint32_t *zero_z) {
+    if (attempts) *attempts = s_persp_attempts;
+    if (no_source) *no_source = s_persp_no_src;
+    if (no_provenance) *no_provenance = s_persp_no_prov;
+    if (zero_z) *zero_z = s_persp_zero_z;
+}
+
 uint32_t gpu_texture_correction_hits(void) {
     return sw_perspective_triangle_count();
 }
@@ -3562,13 +3603,19 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     s_texcorr.attempts++;
     if (!s_texture_correction_enabled) { s_texcorr.no_correction++; return; }
     if (gp0_cmd_source_addr == 0xFFFFFFFFu) { s_texcorr.no_source++; return; }
+    s_persp_attempts++;
     int indices[3] = { i0, i1, i2 };
     uint16_t z[3];
     for (int i = 0; i < 3; i++) {
         uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
-        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
-            z[i] == 0) {
+        /* load_word returns 0 for BOTH "no provenance here" and "matched, but
+         * the projection's Z is 0" — it writes z only in the second case. The
+         * sentinel is what tells the two apart, and they mean opposite things:
+         * one is a tracking gap, the other is real geometry at zero depth. */
+        z[i] = 0xFFFFu;
+        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i])) {
             s_texcorr.no_depth++;
+            if (z[i] == 0) s_persp_zero_z++; else s_persp_no_prov++;
             return;
         }
     }
@@ -3754,6 +3801,10 @@ static void raster_triangle(int32_t x0, int32_t y0,
 }
 
 /* Execute mono triangle (GP0 0x20-0x23) */
+/* Sprite-watch occlusion (defined with the rest of the watch below). */
+static void spw_occlude(int32_t x, int32_t y, int32_t w, int32_t h);
+static void spw_occlude_pts(const int32_t *vx, const int32_t *vy, int n);
+
 static void gp0_exec_mono_tri(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
@@ -3761,6 +3812,7 @@ static void gp0_exec_mono_tri(void) {
     for (int i = 0; i < 3; i++) {
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
     }
+    spw_occlude_pts(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -3781,6 +3833,7 @@ static void gp0_exec_mono_quad(void) {
     int32_t vx[4], vy[4];
     for (int i = 0; i < 4; i++)
         parse_vertex(gp0_cmd_buf[1 + i], &vx[i], &vy[i]);
+    spw_occlude_pts(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -3856,6 +3909,7 @@ static void gp0_exec_shaded_tri(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    spw_occlude_pts(vx, vy, 3);
     if (psx_gpu_triangle_oversize(vx, vy, 0, 1, 2)) return;
     ws_nw_hud_shift_vertices(vx, 3);
     for (int i = 0; i < 3; i++) {
@@ -3888,6 +3942,7 @@ static void gp0_exec_shaded_quad(void) {
         c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
     }
+    spw_occlude_pts(vx, vy, 4);
     int rej_a = psx_gpu_triangle_oversize(vx, vy, 0, 1, 2);
     int rej_b = psx_gpu_triangle_oversize(vx, vy, 2, 1, 3);
     if (rej_a && rej_b) return;
@@ -3969,6 +4024,7 @@ static void gp0_exec_textured_tri(void) {
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
+    spw_occlude_pts(vx, vy, 3);
     u[0] = gp0_cmd_buf[2] & 0xFF;        v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[4] & 0xFF;        v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[6] & 0xFF;        v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
@@ -4010,6 +4066,7 @@ static void gp0_exec_textured_quad(void) {
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[7], &vx[3], &vy[3]);
+    spw_occlude_pts(vx, vy, 4);
     u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[4] & 0xFF;  v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[6] & 0xFF;  v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
@@ -4104,6 +4161,7 @@ static void gp0_exec_shaded_textured_tri(void) {
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
+    spw_occlude_pts(vx, vy, 3);
     u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[5] & 0xFF;  v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[8] & 0xFF;  v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
@@ -4148,6 +4206,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[10], &vx[3], &vy[3]);
+    spw_occlude_pts(vx, vy, 4);
     u[0] = gp0_cmd_buf[2] & 0xFF;   v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
     u[1] = gp0_cmd_buf[5] & 0xFF;   v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
     u[2] = gp0_cmd_buf[8] & 0xFF;   v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
@@ -4237,9 +4296,45 @@ static void gp0_exec_shaded_line(void) {
 }
 
 /* Execute mono rectangle (GP0 0x60-0x63) */
+/* ---- screen-dimmer probe --------------------------------------------------
+ * The game fades the duel field back in after a 3D monster fight by laying a
+ * band of SEMI-TRANSPARENT MONOCHROME RECTS over the scene and ramping their
+ * colour to black — measured 2026-08-16: 30 rects forming an even gradient in
+ * steps of 8 (5-bit), mean colour 244 -> 1 across ~25 frames while screen
+ * brightness went 24% -> 100%.
+ *
+ * This matters because the rank meter is a HOST overlay composited after the
+ * guest frame, so the guest's dimmer never touches it — it stayed at full
+ * opacity over a 24%-lit scene. Reading the dimmer here lets the meter be
+ * attenuated by the same factor the scene is, which is exact by construction
+ * and needs no timer: when the game is not dimming (a card view), there are no
+ * rects and the meter simply stays bright.
+ *
+ * Counted, not sampled: a lone semi-transparent rect is ordinary UI, so
+ * consumers require a whole band before believing it is a fade. */
+static uint32_t s_dim_count, s_dim_sum;          /* accumulating this frame */
+static uint32_t s_dim_count_last, s_dim_sum_last; /* the last COMPLETE frame */
+
+void gpu_fade_dimmer_latch(void) {
+    s_dim_count_last = s_dim_count;
+    s_dim_sum_last   = s_dim_sum;
+    s_dim_count = 0;
+    s_dim_sum   = 0;
+}
+
+int gpu_fade_dimmer_level(int min_rects) {
+    if (s_dim_count_last < (uint32_t)min_rects) return -1;
+    return (int)(s_dim_sum_last / s_dim_count_last);
+}
+
 static void gp0_exec_mono_rect(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    if (semi_trans) {
+        const uint32_t c = gp0_cmd_buf[0] & 0xFFFFFFu;
+        s_dim_sum += ((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF)) / 3u;
+        s_dim_count++;
+    }
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     int w = gp0_cmd_buf[2] & 0xFFFFu;
@@ -4291,6 +4386,163 @@ static void ws_repeat_textured_rect_reveal(int x, int y, int w, int h,
 }
 
 /* Execute textured rectangle (GP0 0x64-0x67) */
+/* ---- sprite watch ---------------------------------------------------------
+ *
+ * "Where is the game drawing sprites out of palette (cx,cy) right now?"
+ *
+ * A host overlay that wants to sit alongside a piece of the game's own HUD has
+ * to follow it, because HUDs move: this title slides its duel HUD off the
+ * screen edges whenever a card view, an attack animation or the 3D fight takes
+ * over, and an overlay pinned to fixed coordinates would hang in mid-air
+ * through the whole transition and then pop.
+ *
+ * Deliberately keyed on a CLUT rather than on anything game-specific: the
+ * caller supplies the palette it cares about, so this stays a general "track
+ * that sprite group" facility. Positions are recorded in GUEST SCREEN space —
+ * before the draw offset, which alternates between buffers — and BEFORE the
+ * draw-area cull, so a sprite tweening off-screen is still reported (with a
+ * negative x) rather than vanishing a frame early.
+ *
+ * Per frame it keeps the minimum x/y over every hit, which for a multi-sprite
+ * widget like a box is its top-left corner.
+ */
+static int      spw_active;
+static uint16_t spw_clut_x, spw_clut_y;
+static int      spw_u = -1, spw_v = -1;
+static int32_t  spw_x, spw_y;
+static uint32_t spw_colour = 0x808080u;
+static uint32_t spw_frame = 0xFFFFFFFFu;
+/* Occlusion: rect (guest screen space) the caller's overlay occupies, and
+ * whether anything was drawn OVER it after the anchor sprite this frame. */
+/* Percent of the overlay's area an occluder must cover before it counts. */
+#define SPW_OCC_MIN_PCT 35
+/* NOTE for anyone tempted to make this order-independent: it was tried, and
+ * reverted deliberately. This title draws its HUD both before AND after the big
+ * card art depending on the situation — an equip applied to a card in hand puts
+ * the FIELD box on TOP of the card — so ignoring draw order does make the
+ * overlay hide in more places. But the overlay is anchored to the FIELD box and
+ * is meant to behave exactly like it: where the game keeps its own HUD above a
+ * card, the overlay should stay too. Order is the rule; the game's own layering
+ * is the specification. */
+static int      spw_occ_armed;
+static int32_t  spw_occ_x, spw_occ_y, spw_occ_w, spw_occ_h;
+static int      spw_occ_hit;
+/* Rect of the primitive that actually set the flag. Without this, "occluded"
+ * is an assertion with no evidence — and a spurious occluder is invisible in a
+ * frame dump because the dump cannot tell you which primitive the GPU blamed. */
+static int32_t  spw_occ_src[4];
+static int      spw_seen_this_frame;
+
+void gpu_sprite_watch(int clut_x, int clut_y, int u, int v) {
+    spw_active = (clut_x >= 0 && clut_y >= 0);
+    spw_clut_x = (uint16_t)clut_x;
+    spw_clut_y = (uint16_t)clut_y;
+    spw_u = u;
+    spw_v = v;
+    spw_frame = 0xFFFFFFFFu;
+}
+
+void gpu_sprite_watch_occlusion(int x, int y, int w, int h) {
+    spw_occ_armed = (w > 0 && h > 0);
+    spw_occ_x = x; spw_occ_y = y; spw_occ_w = w; spw_occ_h = h;
+}
+
+static void spw_note(uint16_t clut_x, uint16_t clut_y, int u, int v,
+                     int32_t x, int32_t y, uint32_t colour) {
+    if (!spw_active || clut_x != spw_clut_x || clut_y != spw_clut_y) return;
+    /* Matching on the texture coords too, not just the palette, pins the
+     * anchor to ONE sprite of a multi-part widget. Taking the minimum over
+     * "every sprite sharing this CLUT" looks equivalent but is not: as the
+     * widget tweens off-screen the game stops emitting the parts that have
+     * fully left, so the minimum hops to a different piece and the anchor
+     * jitters by tens of pixels mid-slide. */
+    if (spw_u >= 0 && u != spw_u) return;
+    if (spw_v >= 0 && v != spw_v) return;
+    /* Open a fresh occlusion window HERE, on the anchor itself, rather than on
+     * a frame-counter change. s_frame_count only ticks at PRESENT, and the game
+     * can begin its next display list before that happens — so a frame-keyed
+     * reset let the previous list's tail and the new list's full-screen
+     * backdrop share one window, and the anchor's own redraw could not clear it
+     * (same frame number, so the reset was a no-op). The anchor is drawn
+     * exactly once per list, which makes it the correct boundary for
+     * "drawn after the HUD". */
+    spw_frame = (uint32_t)s_frame_count;
+    spw_x = x;
+    spw_y = y;
+    spw_colour = colour;
+    spw_occ_hit = 0;
+    spw_seen_this_frame = 1;
+}
+
+/* Anything drawn after the anchor, overlapping the caller's rect, counts as
+ * drawing OVER the overlay. A host overlay is composited on top of the finished
+ * frame and cannot be depth-sorted into the guest's draw order, so this is how
+ * it learns to get out of the way of a card view or an animation. */
+static void spw_occlude(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!spw_occ_armed || spw_occ_hit) return;
+    if (!spw_seen_this_frame) return;
+    if (x >= spw_occ_x + spw_occ_w || x + w <= spw_occ_x) return;
+    if (y >= spw_occ_y + spw_occ_h || y + h <= spw_occ_y) return;
+    /* Require a MEANINGFUL overlap, not any overlap.
+     *
+     * A host overlay cannot be partially occluded — it is composited after the
+     * whole frame, so the only responses available are "draw it all" or "draw
+     * none of it". Treating a clipped corner as occlusion therefore blanks the
+     * entire widget: this title parks its R1 button prompt just under the FIELD
+     * box, catching ~11% of the meter's corner, and the meter blinked out every
+     * time the prompt appeared. Ignoring slight overlaps keeps it steady, at
+     * the cost of a few pixels being drawn over something — far less
+     * distracting than flickering. A card view or animation covers the whole
+     * widget and still hides it. */
+    {
+        int32_t ix0 = x > spw_occ_x ? x : spw_occ_x;
+        int32_t iy0 = y > spw_occ_y ? y : spw_occ_y;
+        int32_t ix1 = (x + w < spw_occ_x + spw_occ_w) ? x + w : spw_occ_x + spw_occ_w;
+        int32_t iy1 = (y + h < spw_occ_y + spw_occ_h) ? y + h : spw_occ_y + spw_occ_h;
+        int32_t inter = (ix1 - ix0) * (iy1 - iy0);
+        int32_t area  = spw_occ_w * spw_occ_h;
+        if (area <= 0 || inter * 100 < area * SPW_OCC_MIN_PCT) return;
+    }
+    spw_occ_hit = 1;
+    spw_occ_src[0] = x; spw_occ_src[1] = y;
+    spw_occ_src[2] = w; spw_occ_src[3] = h;
+}
+
+static void spw_occlude_pts(const int32_t *vx, const int32_t *vy, int n) {
+    int32_t x0 = vx[0], x1 = vx[0], y0 = vy[0], y1 = vy[0];
+    for (int i = 1; i < n; i++) {
+        if (vx[i] < x0) x0 = vx[i];
+        if (vx[i] > x1) x1 = vx[i];
+        if (vy[i] < y0) y0 = vy[i];
+        if (vy[i] > y1) y1 = vy[i];
+    }
+    spw_occlude(x0, y0, x1 - x0, y1 - y0);
+}
+
+/* Brightness the watched sprite was drawn at, 0..255 where 128 is the PS1's
+ * neutral modulation. The game fades the HUD by scaling this, so an overlay
+ * that wants to fade WITH the HUD can just follow it. */
+void gpu_sprite_watch_occluder(int *out4) {
+    for (int i = 0; i < 4; i++) out4[i] = (int)spw_occ_src[i];
+}
+
+int gpu_sprite_watch_brightness(void) {
+    uint32_t c = spw_colour;
+    uint32_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+    uint32_t m = r > g ? r : g;
+    return (int)(m > b ? m : b);
+}
+
+int gpu_sprite_watch_query(int max_age, int *x, int *y, int *occluded) {
+    if (!spw_active || spw_frame == 0xFFFFFFFFu) return 0;
+    uint32_t age = (uint32_t)s_frame_count - spw_frame;
+    if (age > (uint32_t)max_age) return 0;
+    if (x) *x = (int)spw_x;
+    if (y) *y = (int)spw_y;
+    if (occluded) *occluded = spw_occ_hit;
+    return 1;
+}
+
 static void gp0_exec_textured_rect(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
@@ -4307,6 +4559,8 @@ static void gp0_exec_textured_rect(void) {
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
     ws_clear_tagged_rect_reveal(y0 + draw_offset_y, h);
+    spw_note(clut_x, clut_y, u0, v0, x0, y0, color24);
+    spw_occlude(x0, y0, w, h);
 
     /* Widescreen: tagged sprite parts squash around their projected anchor;
      * untagged SPRTs are screen-space 2D (HUD/menus) and squash around the
@@ -4383,6 +4637,11 @@ static void gp0_exec_textured_8x8(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    spw_note((uint16_t)((gp0_cmd_buf[2] >> 16) & 0x3F) * 16,
+             (uint16_t)((gp0_cmd_buf[2] >> 22) & 0x1FF),
+             (int)(gp0_cmd_buf[2] & 0xFF), (int)((gp0_cmd_buf[2] >> 8) & 0xFF),
+             x0, y0, color24);
+    spw_occlude(x0, y0, 8, 8);
     int ws_w = ws_sprt_fixed_transform(&x0, y0, 8);
     x0 += ws_nw_hud_shift(x0, 8);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;

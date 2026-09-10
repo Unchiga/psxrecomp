@@ -180,6 +180,14 @@ void psx_irq_raise(uint32_t bit, uint32_t detail)
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
 #define VBLANK_DEFER_STALE_CYCLES (vblank_cycles * 10ull)
 uint32_t vblank_cycles = 564480u;    /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
+
+void interrupts_set_vblank_divisor(uint32_t mult) {
+    if (mult < 1u) mult = 1u;
+    if (mult > 4u) mult = 4u;   /* matches PSX_VM_SPEED_MAX */   /* matches PSX_VM_SPEED_MAX */
+    vblank_cycles = 564480u / mult;
+}
+
+uint32_t interrupts_get_vblank_cycles(void) { return vblank_cycles; }
 static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
@@ -468,6 +476,59 @@ void psx_spu_sample_event_service(void) {
     }
 }
 
+/* ---- guest frame-gate acceleration (experimental) -----------------------
+ *
+ * Most PS1 titles cap their own frame rate by waiting for N vblanks on a
+ * counter their VSync callback increments — Yu-Gi-Oh! FM waits for TWO
+ * (measured: wait target advances +2 per loop, 30 rendered frames/s, and a
+ * dead frame issuing zero draw commands in between). Adding EXTRA increments
+ * to that counter, once per real vblank, satisfies the wait sooner and runs
+ * the game's main loop faster.
+ *
+ * The point of doing it HERE rather than by speeding up host pacing: host
+ * pacing accelerates the whole machine, including whatever ticks the sound
+ * driver, so the music tempo rides along (this is why FAST LOADING drives the
+ * CD sector delay instead). Injecting into the guest's own frame counter moves
+ * only the thing that waits on it. Anything clocked off the vblank INTERRUPT
+ * keeps real time. Whether a given title's audio actually sits on that side of
+ * the line is a per-title fact, and measuring it is what this is for.
+ *
+ * The address is supplied by the caller, never baked in — the counter is a
+ * game symbol, so this stays a framework tool rather than a per-game hack.
+ *
+ * Runs between guest instructions on the emu thread, so the read-modify-write
+ * cannot interleave with the guest's own increment of the same word. */
+static uint32_t s_frame_gate_addr;
+static int      s_frame_gate_extra;
+static uint64_t s_frame_gate_ticks;
+
+void psx_frame_gate_set(uint32_t addr, int extra) {
+    if (extra < 0) extra = 0;
+    if (extra > 15) extra = 15;
+    s_frame_gate_addr  = addr;
+    s_frame_gate_extra = extra;
+    s_frame_gate_ticks = 0;
+}
+
+void psx_frame_gate_get(uint32_t *addr, int *extra, uint64_t *ticks,
+                        uint32_t *counter_now) {
+    extern uint32_t psx_read_word(uint32_t a);
+    if (addr)  *addr  = s_frame_gate_addr;
+    if (extra) *extra = s_frame_gate_extra;
+    if (ticks) *ticks = s_frame_gate_ticks;
+    if (counter_now)
+        *counter_now = s_frame_gate_addr ? psx_read_word(s_frame_gate_addr) : 0u;
+}
+
+static void frame_gate_tick(void) {
+    extern uint32_t psx_read_word(uint32_t a);
+    extern void psx_write_word(uint32_t a, uint32_t v);
+    if (!s_frame_gate_addr || s_frame_gate_extra <= 0) return;
+    psx_write_word(s_frame_gate_addr,
+                   psx_read_word(s_frame_gate_addr) + (uint32_t)s_frame_gate_extra);
+    s_frame_gate_ticks++;
+}
+
 static void fire_vblank_edge(void) {
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
@@ -481,6 +542,7 @@ static void fire_vblank_edge(void) {
                           (uint32_t)(psx_get_cycle_count() + vblank_cycles));
     psx_irq_raise(IRQ_VBLANK, 0);
     g_vblank_raise_count++;
+    frame_gate_tick();
     event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
     gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
 #ifndef PSX_ENABLE_BLOCK_CYCLES

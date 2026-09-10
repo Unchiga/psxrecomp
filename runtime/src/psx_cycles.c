@@ -25,6 +25,22 @@ uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
 uint32_t *g_psx_cyc_local_acc = NULL;
+
+/* CPU overclock (see psx_cycles.h). Stock is 1: the hot path costs one
+ * predictable branch and nothing else changes. */
+uint32_t g_psx_cpu_overclock = 1u;
+uint32_t g_psx_cpu_overclock_rem = 0u;
+
+void psx_cpu_overclock_set(uint32_t mult) {
+    if (mult < 1u) mult = 1u;
+    if (mult > 16u) mult = 16u;
+    /* Drop the carry rather than letting a stale remainder from the previous
+     * ratio leak a few cycles into the new one. */
+    g_psx_cpu_overclock_rem = 0u;
+    g_psx_cpu_overclock = mult;
+}
+
+uint32_t psx_cpu_overclock_get(void) { return g_psx_cpu_overclock; }
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
 

@@ -184,6 +184,21 @@ typedef struct SpuSnapPartDigests {
 } SpuSnapPartDigests;
 void spu_snapshot_part_digests(SpuSnapPartDigests *out);
 
+/* ---- Music / SFX separation --------------------------------------------
+ *
+ * Hardware sums all 24 voices into one mix with no notion of what a voice is
+ * for, so this classifies voices at KEYON (latched for the voice's lifetime)
+ * and applies a per-bus gain. CD/XA rides the MUSIC bus. All three are
+ * percentages, 0..100; at 100 the mix is bit-for-bit unchanged.
+ *
+ * Classification is an explicit per-game voice mask OR'd with an ADSR == 0
+ * heuristic (an instant-attack, instant-release one-shot is a sound effect).
+ * The heuristic is content-derived, not a hardware fact — hence the mask. */
+void     spu_set_bus_gains(int master_pct, int music_pct, int sfx_pct);
+void     spu_set_sfx_voice_mask(uint32_t mask);
+/* Which currently-ACTIVE voices landed on the SFX bus (for verification). */
+uint32_t spu_get_sfx_bus_mask(void);
+
 #ifdef __cplusplus
 }
 #endif

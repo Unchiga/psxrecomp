@@ -48,6 +48,25 @@ void psx_mod_write_code_word(uint32_t address, uint32_t value);
  */
 uint32_t psx_mod_alloc_guest_memory(uint32_t size, uint32_t alignment);
 
+/* Where the player's files live: Documents/My Games/<title>, or the install
+ * folder for a portable install. Empty string before boot resolves it. A mod
+ * that ships an editable config needs this -- writing next to the exe puts it
+ * somewhere an update overwrites and a locked-down install cannot write. */
+const char *psx_mod_player_data_dir(void);
+
+/*
+ * Disc sector overrides. Replace the 2048 user-data bytes the drive delivers
+ * for one data sector of the mounted image; every reader of that sector sees
+ * the replacement, which is how a mod changes a disc-streamed asset (card
+ * art, a data table inside a loaded module) without knowing who reads it or
+ * when. size < 2048 zero-pads. A stock read ignores overrides, so a mod can
+ * start from the original bytes and change one field. Emulation thread only.
+ */
+int      psx_mod_cd_override_set(uint32_t lba, const void *data, uint32_t size);
+int      psx_mod_cd_override_clear(uint32_t lba);
+void     psx_mod_cd_override_clear_all(void);
+int      psx_mod_cd_read_stock_sector(uint32_t lba, void *out2048);
+
 /*
  * Allocate guest memory that is also addressable by 24-bit GPU linked-list
  * tags. This is intended for opt-in enhanced primitive/ordering-table arenas;

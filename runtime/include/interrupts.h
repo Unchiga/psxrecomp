@@ -150,6 +150,17 @@ void psx_exception_longjmp(void);
  * will eventually call ReturnFromException (longjmp code 1) to exit. */
 void psx_restore_state_escape(void);
 
+/* Guest frame-gate acceleration. Adds `extra` increments per real vblank to a
+ * guest word at `addr` — the counter a title's own VSync wait polls — so a
+ * self-imposed N-vblank frame cap is satisfied sooner and the game's main loop
+ * runs faster, WITHOUT speeding host pacing (which would drag the sound driver
+ * and so the music tempo along with it). `extra`=0 disables; the address is a
+ * game symbol and is always supplied by the caller. See the comment at the
+ * definition for why this lives on the vblank edge. */
+void psx_frame_gate_set(uint32_t addr, int extra);
+void psx_frame_gate_get(uint32_t *addr, int *extra, uint64_t *ticks,
+                        uint32_t *counter_now);
+
 #ifdef __cplusplus
 }
 #endif

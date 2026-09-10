@@ -61,6 +61,30 @@ extern uint32_t g_psx_cyc_batch_limit;
  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
 extern int g_psx_cyc_bb_defer;
 
+/* ---- CPU overclock ------------------------------------------------------
+ *
+ * psx_cycle_count IS device time: vblank, the root counters, CD and SPU all
+ * derive their schedules from it. So the way to run the guest CPU faster
+ * WITHOUT dragging those along is to charge fewer device-cycles per executed
+ * instruction — not to stretch VBLANK_CYCLES, which would move vblank relative
+ * to devices that are still counting the same cycles and would speed the music
+ * and the disc up with it.
+ *
+ * With a multiplier of K the CPU fits K times as many instructions into each
+ * vblank period, while every peripheral keeps the cadence it has today. For a
+ * title whose frame rate is bounded by its own workload rather than by a
+ * deliberate cap, that is the lever that unbinds it.
+ *
+ * 1 = stock (single predictable branch on the hot path; no behaviour change).
+ * Applied to CPU charges only — cycles charged from inside device servicing
+ * represent device time and are passed through untouched. The slow paths
+ * (COSIM / lockstep / conservative stepping) deliberately ignore it, so an
+ * overclock and those diagnostics do not compose. */
+extern uint32_t g_psx_cpu_overclock;      /* K, 1..16; 1 = stock */
+extern uint32_t g_psx_cpu_overclock_rem;  /* fractional carry, so no cycles are lost */
+void psx_cpu_overclock_set(uint32_t mult);
+uint32_t psx_cpu_overclock_get(void);
+
 /* Emitter-level VLC load-charge batching: when non-NULL, psx_cyc_charge
  * accumulates into *g_psx_cyc_local_acc instead of g_psx_cyc_batch. Publish
  * via psx_cyc_local_publish / psx_cyc_batch_flush before IRQ/MMIO barriers. */
@@ -111,8 +135,16 @@ static inline void psx_advance_cycles(uint32_t cycles) {
         return;
     }
     if (psx_in_device_service) {
+        /* Device code charging its own time — that IS device time, pass it
+         * through unscaled or the overclock would speed the devices too. */
         psx_cycle_count += (uint64_t)cycles;
         return;
+    }
+    if (g_psx_cpu_overclock > 1u) {
+        uint32_t t = cycles + g_psx_cpu_overclock_rem;
+        cycles = t / g_psx_cpu_overclock;
+        g_psx_cpu_overclock_rem = t - cycles * g_psx_cpu_overclock;
+        if (cycles == 0u) return;
     }
     psx_cycle_count += (uint64_t)cycles;
     if (psx_next_service_cycle == 0u ||

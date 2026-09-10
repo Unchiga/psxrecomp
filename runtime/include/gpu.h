@@ -131,6 +131,18 @@ uint64_t gpu_gp0_ring_total(void);
 uint32_t gpu_gp0_ring_capacity(void);
 uint32_t gpu_gp0_ring_max_words(void);
 int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
+
+/* Screen-dimmer probe: mean colour (0..255) of the band of semi-transparent
+ * monochrome rects the game lays over the scene while fading it in, or -1 when
+ * fewer than min_rects were drawn last frame (i.e. no fade in progress).
+ *
+ * 255 = fully dimmed, 0 = not dimmed. Host overlays are composited AFTER the
+ * guest frame and so escape this dimming; scaling their alpha by
+ * (255 - level)/255 makes them fade with the picture instead of sitting on top
+ * of it at full brightness. _latch is called at vblank and closes the frame's
+ * tally; callers only ever see whole frames. */
+void     gpu_fade_dimmer_latch(void);
+int      gpu_fade_dimmer_level(int min_rects);
 void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
 
 /* Vblank presentation callback — called from gpu_vblank_tick().
@@ -335,6 +347,11 @@ void gpu_texture_correction_set(int enabled);
 int gpu_texture_correction_enabled(void);
 /* Triangles drawn with perspective-correct UVs since startup. */
 uint32_t gpu_texture_correction_hits(void);
+/* Why the rest were rejected: no DMA source address, no SWC2 provenance at the
+ * packet's words, or a projection with zero depth. Distinguishes "this title
+ * never qualifies" from "the tracking is not reaching the vertices". */
+void gpu_texture_provenance_stats(uint32_t *attempts, uint32_t *no_source,
+                                  uint32_t *no_provenance, uint32_t *zero_z);
 /* GTE-activity gameplay detector ([widescreen] gte_game_mode) for 3D titles
  * with no sprite-tag helper: gte.cpp notes every RTPS/RTPT projection; a frame
  * that projects enough vertices is stamped as gameplay. */

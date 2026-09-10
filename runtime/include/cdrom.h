@@ -1,4 +1,4 @@
-﻿#ifndef PSXRECOMP_CDROM_H
+#ifndef PSXRECOMP_CDROM_H
 #define PSXRECOMP_CDROM_H
 
 #include <stdint.h>
@@ -30,6 +30,17 @@ void cdrom_notify_game_started(void);
 /* LBA of the most recent SetLoc command (-1 if none yet). Used by the DMA
  * ring buffer to correlate each sector transfer with its disc position. */
 int  cdrom_get_setloc_lba(void);
+
+/* Sector overrides: replace the 2048 user-data bytes delivered for a data
+ * sector (mods use this through psx_mod_cd_override_*). size < 2048 pads
+ * with zeros. Emulation thread only. */
+int      cdrom_override_set(uint32_t lba, const uint8_t* data, uint32_t size);
+int      cdrom_override_clear(uint32_t lba);
+void     cdrom_override_clear_all(void);
+uint32_t cdrom_override_count(void);
+int      cdrom_override_get(uint32_t lba, uint8_t* out2048);
+/* The mounted image's own bytes for a data sector, overrides ignored. */
+int      cdrom_read_stock_sector(uint32_t lba, uint8_t* out2048);
 
 /* 'instant' per-frame sector-IRQ budget (step 3). Clamped to [1, 4096];
  * the per-sector period additionally floors at CDROM_MIN_DELAY. Writers:
@@ -106,6 +117,11 @@ int cdrom_load_in_progress(void);
 /* Physical non-XA data-read command state, without the logical load gap
  * bridge used by cdrom_load_in_progress(). Diagnostics only. */
 int cdrom_data_read_active(void);
+/* True while anything in the emulated controller could still deliver a CD-ROM
+ * interrupt (armed second response, queued command, un-acked or unpresented
+ * INT, pended data-ready, active read stream). False means no completion can
+ * arrive without a fresh guest command. Read-only. */
+int cdrom_completion_possible(void);
 
 /* boot_state / netplay digest — full controller FSM (sector FIFOs included). */
 uint32_t cdrom_snapshot_bytes(void);
@@ -209,6 +225,19 @@ typedef struct CDROMDebugState {
     uint64_t accel_consumer_waits;
     uint64_t accel_consumer_wait_cycles;
     uint8_t  int1_pending_now;
+    /* Command-response INT accounting. int1_lost above only sees the
+     * one-deep data-ready pend; these cover INT2/INT3/INT5 as well.
+     * Indexed by CD INT type 1..5, so index == type (slot 0 unused).
+     * int_lost_unseen is the one that matters: an INT destroyed by the next
+     * one before ever being presented to INTC — the guest never saw it. */
+    uint64_t int_raised[6];
+    uint64_t int_presented[6];
+    uint64_t int_clobbered[6];
+    uint64_t int_lost_unseen[6];
+    uint64_t int_acked_unpresented[6];
+    uint8_t  int_last_lost_old;
+    uint8_t  int_last_lost_new;
+    uint32_t int_last_lost_gen;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {
@@ -310,6 +339,11 @@ typedef struct CDROMSectorHistoryEntry {
 } CDROMSectorHistoryEntry;
 
 void cdrom_debug_snapshot(CDROMDebugState* out);
+/* Live disc-speed divisor (1 authentic, >1 fast, 0 instant). During BIOS
+ * boot this is 1 regardless of configuration; the configured value is
+ * cdrom_get_game_speed_divisor() and is latched at game entry. */
+int cdrom_get_speed_divisor(void);
+int cdrom_get_game_speed_divisor(void);
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries);
 void cdrom_debug_clear_trace(void);
 uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries);
