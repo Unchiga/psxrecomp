@@ -615,6 +615,11 @@ static int apply_speed(int delay) {
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
 }
 
+/* Sector pacing and its consumer guard must classify modes identically. */
+static int realtime_read_active(void) {
+    return xa_stream_active || (mode_reg & 0x48u);
+}
+
 static int apply_read_speed(int delay) {
     /* A route is an explicit DATA-read allowlist, never a blanket drive-speed
      * change. Keep FMV/STR authentic once the drive is explicitly in XA/filter
@@ -622,7 +627,7 @@ static int apply_read_speed(int delay) {
      * whole-sector/Form2 bit (0x20) alone as realtime media: Tomba's normal
      * asset loads use mode 0xA0, so including 0x20 here made the CD Speed mod
      * configure divisor=32 while every actual data-read deadline stayed 1x/2x. */
-    if (xa_stream_active || (mode_reg & 0x48u)) return delay;
+    if (realtime_read_active()) return delay;
     if (s_warm_route_active) return warm_route_period();
     return apply_speed(delay);
 }
@@ -2872,7 +2877,7 @@ static int authentic_sector_period(void) {
 }
 
 static int accelerated_read_active(void) {
-    if (xa_stream_active || (mode_reg & 0x68u)) return 0;
+    if (realtime_read_active()) return 0;
     return g_disc_speed_divisor != 1;   /* 0 = instant, >1 = divided */
 }
 

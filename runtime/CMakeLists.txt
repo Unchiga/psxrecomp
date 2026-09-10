@@ -433,6 +433,17 @@ if(BUILD_TESTING)
     target_include_directories(cdrom_irq_mask_test PRIVATE src)
     add_test(NAME cdrom_irq_mask_test COMMAND cdrom_irq_mask_test)
 
+    if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        add_executable(cdrom_accelerated_consumer_test
+            tests/test_cdrom_accelerated_consumer.c)
+        target_include_directories(cdrom_accelerated_consumer_test PRIVATE include)
+        target_compile_definitions(cdrom_accelerated_consumer_test PRIVATE PSX_NO_DEBUG_TOOLS)
+        target_compile_options(cdrom_accelerated_consumer_test PRIVATE
+            -ffunction-sections -fdata-sections)
+        target_link_options(cdrom_accelerated_consumer_test PRIVATE -Wl,--gc-sections)
+        add_test(NAME cdrom_accelerated_consumer_test COMMAND cdrom_accelerated_consumer_test)
+    endif()
+
     add_executable(cdrom_lid_state_test tests/test_cdrom_lid_state.c)
     target_include_directories(cdrom_lid_state_test PRIVATE src)
     add_test(NAME cdrom_lid_state_test COMMAND cdrom_lid_state_test)
