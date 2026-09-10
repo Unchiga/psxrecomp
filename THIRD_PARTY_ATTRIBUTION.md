@@ -132,3 +132,11 @@ scaffolding a project and destructive on a live one.
 Keep the pin above accurate when re-syncing. These files are the reason a
 standalone setup-wizard install and a RetComM build produce the same
 multi-disc `game.toml`; if the two drift, so do those two paths.
+
+## Bundled UI fonts
+
+The private menu embeds Inter (SIL Open Font License) and Material Symbols
+(Apache License 2.0) in `runtime/third_party/fonts/psx_ui_font_data.h`.
+Their notices are `runtime/third_party/fonts/Inter-OFL.txt` and
+`runtime/third_party/fonts/MaterialSymbols-LICENSE.txt`; `runtime.cmake`
+stages both notices in player builds.

@@ -201,9 +201,17 @@ def clamp_future_mtimes(
                 continue
             if mtime > stamp:
                 try:
-                    os.utime(p, (stamp, stamp), follow_symlinks=False)
+                    # follow_symlinks=False is unsupported on Windows (utime
+                    # raises NotImplementedError), and NotImplementedError is
+                    # not an OSError, so it would escape. Only pass the flag
+                    # where the platform supports it; otherwise stamp through
+                    # the link, which is fine for clamping a future mtime.
+                    if os.utime in os.supports_follow_symlinks:
+                        os.utime(p, (stamp, stamp), follow_symlinks=False)
+                    else:
+                        os.utime(p, (stamp, stamp))
                     n += 1
-                except OSError:
+                except (OSError, NotImplementedError):
                     pass
     return n
 
@@ -288,18 +296,15 @@ def file_hashes(path: Path) -> tuple[str, str, int]:
 
 
 def resolve_cue_bin(cue_path: Path) -> Path:
-    text = cue_path.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r'FILE\s+"([^"]+)"\s+BINARY', text, re.I)
-    if not m:
-        m = re.search(r"FILE\s+(\S+)\s+BINARY", text, re.I)
-    if not m:
-        raise ValueError(f"no BINARY FILE in cue: {cue_path}")
-    cand = Path(m.group(1))
-    if not cand.is_absolute():
-        cand = cue_path.parent / cand
-    if not cand.is_file():
-        raise ValueError(f"cue references missing bin: {cand}")
-    return cand
+    """The data-track binary a cue names, with prepare_disc's tolerance for a
+    renamed bin -- the two must agree, or the wizard verifies a cue that
+    generate then refuses. Raises ValueError with a player-readable reason."""
+    from prepare_disc import list_cue_bins  # tools/ is on sys.path above
+
+    try:
+        return list_cue_bins(cue_path)[0]
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> Path:
@@ -618,6 +623,7 @@ def _build_recompiler_targets(
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
 
+    _wipe_if_relocated(build_dir, progress)
     # Wipe when the caller asked for a clean build, or when the toolchain that
     # produced this tree's objects is not the one about to link them.
     stamp_file = build_dir / ".retcomm-toolchain-stamp"
@@ -704,7 +710,7 @@ def _build_recompiler_targets(
     for target in targets:
         build_cmd += ["--target", target]
     progress.log(" ".join(build_cmd))
-    proc = subprocess.run(build_cmd, capture_output=True, text=True)
+    proc = subprocess.run(build_cmd, capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -818,6 +824,7 @@ def regen_bios_profile(
         cwd=str(fw),
         capture_output=True,
         text=True,
+        errors="replace",
     )
     for stream in (proc.stdout, proc.stderr):
         if not stream:
@@ -844,7 +851,13 @@ def verify_disc_path(
 ) -> dict[str, Any]:
     path = disc.resolve()
     if path.suffix.lower() == ".cue":
-        path = resolve_cue_bin(path)
+        try:
+            path = resolve_cue_bin(path)
+        except ValueError as exc:
+            # Not a wrong dump -- a cue pointing at a file that is not there.
+            # Keep it off the verify exit code, which the setup host reports
+            # as "wrong dump".
+            raise DiscPathError(str(exc)) from None
     md5, sha1, size = file_hashes(path)
     try:
         subchannel, _ = inspect_companion(disc, size, sha1)
@@ -883,6 +896,10 @@ class DiscVerifyError(Exception):
     pass
 
 
+class DiscPathError(Exception):
+    """The disc argument cannot be read as given (a cue naming a missing bin)."""
+
+
 def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int:
     config = Path(args.config).expanduser().resolve()
     if not config.is_file():
@@ -912,6 +929,9 @@ def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
+    except DiscPathError as exc:
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
     progress.phase("done", pct=1.0,
                    message=f"Main track accepted; subchannel status: {identity['subchannel']['status']}")
     progress.result(ok=True, **identity)
@@ -937,13 +957,39 @@ def run_prepare_disc(
         str(project_root),
         str(source),
     ]
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    # Pin BOTH ends of the pipe to UTF-8. The child's stdout encoding is
+    # whatever Python picks for a pipe on that machine, and text=True decodes
+    # with the locale's ANSI page; when the two disagree, a project root with
+    # an accent in it comes back as "UsuA~rio"-style mojibake, the RESULT_CUE
+    # path below points at a folder that does not exist, and the whole
+    # generate fails with nothing more specific than "exit 1".
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        cmd,
+        cwd=str(project_root),
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
     out = (proc.stdout or "") + (proc.stderr or "")
     for line in out.splitlines():
         if line.strip():
             progress.log(line)
     if proc.returncode != 0:
-        raise RuntimeError(f"prepare_disc failed (exit {proc.returncode})")
+        # Carry the reason: the setup dialog shows only this message, and
+        # "exit 1" alone sent players guessing between the disc, the path
+        # and the toolchain.
+        reason = ""
+        for line in reversed((proc.stderr or "").splitlines()):
+            if line.strip():
+                reason = line.strip()
+                break
+        raise RuntimeError(
+            f"prepare_disc failed (exit {proc.returncode})"
+            + (f": {reason}" if reason else "")
+        )
     marker = "RESULT_CUE="
     cue = None
     for line in out.splitlines():
@@ -994,6 +1040,9 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
+    except DiscPathError as exc:
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
 
     boot = str(prep.get("boot_exe") or Path(str(game.get("exe") or "")).name)
     out_rel = str(prep.get("out_dir") or "prepared_disc")
@@ -1141,6 +1190,7 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
         cwd=str(project_root),
         capture_output=True,
         text=True,
+        errors="replace",
     )
     ri_warn = 0
     for stream in (proc.stdout, proc.stderr):
@@ -1258,6 +1308,55 @@ def _read_cmake_cache_generator(cache_file: Path) -> str:
     return ""
 
 
+def _read_cmake_cache_var(cache_file: Path, key: str) -> str:
+    if not cache_file.is_file():
+        return ""
+    try:
+        text = cache_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    prefix = key + ":"
+    for line in text.splitlines():
+        if line.startswith(prefix) and "=" in line:
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _wipe_if_relocated(build_dir: Path, progress: "ProgressReporter") -> None:
+    """Discard a build tree that was configured somewhere else.
+
+    A CMake build tree records its own absolute path, and every FetchContent
+    subbuild under _deps records it again. Move or copy the extracted release
+    folder after a setup run - Downloads to Desktop is the one people do - and
+    the next configure dies inside a subbuild with
+
+        The current CMakeCache.txt directory <new>/_deps/psx_libchdr-subbuild/
+        CMakeCache.txt is different than the directory <old>/... where
+        CMakeCache.txt was created
+        CMake step for psx_libchdr failed: 1
+
+    which names neither the real cause nor the fix. Build trees are not
+    relocatable and there is nothing in one worth keeping, so start clean
+    instead of failing.
+    """
+    cache_file = build_dir / "CMakeCache.txt"
+    cached_dir = _read_cmake_cache_var(cache_file, "CMAKE_CACHEFILE_DIR")
+    if not cached_dir:
+        return
+    try:
+        same = Path(cached_dir).resolve() == build_dir.resolve()
+    except OSError:
+        same = False
+    if same:
+        return
+    progress.log(
+        f"Build tree was configured in {cached_dir} but now sits in "
+        f"{build_dir} - discarding it and configuring fresh."
+    )
+    shutil.rmtree(build_dir, ignore_errors=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _cmake_configure(
     project_root: Path,
     build_dir: Path,
@@ -1267,6 +1366,7 @@ def _cmake_configure(
     progress: ProgressReporter,
 ) -> None:
     build_dir.mkdir(parents=True, exist_ok=True)
+    _wipe_if_relocated(build_dir, progress)
     cache_file = build_dir / "CMakeCache.txt"
     toolchain_bin = resolve_embedded_toolchain_bin(project_root)
     ninja = _tool_in_dir(toolchain_bin, "ninja") or _which_tool("ninja")
@@ -1313,7 +1413,7 @@ def _cmake_configure(
         *extra,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1396,7 +1496,7 @@ def _cmake_build(
         target,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1552,6 +1652,7 @@ def run_pgo_train(
                     ["xcrun", "--find", "llvm-profdata"],
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     check=False,
                 )
                 if r.returncode == 0 and r.stdout.strip():

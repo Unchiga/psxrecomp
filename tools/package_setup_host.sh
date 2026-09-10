@@ -64,6 +64,11 @@ DISPLAY_NAME=""
 RECOMPILER_BUILD="build-recompiler"
 VERSION_ENV="RELEASE_VERSION"
 DISC_HINT="your legally owned game disc"
+# A title that ships OpenBIOS uses it and nothing else -- setup never adopts a
+# retail dump for one, so telling the player a dump is "optional" invites them
+# to supply a file that is then silently ignored. Opt-in, because titles that
+# genuinely need a retail image still exist.
+OPENBIOS_ONLY=0
 PROJECT_FILES=()
 PROJECT_DIRS=()
 RUNTIME_DIRS=()
@@ -82,6 +87,7 @@ STAGE_MODS=1
 if [[ -z "${EXCLUDE_DEV_MODS:-}" ]]; then
   if [[ -n "${CI:-}" ]]; then EXCLUDE_DEV_MODS=1; else EXCLUDE_DEV_MODS=0; fi
 fi
+PROJECT_EXCLUDES=()
 RUNTIME_BIN_DIR="${PSXRECOMP_RUNTIME_BIN_DIR:-${BPE_RUNTIME_BIN_DIR:-/usr/x86_64-w64-mingw32/bin}}"
 EMBED_TOOLCHAIN=0
 if [[ "${PSXRECOMP_EMBED_TOOLCHAIN:-0}" == "1" ]]; then
@@ -111,10 +117,12 @@ while [[ $# -gt 0 ]]; do
     --include-dev-mods) EXCLUDE_DEV_MODS=0; shift ;;
     --runtime-dir) RUNTIME_DIRS+=("${2:?}"); shift 2 ;;
     --runtime-dir-optional) RUNTIME_DIRS_OPTIONAL+=("${2:?}"); shift 2 ;;
+    --project-exclude) PROJECT_EXCLUDES+=("${2:?}"); shift 2 ;;
     --runtime-bin) RUNTIME_BIN_DIR="${2:?}"; shift 2 ;;
     --root) ROOT="${2:?}"; shift 2 ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
     --no-embed-toolchain) EMBED_TOOLCHAIN=0; shift ;;
+    --openbios-only) OPENBIOS_ONLY=1; shift ;;
     *)
       echo "error: unknown arg: $1" >&2
       usage 2
@@ -285,16 +293,27 @@ if [[ "${EXE_BASENAME}" == *.exe ]]; then
   shopt -u nullglob
 fi
 
-if [[ ! -d "${EXE_DIR}/assets/fonts" || ! -d "${EXE_DIR}/assets/img" ]]; then
+# assets/{fonts,img} belong to the recomp-ui launcher. A project built with
+# PSX_RECOMP_UI=OFF has no launcher and therefore none of them — that is a
+# supported product shape, not a broken build: the runtime asks for the BIOS
+# and the disc itself on first run. Only a project that HAS recomp-ui can be
+# missing them by mistake, so that is the only case that still fails.
+if [[ -d "${EXE_DIR}/assets/fonts" && -d "${EXE_DIR}/assets/img" ]]; then
+  mkdir -p "${STAGE}/assets"
+  cp -a "${EXE_DIR}/assets/fonts" "${STAGE}/assets/"
+  cp -a "${EXE_DIR}/assets/img" "${STAGE}/assets/"
+  if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/boxart.tga" ]]; then
+    cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
+  fi
+elif [[ -d "${ROOT}/recomp-ui" ]]; then
   echo "error: ${EXE_DIR}/assets/{fonts,img} missing — rebuild psx-runtime" >&2
   exit 1
+else
+  echo "no recomp-ui in this project — staging a launcher-less host"
+  HAS_LAUNCHER=0
 fi
-mkdir -p "${STAGE}/assets"
-cp -a "${EXE_DIR}/assets/fonts" "${STAGE}/assets/"
-cp -a "${EXE_DIR}/assets/img" "${STAGE}/assets/"
-if [[ ! -f "${STAGE}/assets/img/boxart.tga" && -f "${ROOT}/launcher_assets/img/boxart.tga" ]]; then
-  cp -a "${ROOT}/launcher_assets/img/boxart.tga" "${STAGE}/assets/img/boxart.tga"
-fi
+
+HAS_LAUNCHER="${HAS_LAUNCHER:-1}"
 
 # Exe-relative runtime data (mods catalog, bezels, ...): the runtime resolves
 # these from the exe's own directory, so ship them at the stage root exactly
@@ -416,6 +435,41 @@ else
          "pass --exclude-dev-mods (or EXCLUDE_DEV_MODS=1) for a public release"
   fi
 fi
+# A retail PlayStation BIOS dump is Sony's, and a release must never carry one
+# -- not from a developer's working tree, not from a submodule's bios/. This is
+# not hypothetical: an SCPH1001.BIN dropped into psxrecomp/bios/ during a
+# debugging session sat one packaging run away from shipping, and nothing in
+# the copy path would have caught it.
+#
+# Identified by CONTENT, not by name or size. OpenBIOS is the image a release
+# exists to ship, it lives at bios/openbios.bin, and it deliberately carries
+# "Licensed by Sony Computer Entertainment Inc." for compatibility -- so a name
+# match, a size match, or a string match on "Sony" would delete the wrong file.
+# Only a retail dump carries a Sony COPYRIGHT line (verified: 0 hits in
+# OpenBIOS, 6 in SCPH1001).
+scrub_retail_bios() {
+  local dir="$1" f
+  [[ -d "${dir}" ]] || return 0
+  while IFS= read -r -d '' f; do
+    if grep -qa 'Copyright.*Sony Computer Entertainment' "${f}" 2>/dev/null; then
+      echo "scrub: removed retail BIOS dump from release: ${f#${dir}/}" >&2
+      rm -f "${f}"
+    fi
+  done < <(find "${dir}" -type f -size -1025k -size +255k                 \( -iname '*.bin' -o -iname '*.rom' -o -iname '*.img' \)                 -print0 2>/dev/null)
+}
+
+# Project paths a release must NOT carry, removed after the copy because
+# copy_proj is a plain cp -a of the working tree. The motivating case: art a
+# title bakes from the player's own disc or captures from a running game
+# (gitignored, but the working tree has it) sitting inside a --project-dir —
+# shipping it is exactly what the bake-from-disc rule exists to prevent, and
+# nothing fails when it leaks. Same defensive posture as the .mcd scrub.
+for x in "${PROJECT_EXCLUDES[@]}"; do
+  rm -rf "${STAGE:?}/${x}"
+done
+find "${STAGE}" -type d -name '__pycache__' -prune -exec rm -rf {} + \
+  2>/dev/null || true
+scrub_retail_bios "${STAGE}"
 
 copy_tree_filtered() {
   local src="$1" dest="$2"
@@ -429,17 +483,20 @@ copy_tree_filtered() {
     find "${dest}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
     find "${dest}" -type d \( -name 'build' -o -name 'build-*' \) -prune -exec rm -rf {} + 2>/dev/null || true
   fi
+  # Memory-card images are somebody's saves. Working trees accumulate them
+  # (test fixtures, a developer's own card), and a release must carry none.
+  # Done here, after BOTH branches, on purpose: the no-rsync fallback above
+  # ignores every --exclude it is handed, so a filter argument alone would
+  # quietly ship these on any machine without rsync.
+  find "${dest}" -type f \( -name '*.mcd' -o -name '*.mcr' \) -delete 2>/dev/null || true
+  # Same posture, same reason for being here rather than in a --exclude.
+  scrub_retail_bios "${dest}"
 }
 
 if [[ ! -d "${ROOT}/psxrecomp" ]]; then
   echo "error: ${ROOT}/psxrecomp missing (expected framework submodule)" >&2
   exit 1
 fi
-if [[ ! -d "${ROOT}/recomp-ui" ]]; then
-  echo "error: ${ROOT}/recomp-ui missing (expected UI submodule)" >&2
-  exit 1
-fi
-
 copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude '.git' \
   --exclude 'recompiler/build' \
@@ -448,10 +505,12 @@ copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
   --exclude 'build' \
   --exclude 'build-*'
 
-copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
-  --exclude '.git' \
-  --exclude 'build' \
-  --exclude '__pycache__'
+if [[ -d "${ROOT}/recomp-ui" ]]; then
+  copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
+    --exclude '.git' \
+    --exclude 'build' \
+    --exclude '__pycache__'
+fi
 
 # Never ship game generated C or common disc working trees.
 rm -rf "${STAGE}/generated" "${STAGE}/bpe" "${STAGE}/motk" "${STAGE}/disc"
@@ -484,6 +543,18 @@ fi
 
 bash "${STAGE_SDK}" "${stage_args[@]}"
 
+if [[ "${HAS_LAUNCHER}" == "1" ]]; then
+  STEP4="Follow the Generate & rebuild wizard."
+else
+  STEP4="Nothing else. It does the rest by itself."
+fi
+
+if [[ "${OPENBIOS_ONLY}" -eq 1 ]]; then
+  BIOS_HINT=" This build uses the OpenBIOS image it ships with; a retail BIOS dump is neither needed nor accepted."
+else
+  BIOS_HINT=" A retail SCPH-1001 BIOS dump is optional; otherwise OpenBIOS is regenerated locally."
+fi
+
 cat >"${STAGE}/README-SETUP.txt" <<EOF
 ${DISPLAY_NAME} ${VERSION} — setup package
 Platform: ${ARTIFACT}
@@ -493,14 +564,54 @@ BIOS dumps, pre-generated game C, or a portable cmake/clang pack. Emitters
 (psxrecomp-game / psxrecomp-bios) and the CLI are inside psxrecomp/.
 
 Standalone:
-1. Install Python 3.
-2. Run ${EXE_BASENAME}.
-3. Provide ${DISC_HINT} (and optional retail SCPH-1001 BIOS; otherwise
-   OpenBIOS is regenerated locally).
-4. Follow the Generate & rebuild wizard. On first rebuild the host downloads
-   cmake-clang-v1 from RetroPortingToolKit/RetroPorting-Toolchains (or you can
-   pick a local cmake-clang-v1-*.zip for offline builds). System cmake/ninja
-   also works if already on PATH.
+1. Run ${EXE_BASENAME}. Nothing needs installing first -- the setup brings
+   its own compiler and its own Python, and uses yours if you have them.
+2. Provide ${DISC_HINT}.${BIOS_HINT}
+3. ${STEP4}
+
+THE FIRST RUN TAKES A WHILE - LET IT FINISH.
+
+It downloads a compiler if you have none, translates the game to C from
+your disc, and compiles it. Expect minutes, not seconds, and a console
+window that sits there working. Every run after that starts immediately.
+
+That wait is the point. This download contains no game code and no game
+assets - not the executable, not the artwork, not the font. All of it is
+built on your machine, from the disc you already own, and never leaves it.
+Shipping a ready-made build would mean shipping Konami's work; this way
+nobody does.
+
+YOUR SAVES ARE NOT IN THIS FOLDER
+
+Memory cards, save states and your settings live in
+
+    Documents\\My Games\\${DISPLAY_NAME}
+
+so updating cannot touch them. Extract a new version wherever you like --
+over the top of the old one or into a brand new folder -- and your saves
+are safe either way. You do not have to copy anything.
+
+UPGRADING FROM AN OLDER VERSION -- READ THIS ONCE
+
+Older versions kept saves inside the game folder. To bring them across,
+EXTRACT THIS UPDATE OVER YOUR EXISTING INSTALL. The first launch then finds
+your old saves, copies them to Documents, and leaves the originals alone --
+you do nothing, and nothing is lost if you change your mind.
+
+If you instead extracted into a brand new folder, the game cannot see your
+old saves, because they are still sitting in the old folder. Nothing is
+gone. Copy these from the OLD game folder into
+
+    Documents\\My Games\\${DISPLAY_NAME}
+
+    card1.mcd, card2.mcd   (memory cards)
+    saves\\                 (or the openbios\\ folder inside it: save states)
+
+After that first launch, this no longer applies: your saves are outside the
+game folder for good, and any later update can be extracted anywhere.
+
+Want everything in this folder instead (USB stick, shared machine)? Put an
+empty file named portable.txt next to ${EXE_BASENAME}, or set PSX_PORTABLE=1.
 
 RetComM uses this same zip: it harvests emitters into a shared SDK cache,
 downloads the toolchain pack (or uses RETCOMM_TOOLCHAIN_DIR), and preserves
@@ -604,8 +715,19 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
   cd "${STAGE}"
   if command -v zip >/dev/null 2>&1; then
     zip -r -q "${DIST}/${ZIP_NAME}" .
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -bso0 -bsp0 "${DIST}/${ZIP_NAME}" . >/dev/null
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    # The release target is Windows, where `zip` is not standard — MSYS ships
+    # it only if selected, so requiring it made the last step of a release fail
+    # on an otherwise complete stage. Compress-Archive is always present.
+    # -Force overwrites a stale archive from a previous run of the same tag.
+    rm -f "${DIST}/${ZIP_NAME}"
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "Compress-Archive -Path '.\\*' -DestinationPath '$(cygpath -w "${DIST}/${ZIP_NAME}" 2>/dev/null || echo "${DIST}/${ZIP_NAME}")' -Force" \
+      || { echo "error: Compress-Archive failed" >&2; exit 1; }
   else
-    echo "error: zip not found" >&2
+    echo "error: no zip, 7z, or powershell.exe available to build the archive" >&2
     exit 1
   fi
 )

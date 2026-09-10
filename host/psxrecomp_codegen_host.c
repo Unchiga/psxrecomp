@@ -6,10 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>   /* update stamp age */
 #include <time.h>
+
+#include <zlib.h>        /* built-in zip extraction of the toolchain pack */
 
 #if defined(_WIN32)
 #  include <windows.h>
+#  include <winhttp.h>   /* toolchain download when curl.exe is not there */
 #else
 #  include <dirent.h>
 #  include <errno.h>
@@ -20,6 +24,9 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 extern char** environ;
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h> /* _NSGetExecutablePath: macOS has no /proc */
+#  endif
 #endif
 
 /* Forward decls — used by toolchain cache helpers before their definitions. */
@@ -47,10 +54,17 @@ static char g_exe_path[1100];
 static char g_helper_path[1100];
 static char g_cmake_target[256];
 static char g_exe_basename[256];
+/* Why the wizard reopened on a setup host that already generated once; the
+ * launcher keeps the pointer for the life of the window. */
+static char g_stale_note[640];
 static char g_display[128];
 static char g_toolchain_bin[1400];
 /* Last ensure-toolchain JSONL result path (bin/); shared-cache fallback. */
 static char g_cli_toolchain_bin[1400];
+/* The last {"event":"error"} the CLI reported. "generate failed (exit 1)" on
+ * its own sent players guessing between the disc, the path and the toolchain;
+ * the CLI knows the reason and says it, so the dialog repeats it. */
+static char g_cli_last_error[480];
 static int g_ready;
 static int g_relaunch_is_helper;
 /* Wizard BIOS pick (survives cwd-relative bios.cfg misses on Windows). */
@@ -60,6 +74,11 @@ static char g_tc_repair_note[320];
 /* Set when host_persist_setup receives an explicit bios_path (including ""
  * for OpenBIOS). Distinguishes intentional OpenBIOS clear from "unset". */
 static int g_wizard_bios_explicit;
+
+/* cfg->openbios_only: the title runs the bundled OpenBIOS and nothing else. */
+static int host_openbios_only(void) {
+    return g_cfg && g_cfg->openbios_only;
+}
 
 static const char* cfg_or(const char* v, const char* d) {
     return (v && v[0]) ? v : d;
@@ -403,6 +422,36 @@ static int find_on_path(const char* name, char* out, size_t cap) {
 #endif
     return 0;
 }
+
+#if !defined(_WIN32)
+/* Absolute path of an executable on PATH.
+ *
+ * find_on_path() answers only "does it exist" and writes the bare NAME back.
+ * That suits callers that go on to exec through a shell, but not
+ * cmake_path_runs(), whose first act is path_is_file() -- handed "cc" it
+ * fails, and the failure surfaces as a broken toolchain. */
+static int resolve_on_path_abs(const char* name, char* out, size_t cap) {
+    char cmd[640];
+    FILE* pipe;
+    size_t n;
+    if (!name || !out || cap == 0)
+        return 0;
+    out[0] = '\0';
+    snprintf(cmd, sizeof(cmd), "command -v %s 2>/dev/null", name);
+    pipe = popen(cmd, "r");
+    if (!pipe)
+        return 0;
+    if (!fgets(out, (int)cap, pipe)) {
+        pclose(pipe);
+        return 0;
+    }
+    pclose(pipe);
+    n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+        out[--n] = '\0';
+    return out[0] == '/' && path_is_file(out);
+}
+#endif
 
 /* resolve_toolchain_bin is defined later; pack python lives beside bin/. */
 static int resolve_toolchain_bin(char* out, size_t cap);
@@ -1321,6 +1370,12 @@ static int resolve_bios_arg(char* out, size_t cap) {
     char cand[1100];
     char line[1100];
     char abs[1100];
+    if (host_openbios_only()) {
+        /* Not "no pick yet" -- there is nothing to pick. A dump beside the
+         * install or a stale bios.cfg must not turn into --bios. */
+        out[0] = '\0';
+        return 0;
+    }
     if (g_wizard_bios[0] && absolutize_existing_file(abs, sizeof(abs),
                                                      g_wizard_bios)) {
         snprintf(out, cap, "%s", abs);
@@ -1614,6 +1669,16 @@ static void persist_relaunch_sidecars(const char* near_exe,
                 write_sidecar_near_exe(build_exe, "bios.cfg", "");
         }
         return;
+    } else if (host_openbios_only()) {
+        /* Nothing to carry over: clear a bios.cfg an older install may have
+         * left behind so the relaunched game does not even read it. */
+        write_sidecar_near_exe(near_exe, "bios.cfg", "");
+        write_line_file("bios.cfg", "");
+        if (g_project_root[0] &&
+            join_path(project_sidecar, sizeof(project_sidecar), g_project_root,
+                      "bios.cfg"))
+            write_line_file(project_sidecar, "");
+        return;
     } else {
         char line[1100];
         line[0] = '\0';
@@ -1677,6 +1742,9 @@ static void handle_progress_line(const char* line,
         return;
     char event[64] = "";
     json_get_string(line, "event", event, sizeof(event));
+    if (strcmp(event, "error") == 0)
+        json_get_string(line, "message", g_cli_last_error,
+                        sizeof(g_cli_last_error));
     /* Capture ensure-toolchain result even when UI progress is absent. */
     if (strcmp(event, "result") == 0) {
         char tb[1400], resolved[1400];
@@ -1771,6 +1839,7 @@ static int run_cli_win(const char* cmdline,
                        void* progress_ctx, char* err_msg, size_t err_cap,
                        const char* fail_label) {
     SECURITY_ATTRIBUTES sa;
+    g_cli_last_error[0] = '\0';
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -1846,6 +1915,7 @@ static int run_cli_posix(char* const argv[],
                          RecompLauncherCPrepareProgressFn on_progress,
                          void* progress_ctx, char* err_msg, size_t err_cap,
                          const char* fail_label) {
+    g_cli_last_error[0] = '\0';
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(err_msg, err_cap, "pipe() failed: %s", strerror(errno));
@@ -2300,6 +2370,247 @@ static int activate_installed_pack_root(const char* pack_root) {
     return toolchain_bin_is_healthy(bin);
 }
 
+/* ---- built-in zip extraction ------------------------------------------
+ * The toolchain pack is a plain zip. Windows 10+ has tar.exe and PowerShell
+ * and Linux has unzip/tar -- until it does not: a Wine/Proton install has
+ * none of them, LTSC images drop tar.exe, and a minimal distro can lack
+ * unzip. So the host can also extract the pack itself: stored and deflate
+ * entries, directory entries, POSIX mode bits from the central directory.
+ * Zip64 is not needed (the packs are well under 4 GB). */
+static uint32_t zip_le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+static uint16_t zip_le16(const uint8_t* p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+/* No absolute paths, no drive letters, no ".." components. */
+static int zip_name_safe(const char* name) {
+    const char* s = name;
+    if (!name || !name[0])
+        return 0;
+    if (name[0] == '/' || name[0] == '\\')
+        return 0;
+    if (((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')) &&
+        name[1] == ':')
+        return 0;
+    while (*s) {
+        const char* e = s;
+        while (*e && *e != '/' && *e != '\\')
+            e++;
+        if (e - s == 2 && s[0] == '.' && s[1] == '.')
+            return 0;
+        s = *e ? e + 1 : e;
+    }
+    return 1;
+}
+
+static int zip_write_entry(FILE* in, uint32_t method, uint32_t csize,
+                           const char* out_path, char* err, size_t cap) {
+    static uint8_t ib[65536], ob[65536];
+    FILE* out = fopen(out_path, "wb");
+    uint32_t left = csize;
+    if (!out) {
+        snprintf(err, cap, "Cannot create %s", out_path);
+        return 0;
+    }
+    if (method == 0) {
+        while (left) {
+            size_t n = left < sizeof(ib) ? left : sizeof(ib);
+            if (fread(ib, 1, n, in) != n || fwrite(ib, 1, n, out) != n) {
+                fclose(out);
+                snprintf(err, cap, "Short read/write extracting %s", out_path);
+                return 0;
+            }
+            left -= (uint32_t)n;
+        }
+    } else if (method == 8) {
+        z_stream zs;
+        int ret = Z_OK;
+        memset(&zs, 0, sizeof(zs));
+        if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
+            fclose(out);
+            snprintf(err, cap, "zlib init failed");
+            return 0;
+        }
+        do {
+            size_t got;
+            if (zs.avail_in == 0 && left) {
+                size_t n = left < sizeof(ib) ? left : sizeof(ib);
+                if (fread(ib, 1, n, in) != n) {
+                    inflateEnd(&zs);
+                    fclose(out);
+                    snprintf(err, cap, "Short read extracting %s", out_path);
+                    return 0;
+                }
+                zs.next_in = ib;
+                zs.avail_in = (uInt)n;
+                left -= (uint32_t)n;
+            }
+            zs.next_out = ob;
+            zs.avail_out = sizeof(ob);
+            ret = inflate(&zs, Z_NO_FLUSH);
+            if (ret != Z_OK && ret != Z_STREAM_END) {
+                inflateEnd(&zs);
+                fclose(out);
+                snprintf(err, cap, "Corrupt deflate stream in %s", out_path);
+                return 0;
+            }
+            got = sizeof(ob) - zs.avail_out;
+            if (got && fwrite(ob, 1, got, out) != got) {
+                inflateEnd(&zs);
+                fclose(out);
+                snprintf(err, cap, "Short write extracting %s", out_path);
+                return 0;
+            }
+        } while (ret != Z_STREAM_END && (left || zs.avail_in));
+        inflateEnd(&zs);
+    } else {
+        fclose(out);
+        snprintf(err, cap, "Unsupported zip method %u for %s", (unsigned)method,
+                 out_path);
+        return 0;
+    }
+    if (fclose(out) != 0) {
+        snprintf(err, cap, "Cannot finish %s", out_path);
+        return 0;
+    }
+    return 1;
+}
+
+static int zip_extract_builtin(const char* zip_path, const char* dest_dir,
+                               char* err, size_t cap) {
+    FILE* f = fopen(zip_path, "rb");
+    long size, tail_len;
+    uint8_t* tail = NULL;
+    uint8_t* cd = NULL;
+    const uint8_t* eocd = NULL;
+    uint32_t entries, cd_size, cd_off, i, pos;
+    long k;
+    if (!f) {
+        snprintf(err, cap, "Cannot open %s", zip_path);
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 22) {
+        fclose(f);
+        snprintf(err, cap, "Not a zip: %s", zip_path);
+        return 0;
+    }
+    tail_len = size < 66000 ? size : 66000;
+    tail = (uint8_t*)malloc((size_t)tail_len);
+    if (!tail || fseek(f, size - tail_len, SEEK_SET) != 0 ||
+        fread(tail, 1, (size_t)tail_len, f) != (size_t)tail_len) {
+        free(tail);
+        fclose(f);
+        snprintf(err, cap, "Cannot read the end of %s", zip_path);
+        return 0;
+    }
+    for (k = tail_len - 22; k >= 0; --k) {
+        if (zip_le32(tail + k) == 0x06054b50u) {
+            eocd = tail + k;
+            break;
+        }
+    }
+    if (!eocd) {
+        free(tail);
+        fclose(f);
+        snprintf(err, cap, "No zip directory in %s", zip_path);
+        return 0;
+    }
+    entries = zip_le16(eocd + 10);
+    cd_size = zip_le32(eocd + 12);
+    cd_off = zip_le32(eocd + 16);
+    free(tail);
+    if (entries == 0xFFFFu || cd_off == 0xFFFFFFFFu || cd_size == 0xFFFFFFFFu) {
+        fclose(f);
+        snprintf(err, cap, "Zip64 archive not supported: %s", zip_path);
+        return 0;
+    }
+    cd = (uint8_t*)malloc(cd_size);
+    if (!cd || fseek(f, (long)cd_off, SEEK_SET) != 0 ||
+        fread(cd, 1, cd_size, f) != cd_size) {
+        free(cd);
+        fclose(f);
+        snprintf(err, cap, "Cannot read the zip directory of %s", zip_path);
+        return 0;
+    }
+    mkdir_p(dest_dir);
+    for (i = 0, pos = 0; i < entries; ++i) {
+        uint32_t method, csize, nlen, xlen, clen, extattr, loff, data_at;
+        char name[1024], out_path[1400], parent[1400];
+        uint8_t lh[30];
+        if (pos + 46 > cd_size || zip_le32(cd + pos) != 0x02014b50u) {
+            free(cd);
+            fclose(f);
+            snprintf(err, cap, "Corrupt zip directory in %s", zip_path);
+            return 0;
+        }
+        method = zip_le16(cd + pos + 10);
+        csize = zip_le32(cd + pos + 20);
+        nlen = zip_le16(cd + pos + 28);
+        xlen = zip_le16(cd + pos + 30);
+        clen = zip_le16(cd + pos + 32);
+        extattr = zip_le32(cd + pos + 38);
+        loff = zip_le32(cd + pos + 42);
+        if (pos + 46 + nlen > cd_size || nlen >= sizeof(name)) {
+            free(cd);
+            fclose(f);
+            snprintf(err, cap, "Corrupt zip entry in %s", zip_path);
+            return 0;
+        }
+        memcpy(name, cd + pos + 46, nlen);
+        name[nlen] = '\0';
+        pos += 46 + nlen + xlen + clen;
+        if (!zip_name_safe(name))
+            continue;
+        if (!join_path(out_path, sizeof(out_path), dest_dir, name))
+            continue;
+        if (name[nlen - 1] == '/' || name[nlen - 1] == '\\') {
+            mkdir_p(out_path);
+            continue;
+        }
+        if (fseek(f, (long)loff, SEEK_SET) != 0 || fread(lh, 1, 30, f) != 30 ||
+            zip_le32(lh) != 0x04034b50u) {
+            free(cd);
+            fclose(f);
+            snprintf(err, cap, "Corrupt local header for %s", name);
+            return 0;
+        }
+        data_at = loff + 30 + zip_le16(lh + 26) + zip_le16(lh + 28);
+        if (fseek(f, (long)data_at, SEEK_SET) != 0) {
+            free(cd);
+            fclose(f);
+            snprintf(err, cap, "Corrupt offsets for %s", name);
+            return 0;
+        }
+        if (dirname_copy(parent, sizeof(parent), out_path))
+            mkdir_p(parent);
+        if (!zip_write_entry(f, method, csize, out_path, err, cap)) {
+            free(cd);
+            fclose(f);
+            return 0;
+        }
+#if !defined(_WIN32)
+        {
+            /* Mode bits ride in the high half of the external attributes
+             * when the pack was built on a POSIX host; a pack built on
+             * Windows carries none, so everything under bin/ is made
+             * executable anyway (cmake, clang, ninja live there). */
+            mode_t mode = (mode_t)((extattr >> 16) & 07777);
+            if (mode == 0)
+                mode = strstr(name, "bin/") ? 0755 : 0644;
+            chmod(out_path, mode);
+        }
+#else
+        (void)extattr;
+#endif
+    }
+    free(cd);
+    fclose(f);
+    return 1;
+}
+
 #if defined(_WIN32)
 /* Point a real LocalAppData path at a Store-Python LocalCache pack (no copy). */
 static int junction_dir(const char* link_path, const char* target_path) {
@@ -2427,6 +2738,108 @@ static int harvest_store_python_toolchain(int allow_copy) {
         pack_root_has_cmake(real_latest) ? real_latest : cache_root);
 }
 
+#if defined(_WIN32)
+/* Direct HTTPS download through WinHTTP: no curl.exe, no PowerShell, and
+ * it works under Wine/Proton where neither exists. WinHTTP follows the
+ * https->https redirect GitHub uses for release assets on its own. */
+static int host_winhttp_download(const char* url, const char* dest, char* err,
+                                 size_t cap) {
+    wchar_t wurl[2048], host[256], path[1536];
+    URL_COMPONENTS uc;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    FILE* out = NULL;
+    DWORD status = 0, status_len = sizeof(status);
+    int ok = 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 2048) == 0) {
+        snprintf(err, cap, "WinHTTP: bad URL");
+        return 0;
+    }
+    memset(&uc, 0, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 1536;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
+        snprintf(err, cap, "WinHTTP: cannot parse URL");
+        return 0;
+    }
+    ses = WinHttpOpen(L"psxrecomp-setup/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) {
+        snprintf(err, cap, "WinHTTP: open failed (%lu)", (unsigned long)GetLastError());
+        return 0;
+    }
+    WinHttpSetTimeouts(ses, 15000, 15000, 30000, 120000);
+    con = WinHttpConnect(ses, host, uc.nPort, 0);
+    if (!con) {
+        snprintf(err, cap, "WinHTTP: connect failed (%lu)", (unsigned long)GetLastError());
+        goto done;
+    }
+    req = WinHttpOpenRequest(con, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                             uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (!req) {
+        snprintf(err, cap, "WinHTTP: request failed (%lu)", (unsigned long)GetLastError());
+        goto done;
+    }
+    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(req, NULL)) {
+        snprintf(err, cap, "WinHTTP: no response (%lu)", (unsigned long)GetLastError());
+        goto done;
+    }
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_len,
+                             WINHTTP_NO_HEADER_INDEX) ||
+        status != 200) {
+        snprintf(err, cap, "WinHTTP: HTTP %lu", (unsigned long)status);
+        goto done;
+    }
+    out = fopen(dest, "wb");
+    if (!out) {
+        snprintf(err, cap, "Cannot create %s", dest);
+        goto done;
+    }
+    for (;;) {
+        static uint8_t buf[65536];
+        DWORD avail = 0, got = 0;
+        if (!WinHttpQueryDataAvailable(req, &avail)) {
+            snprintf(err, cap, "WinHTTP: read failed (%lu)", (unsigned long)GetLastError());
+            goto done;
+        }
+        if (avail == 0)
+            break;
+        if (avail > sizeof(buf))
+            avail = sizeof(buf);
+        if (!WinHttpReadData(req, buf, avail, &got)) {
+            snprintf(err, cap, "WinHTTP: read failed (%lu)", (unsigned long)GetLastError());
+            goto done;
+        }
+        if (got == 0)
+            break;
+        if (fwrite(buf, 1, got, out) != got) {
+            snprintf(err, cap, "Short write to %s", dest);
+            goto done;
+        }
+    }
+    ok = 1;
+done:
+    if (out) {
+        if (fclose(out) != 0 && ok) {
+            snprintf(err, cap, "Cannot finish %s", dest);
+            ok = 0;
+        }
+        if (!ok)
+            DeleteFileA(dest);
+    }
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    return ok;
+}
+#endif
+
 static int host_download_url_to_file(const char* url, const char* dest,
                                      char* err_msg, size_t err_cap) {
     char cmd[4096];
@@ -2436,20 +2849,52 @@ static int host_download_url_to_file(const char* url, const char* dest,
         snprintf(err_msg, err_cap, "Bad download destination.");
         return 0;
     }
+    char why_curl[96], why_ps[96], why_http[200];
+    int ran;
     mkdir_p(parent);
     DeleteFileA(dest);
-    /* Windows 10+ ships curl.exe. -L follows GitHub release redirects. */
+    /* Windows 10+ ships curl.exe. -L follows GitHub release redirects. A
+     * Wine/Proton install has no curl.exe at all, and a failed
+     * CreateProcess used to read as "curl exit 1", so each attempt says
+     * what actually happened. */
     snprintf(cmd, sizeof(cmd),
              "curl.exe -fsSL --retry 3 --retry-delay 2 -o \"%s\" \"%s\"", dest,
              url);
-    if (!run_cmdline_wait(cmd, &code) || code != 0) {
-        snprintf(err_msg, err_cap,
-                 "Toolchain download failed (curl exit %lu). Check network / "
-                 "curl.exe.",
-                 (unsigned long)code);
-        return 0;
-    }
-    return path_is_file(dest);
+    ran = run_cmdline_wait(cmd, &code);
+    if (ran && code == 0 && path_is_file(dest))
+        return 1;
+    if (!ran)
+        snprintf(why_curl, sizeof(why_curl), "curl.exe not found");
+    else
+        snprintf(why_curl, sizeof(why_curl), "curl.exe exit %lu", (unsigned long)code);
+    DeleteFileA(dest);
+    /* PowerShell 5+ is on every Windows 10+; it has its own TLS stack. */
+    code = 1;
+    snprintf(cmd, sizeof(cmd),
+             "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+             "-Command \"[Net.ServicePointManager]::SecurityProtocol = "
+             "[Net.SecurityProtocolType]::Tls12; "
+             "Invoke-WebRequest -UseBasicParsing -Uri '%s' -OutFile '%s'\"",
+             url, dest);
+    ran = run_cmdline_wait(cmd, &code);
+    if (ran && code == 0 && path_is_file(dest))
+        return 1;
+    if (!ran)
+        snprintf(why_ps, sizeof(why_ps), "PowerShell not found");
+    else
+        snprintf(why_ps, sizeof(why_ps), "PowerShell exit %lu", (unsigned long)code);
+    DeleteFileA(dest);
+    /* Last: the system HTTP stack directly, no helper process at all. */
+    why_http[0] = '\0';
+    if (host_winhttp_download(url, dest, why_http, sizeof(why_http)) && path_is_file(dest))
+        return 1;
+    snprintf(err_msg, err_cap,
+             "Toolchain download failed: %s; %s; %s. URL: %s. Check the network "
+             "(proxy, firewall, TLS inspection), or download that file by hand, "
+             "unpack it, and point RETCOMM_TOOLCHAIN_DIR at the folder that holds "
+             "bin\\cmake.exe.",
+             why_curl, why_ps, why_http[0] ? why_http : "WinHTTP failed", url);
+    return 0;
 }
 
 static int host_extract_zip(const char* zip_path, const char* dest_dir,
@@ -2468,13 +2913,31 @@ static int host_extract_zip(const char* zip_path, const char* dest_dir,
     mkdir_p(parent);
     rmtree_path(dest_dir);
     mkdir_p(dest_dir);
-    /* tar.exe on Windows 10+ extracts .zip */
+    /* tar.exe on Windows 10+ extracts .zip; PowerShell's Expand-Archive is
+     * the second choice; the built-in extractor covers Wine/Proton and
+     * images that ship neither. */
     snprintf(cmd, sizeof(cmd), "tar.exe -xf \"%s\" -C \"%s\"", zip_path,
              dest_dir);
     if (!run_cmdline_wait(cmd, &code) || code != 0) {
-        snprintf(err_msg, err_cap, "Failed to extract toolchain zip (tar exit %lu).",
-                 (unsigned long)code);
-        return 0;
+        char why[600];
+        rmtree_path(dest_dir);
+        mkdir_p(dest_dir);
+        code = 1;
+        snprintf(cmd, sizeof(cmd),
+                 "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                 "-Command \"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"",
+                 zip_path, dest_dir);
+        if (!run_cmdline_wait(cmd, &code) || code != 0) {
+            rmtree_path(dest_dir);
+            mkdir_p(dest_dir);
+            why[0] = '\0';
+            if (!zip_extract_builtin(zip_path, dest_dir, why, sizeof(why))) {
+                snprintf(err_msg, err_cap,
+                         "Failed to extract the toolchain zip (tar.exe and "
+                         "PowerShell unavailable or failed; built-in: %s).", why);
+                return 0;
+            }
+        }
     }
     if (pack_root_has_cmake(dest_dir))
         return 1;
@@ -2514,14 +2977,25 @@ static int host_download_url_to_file(const char* url, const char* dest,
         return 0;
     }
     mkdir_p(parent);
+    int rc_curl, rc_wget;
     unlink(dest);
     snprintf(cmd, sizeof(cmd),
              "curl -fsSL --retry 3 --retry-delay 2 -o \"%s\" \"%s\"", dest, url);
-    if (system(cmd) != 0) {
-        snprintf(err_msg, err_cap, "Toolchain download failed (curl).");
-        return 0;
-    }
-    return path_is_file(dest);
+    rc_curl = system(cmd);
+    if (rc_curl == 0 && path_is_file(dest))
+        return 1;
+    unlink(dest);
+    snprintf(cmd, sizeof(cmd), "wget -q -O \"%s\" \"%s\"", dest, url);
+    rc_wget = system(cmd);
+    if (rc_wget == 0 && path_is_file(dest))
+        return 1;
+    unlink(dest);
+    snprintf(err_msg, err_cap,
+             "Toolchain download failed (curl exit %d, wget exit %d). URL: %s. "
+             "Check the network, or download that file by hand, unpack it, and "
+             "point RETCOMM_TOOLCHAIN_DIR at the folder that holds bin/cmake.",
+             WEXITSTATUS(rc_curl), WEXITSTATUS(rc_wget), url);
+    return 0;
 }
 
 static int host_extract_zip(const char* zip_path, const char* dest_dir,
@@ -2541,11 +3015,21 @@ static int host_extract_zip(const char* zip_path, const char* dest_dir,
     mkdir_p(dest_dir);
     snprintf(cmd, sizeof(cmd), "unzip -q \"%s\" -d \"%s\"", zip_path, dest_dir);
     if (system(cmd) != 0) {
+        rmtree_path(dest_dir);
+        mkdir_p(dest_dir);
         snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\"", zip_path,
                  dest_dir);
         if (system(cmd) != 0) {
-            snprintf(err_msg, err_cap, "Failed to extract toolchain zip.");
-            return 0;
+            char why[600];
+            rmtree_path(dest_dir);
+            mkdir_p(dest_dir);
+            why[0] = '\0';
+            if (!zip_extract_builtin(zip_path, dest_dir, why, sizeof(why))) {
+                snprintf(err_msg, err_cap,
+                         "Failed to extract the toolchain zip (unzip and tar "
+                         "unavailable or failed; built-in: %s).", why);
+                return 0;
+            }
         }
     }
     if (pack_root_has_cmake(dest_dir))
@@ -2980,6 +3464,7 @@ static int toolchain_bin_compiler_works(const char* bin) {
     char clang[1200], lld[1200], src[1400], exe[1400], cmd[4096];
     FILE* f;
     int ok;
+    int use_system_cc = 0;
     if (!bin || !bin[0])
         return 0;
 #if defined(_WIN32)
@@ -2991,9 +3476,22 @@ static int toolchain_bin_compiler_works(const char* bin) {
             return 0;
     }
 #else
-    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang))
-        return 0;
-    if (!join_path(lld, sizeof(lld), bin, "ld.lld") || !path_is_file(lld))
+    /* A pack of kind "cmake-ninja-system-clang" -- which is what the macOS
+     * pack is -- ships cmake, ninja and ccache and deliberately NO compiler,
+     * because it is built to drive the host's own clang. Requiring bin/clang
+     * and bin/ld.lld here declares such a pack broken, and the caller reports
+     * that as "Extracted toolchain but cmake.exe is missing", so a correct
+     * macOS install fails setup while pointing at the wrong thing entirely.
+     * Fall back to the system compiler the pack means to use. */
+    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang)) {
+        if (!resolve_on_path_abs("cc", clang, sizeof(clang)) &&
+            !resolve_on_path_abs("clang", clang, sizeof(clang)) &&
+            !resolve_on_path_abs("gcc", clang, sizeof(clang)))
+            return 0;
+        use_system_cc = 1;
+    }
+    if (!use_system_cc &&
+        (!join_path(lld, sizeof(lld), bin, "ld.lld") || !path_is_file(lld)))
         return 0;
 #endif
     if (!cmake_path_runs(clang))
@@ -3030,10 +3528,16 @@ static int toolchain_bin_compiler_works(const char* bin) {
 #else
     /* Prefer the pack linker explicitly so PATH cannot hide a broken lld. */
     (void)lld; /* used via -fuse-ld when present; path already validated */
-    snprintf(cmd, sizeof(cmd),
-             "env PATH=\"%s:$PATH\" \"%s\" -fuse-ld=lld \"%s\" -o \"%s\" "
-             ">/dev/null 2>&1",
-             bin, clang, src, exe);
+    if (use_system_cc)
+        /* System compiler: it owns its own linker, and -fuse-ld=lld would
+         * fail on a host that has no lld at all. */
+        snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\" -o \"%s\" >/dev/null 2>&1",
+                 clang, src, exe);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "env PATH=\"%s:$PATH\" \"%s\" -fuse-ld=lld \"%s\" -o \"%s\" "
+                 ">/dev/null 2>&1",
+                 bin, clang, src, exe);
 #endif
     ok = run_cmd_exit_zero(cmd);
 #if defined(_WIN32)
@@ -3297,7 +3801,7 @@ static int parse_github_release_tag(const char* text, char* out, size_t cap) {
 }
 
 /* Query GitHub for the latest cmake-clang-v1 release tag (short timeout). */
-static int host_remote_toolchain_version(char* out, size_t cap) {
+static int host_remote_latest_tag(const char* repo, char* out, size_t cap) {
     char url[320], tmp[1400], buf[8192];
     FILE* f;
     size_t n;
@@ -3306,7 +3810,8 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
         return 0;
     out[0] = '\0';
     snprintf(url, sizeof(url),
-             "https://api.github.com/repos/%s/releases/latest", k_tc_repo);
+             "https://api.github.com/repos/%s/releases/latest",
+             repo ? repo : k_tc_repo);
 #if defined(_WIN32)
     {
         char tdir[512];
@@ -3338,7 +3843,7 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
                      "--max-time 15 -A psxrecomp-codegen -o NUL "
                      "-w %%{url_effective} "
                      "https://github.com/%s/releases/latest > \"%s\"\"",
-                     k_tc_repo, tmp);
+                     repo ? repo : k_tc_repo, tmp);
             if (!run_cmdline_wait(cmd, &code) || code != 0 || !path_is_file(tmp))
                 return 0;
         }
@@ -3358,7 +3863,7 @@ static int host_remote_toolchain_version(char* out, size_t cap) {
                      "curl -fsSIL --connect-timeout 5 --max-time 15 "
                      "-A psxrecomp-codegen -o /dev/null -w '%%{url_effective}' "
                      "'https://github.com/%s/releases/latest' > '%s'",
-                     k_tc_repo, tmp);
+                     repo ? repo : k_tc_repo, tmp);
             if (system(cmd) != 0 || !path_is_file(tmp))
                 return 0;
         }
@@ -3401,7 +3906,7 @@ static int host_toolchain_update_available(char* local_ver, size_t local_cap,
         return 0;
     migrate_legacy_psxrecomp_toolchain();
     (void)host_local_toolchain_version(local_ver, local_cap);
-    if (!host_remote_toolchain_version(remote_ver, remote_cap))
+    if (!host_remote_latest_tag(k_tc_repo, remote_ver, remote_cap))
         return 0;
     if (!local_ver || !local_ver[0])
         return 0; /* missing install → page 0 is "install", not "update" */
@@ -3777,6 +4282,12 @@ static int host_prepare_generate(const char* source_path, char* out_path,
 
     /* Hand the CLI the launcher's staged disc + BIOS. Empty g_wizard_bios means
      * OpenBIOS unless setup can adopt a retail dump beside the install. */
+    if (host_openbios_only()) {
+        /* Explicit, not merely empty: the adoption below is skipped and the
+         * sidecars record OpenBIOS on purpose. */
+        g_wizard_bios[0] = '\0';
+        g_wizard_bios_explicit = 1;
+    }
     {
         char abs_bios[1100];
         if (g_wizard_bios[0] &&
@@ -3872,9 +4383,48 @@ static int host_prepare_generate(const char* source_path, char* out_path,
 }
 
 #if defined(_WIN32)
+/* cmd.exe decodes a batch file in the CONSOLE code page (CP850 on a Brazilian
+ * Portuguese Windows, CP437 on a US one), but every path this host holds is
+ * in the process ANSI page. The two agree on ASCII and on nothing else, so a
+ * user name with an accent (C:\Users\Usuário\...\python.exe) came back from
+ * cmd as a path that does not exist: "cannot find the path specified" right
+ * after "Ensuring toolchain...", one step from the end of the player's first
+ * run. Converting to the OEM page does not help either -- the runtime's
+ * manifest makes this process's OEM page UTF-8 too, and measured on a US
+ * machine even system-OEM bytes failed. What works everywhere is to make the
+ * batch file self-describing: write UTF-8 and open it with "chcp 65001", so
+ * cmd re-reads every following line as UTF-8 regardless of the console's
+ * default. bat_utf8() is the identity under the manifest (ANSI page already
+ * UTF-8) and a real conversion on a build without it. */
+static const char* bat_utf8(const char* ansi, char* buf, size_t cap) {
+    if (!ansi) return "";
+    if (cap == 0) return ansi;
+    wchar_t wide[2048];
+    int wn = MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide,
+                                 (int)(sizeof(wide) / sizeof(wide[0])));
+    if (wn <= 0) {
+        snprintf(buf, cap, "%s", ansi);
+        return buf;
+    }
+    int on = WideCharToMultiByte(CP_UTF8, 0, wide, -1, buf, (int)cap,
+                                 NULL, NULL);
+    if (on <= 0) {
+        snprintf(buf, cap, "%s", ansi);
+        return buf;
+    }
+    return buf;
+}
+
+/* First lines of every helper. chcp before anything that names a path. */
+static void bat_write_header(FILE* f) {
+    fprintf(f, "@echo off\r\n");
+    fprintf(f, "chcp 65001 >NUL\r\n");
+}
+
 static void bat_write_set(FILE* f, const char* name, const char* value) {
+    char utf8[2048];
     fprintf(f, "set \"%s=", name);
-    for (const char* p = value; *p; ++p) {
+    for (const char* p = bat_utf8(value, utf8, sizeof(utf8)); *p; ++p) {
         if (*p == '%')
             fputc('%', f);
         fputc(*p, f);
@@ -3908,7 +4458,7 @@ static int write_windows_deferred_rebuild_helper(int force_pgo,
     char pid_buf[32];
     snprintf(pid_buf, sizeof(pid_buf), "%lu",
              (unsigned long)GetCurrentProcessId());
-    fprintf(f, "@echo off\r\n");
+    bat_write_header(f);
     fprintf(f, "setlocal EnableExtensions\r\n");
     fprintf(f, "title %s - %s\r\n", g_display,
             force_pgo ? "PGO optimize" : "rebuilding");
@@ -4165,7 +4715,22 @@ static int host_self_exe_path(char* out, size_t cap) {
             snprintf(out, cap, "%s", appimg);
             return 1;
         }
-        char* rp = realpath("/proc/self/exe", NULL);
+        char* rp;
+#if defined(__APPLE__)
+        /* macOS has no /proc, so the Linux spelling below resolves to nothing
+         * and the caller reports "relaunch requested but no path" -- after a
+         * first-run build that fully succeeded, leaving the player with a
+         * built game and no way in. Ask dyld for this image instead. */
+        {
+            char self[4096];
+            uint32_t n = (uint32_t)sizeof(self);
+            if (_NSGetExecutablePath(self, &n) != 0)
+                return 0;
+            rp = realpath(self, NULL);
+        }
+#else
+        rp = realpath("/proc/self/exe", NULL);
+#endif
         if (!rp)
             return 0;
         snprintf(out, cap, "%s", rp);
@@ -4201,6 +4766,52 @@ static int host_paths_same_file(const char* a, const char* b) {
 }
 
 /* Setup-host zip-root exe → build-release product (bios/mods/assets/settings). */
+/* Defined further down with the update-check helpers; needed here for the
+ * stale-build test below. */
+static int host_local_game_version(char* out, size_t cap);
+
+/* Is the product build under build-<cfg>/ the one this source tree would
+ * produce?  0 = yes (exe present; version stamp matches, or is unknown).
+ * 1 = no exe.  2 = exe stamped with another version than the VERSION file
+ * next to it (src_ver / built_ver filled in).
+ *
+ * Shared by forward_if_built (never launch a stale binary) and host_apply
+ * (reopen the wizard so the player can rebuild).  They MUST agree: when the
+ * forwarder declines but the wizard stays shut, the launcher opens on an exe
+ * that links no game code, PLAY is enabled, and PLAY ends in the runtime's
+ * "Setup host -- finish Generate & rebuild" dialog with nothing in the UI
+ * that would do so.  Seen on Windows after a rebuild helper console that
+ * was closed or failed (generated/ present, build-release/ empty), and
+ * after extracting a newer setup zip over an install built from the
+ * previous one (stamp mismatch). */
+static int host_product_build_stale(char* src_ver, size_t src_cap,
+                                    char* built_ver, size_t built_cap) {
+    char stamp[1200];
+    if (src_ver && src_cap) src_ver[0] = '\0';
+    if (built_ver && built_cap) built_ver[0] = '\0';
+    if (!g_exe_path[0] || !path_is_file(g_exe_path))
+        return 1;
+    if (!src_ver || !built_ver || src_cap < 2 || built_cap < 2)
+        return 0;
+    (void)host_local_game_version(src_ver, src_cap);
+    if (join_path(stamp, sizeof(stamp), g_build_dir, "psx_game_version.txt")) {
+        FILE* f = fopen(stamp, "rb");
+        if (f) {
+            size_t n = fread(built_ver, 1, built_cap - 1, f);
+            fclose(f);
+            built_ver[n] = '\0';
+            while (n && (built_ver[n - 1] == '\n' || built_ver[n - 1] == '\r' ||
+                         built_ver[n - 1] == ' '  || built_ver[n - 1] == '\t'))
+                built_ver[--n] = '\0';
+        }
+    }
+    /* Only when BOTH are known: a missing stamp is an older layout, not a
+     * stale build, and must not trigger an endless rebuild loop. */
+    if (src_ver[0] && built_ver[0] && strcmp(src_ver, built_ver) != 0)
+        return 2;
+    return 0;
+}
+
 void psxrecomp_codegen_host_forward_if_built(
     const PsxrecompCodegenHostConfig* cfg, int argc, char** argv) {
 #if defined(PSX_HAS_GAME_DISPATCH)
@@ -4247,6 +4858,32 @@ void psxrecomp_codegen_host_forward_if_built(
         return;
     if (host_paths_same_file(self, g_exe_path))
         return;
+
+    /* Refuse to forward a build older than the sources sitting next to it.
+     *
+     * An update to a setup-host zip is SOURCE ONLY: it replaces this exe and
+     * the tree, but never build-<cfg>/, because the built game is not in the
+     * archive. Forwarding unconditionally therefore keeps launching the
+     * PREVIOUS version's binary forever - the player extracts the update, sees
+     * the old build start, and is still playing the version they just
+     * replaced. Measured: a tree at 0.2.4 next to a build stamped 0.2.3,
+     * launching 0.2.3 every time, and (because the runtime asks GitHub what
+     * the latest release is) nagging to download an update it already had.
+     *
+     * Declining to forward drops through to the generate/build path below
+     * (launcher-less host), or to a launcher whose wizard host_apply reopens
+     * with the same check, so the player is offered the rebuild. */
+    {
+        char src_ver[64], built_ver[64];
+        if (host_product_build_stale(src_ver, sizeof(src_ver),
+                                     built_ver, sizeof(built_ver)) == 2) {
+            fprintf(stderr,
+                    "psxrecomp-codegen: installed sources are %s but the build "
+                    "is %s - rebuilding instead of launching the old one\n",
+                    src_ver, built_ver);
+            return;
+        }
+    }
 
     fprintf(stderr,
             "psxrecomp-codegen: setup host forwarding to product build:\n  %s\n",
@@ -4325,6 +4962,38 @@ void psxrecomp_codegen_host_forward_if_built(
 #endif /* !PSX_HAS_GAME_DISPATCH */
 }
 
+/* Keyed on _IMPL, not on PSX_HAS_RECOMP_LAUNCHER: that macro only says the
+ * recomp-ui HEADER is reachable, which is true whenever the submodule is on
+ * disk. The definition below must be dropped exactly when recomp-ui's
+ * launcher_ng_capi.c is LINKED (it defines the same symbol), and kept in every
+ * other case -- including PSX_RECOMP_UI=OFF with the submodule present, which
+ * otherwise links nothing at all and fails on an undefined symbol. */
+#if !defined(PSX_HAS_RECOMP_LAUNCHER_IMPL)
+/* Which binary to restart, with no launcher to ask.
+ *
+ * On Windows a rebuild cannot happen in this process -- the running .exe holds
+ * its own file and cannot be relinked -- so host_rebuild_game_ex writes a helper
+ * .cmd, sets g_relaunch_is_helper and RETURNS THE HELPER'S PATH as out_exe. A
+ * launcher feeds that back here.
+ *
+ * Answering with this process's own image instead relaunches the SETUP exe,
+ * which re-enters first run, finds the work already done and fails further
+ * along -- seen as a toolchain error raised by a second setup process while the
+ * helper never ran at all and build-release/ stayed empty.
+ *
+ * So: the helper when one is armed, this image otherwise. */
+int recomp_launcher_relaunch_exe(char* out, size_t out_sz) {
+    if (!out || out_sz < 2)
+        return 0;
+    out[0] = '\0';
+    if (g_relaunch_is_helper && g_helper_path[0]) {
+        snprintf(out, out_sz, "%s", g_helper_path);
+        return 1;
+    }
+    return host_self_exe_path(out, out_sz);
+}
+#endif
+
 void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
     char exe[512];
     const char* near_exe;
@@ -4348,7 +5017,23 @@ void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
         if (g_relaunch_is_helper) {
             fprintf(stderr,
                     "psxrecomp-codegen: starting deferred rebuild helper\n");
-            snprintf(cmd, sizeof(cmd), "cmd.exe /C \"%s\"", exe);
+            /* Doubled quotes, and /S, or cmd eats the path.
+             *
+             * `cmd /C "<path>"` preserves its quotes only when the text
+             * between them has no character from &<>()@^| AND contains
+             * whitespace. An install directory named `ygofm-0.2.5-win-x64(1)`
+             * -- exactly what a browser produces on a second download of the
+             * same zip -- fails both tests, so cmd strips the quotes and then
+             * parses the bare parenthesis as a command group. The helper never
+             * runs, nothing rebuilds, and the player keeps launching the
+             * previous version's binary with no error anywhere. Measured: a
+             * tree at 0.2.5 next to a build stamped 0.2.3, across two updates.
+             * `&` in a path fails the same way.
+             *
+             * /S makes the rule deterministic (always strip the outer pair),
+             * and the inner pair then protects the path. Same idiom as the
+             * toolchain probe further up this file. */
+            snprintf(cmd, sizeof(cmd), "cmd.exe /S /C \"\"%s\"\"", exe);
             flags = CREATE_NEW_CONSOLE;
         } else {
             fprintf(stderr, "psxrecomp-codegen: relaunching %s\n", exe);
@@ -4378,18 +5063,313 @@ void psxrecomp_codegen_host_relaunch_or_exit(const char* disc_path) {
 #endif
 }
 
-void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
-                                  const PsxrecompCodegenHostConfig* cfg) {
-    if (!gi || !cfg || !cfg->cmake_target || !cfg->exe_basename)
-        return;
+/* ---- Updates -------------------------------------------------------------
+ *
+ * A setup-host zip is SOURCE ONLY. Installing one over an existing tree
+ * therefore replaces exactly the files that should be replaced and cannot
+ * reach generated/, the disc, saves, settings or the build tree, because none
+ * of those are in the zip. That property is what makes this safe to do without
+ * an exclusion list to keep in sync; see the note on update_repo in the header.
+ */
 
-#if !defined(PSX_HAS_SETUP_WIZARD)
-    /* Build did not opt into the setup-wizard product surface
-     * (-DPSX_SETUP_WIZARD=ON / ENABLE_SETUP_WIZARD). Leave GameInfo dark so
-     * recomp-ui never opens first-run / Generate & rebuild. */
-    (void)cfg;
-    return;
+/* The VERSION file at the project root, trimmed. */
+static int host_local_game_version(char* out, size_t cap) {
+    char path[1400];
+    FILE* f;
+    size_t n;
+    if (!out || cap < 2)
+        return 0;
+    out[0] = '\0';
+    if (!g_project_root[0])
+        return 0;
+    if (!join_path(path, sizeof(path), g_project_root, "VERSION"))
+        return 0;
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r' ||
+                 out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+    return out[0] != '\0';
+}
+
+/* Where the once-a-day answer is remembered: beside the executable, so a
+ * per-install answer travels with the install rather than the user profile. */
+static int host_update_stamp_path(char* out, size_t cap) {
+    char exe[1100];
+    char* cut;
+    char* alt;
+    if (!host_self_exe_path(exe, sizeof(exe)))
+        return 0;
+    cut = strrchr(exe, '\\');
+    alt = strrchr(exe, '/');
+    if (alt && (!cut || alt > cut))
+        cut = alt;
+    if (!cut)
+        return 0;
+    *cut = '\0';
+    return join_path(out, cap, exe, "update_check.txt");
+}
+
+/* Seconds since the last check, or a very large number if there wasn't one. */
+static long host_update_stamp_age(void) {
+    char path[1400];
+    struct stat st;
+    double age;
+    if (!host_update_stamp_path(path, sizeof(path)))
+        return 1L << 30;
+    if (stat(path, &st) != 0)
+        return 1L << 30;
+    age = difftime(time(NULL), st.st_mtime);
+    if (age < 0)
+        return 1L << 30;   /* clock moved back; treat as due */
+    return (long)age;
+}
+
+static void host_update_stamp_touch(const char* remote) {
+    char path[1400];
+    FILE* f;
+    if (!host_update_stamp_path(path, sizeof(path)))
+        return;
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    fprintf(f, "%s\n", remote ? remote : "");
+    fclose(f);
+}
+
+/* "<PREFIX>_SKIP_UPDATE", where PREFIX is whatever the title put in front of
+ * its force-setup variable. YGOFM_FORCE_SETUP therefore yields
+ * YGOFM_SKIP_UPDATE rather than the YGOFM_FORCE_SETUP_SKIP_UPDATE a naive
+ * concatenation would produce. */
+static void host_update_skip_var(char* out, size_t cap) {
+    const char* env = cfg_or(g_cfg ? g_cfg->force_setup_env : NULL,
+                             "PSXRECOMP_FORCE_SETUP");
+    const char* tail = strstr(env, "_FORCE_SETUP");
+    size_t n = tail ? (size_t)(tail - env) : strlen(env);
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(out, env, n);
+    out[n] = '\0';
+    snprintf(out + n, cap - n, "_SKIP_UPDATE");
+}
+
+int psxrecomp_codegen_host_update_check(char* local_ver, size_t local_cap,
+                                        char* remote_ver, size_t remote_cap,
+                                        int force) {
+    char local[64], remote[64], skip_var[128];
+    const char* skip;
+
+    if (local_ver && local_cap) local_ver[0] = '\0';
+    if (remote_ver && remote_cap) remote_ver[0] = '\0';
+    if (!g_ready || !g_cfg || !g_cfg->update_repo || !g_cfg->update_repo[0])
+        return 0;
+
+    host_update_skip_var(skip_var, sizeof(skip_var));
+    skip = getenv(skip_var);
+    if (skip && skip[0] && skip[0] != '0')
+        return 0;
+
+    if (!host_local_game_version(local, sizeof(local)))
+        return 0;
+    if (local_ver && local_cap)
+        snprintf(local_ver, local_cap, "%s", local);
+
+    /* A check on every launch is a cost on every launch. Releases move at most
+     * weekly, and startup latency here was hard-won. Once a day. */
+    if (!force && host_update_stamp_age() < 24L * 60L * 60L)
+        return 0;
+
+    if (!host_remote_latest_tag(g_cfg->update_repo, remote, sizeof(remote)))
+        return 0;   /* offline is an unknown, not a failure */
+    host_update_stamp_touch(remote);
+    if (remote_ver && remote_cap)
+        snprintf(remote_ver, remote_cap, "%s", remote);
+    return version_cmp(local, remote) < 0;
+}
+
+/* Write the helper that installs an update after this process exits.
+ *
+ * Same shape as the deferred rebuild helper, and for the same reason twice
+ * over: the update replaces the running executable, and the rebuild relinks it.
+ * Neither is possible while it is running, so both happen in a console that
+ * outlives us. Unpack, regenerate, rebuild, relaunch.
+ *
+ * The regenerate is not optional. An update can carry recompiler changes, and
+ * `generate` is cheap when its output already matches -- it reports every shard
+ * unchanged and moves on. */
+static int host_write_update_helper(const char* zip_path, char* err_msg,
+                                    size_t err_cap) {
+    FILE* f;
+    char exe_dir[1400];
+#if defined(_WIN32)
+    if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
+                   "recomp_update.cmd")) {
+        snprintf(err_msg, err_cap, "Could not place the update helper.");
+        return 0;
+    }
+    snprintf(exe_dir, sizeof(exe_dir), "%s", g_exe_path);
+    f = fopen(g_helper_path, "wb");
+    if (!f) {
+        snprintf(err_msg, err_cap, "Could not write %s.", g_helper_path);
+        return 0;
+    }
+    bat_write_header(f);
+    fprintf(f, "setlocal EnableExtensions\r\n");
+    fprintf(f, "title %s - updating\r\n", g_display);
+    fprintf(f, "set \"PARENT_PID=%lu\"\r\n",
+            (unsigned long)GetCurrentProcessId());
+    /* Paths go through bat_write_set: see bat_utf8() for why raw bytes in a
+     * .cmd break on any non-ASCII user name. */
+    bat_write_set(f, "ROOT", g_project_root);
+    bat_write_set(f, "ZIP", zip_path);
+    bat_write_set(f, "PYTHON", g_python);
+    bat_write_set(f, "CLI", g_cli_path);
+    bat_write_set(f, "CONFIG", g_game_toml);
+    bat_write_set(f, "BUILD_DIR", g_build_dir);
+    bat_write_set(f, "TARGET", g_cmake_target);
+    bat_write_set(f, "EXE_BASE", g_exe_basename);
+    bat_write_set(f, "EXE", exe_dir);
+    if (g_toolchain_bin[0]) {
+        bat_write_set(f, "TC_BIN", g_toolchain_bin);
+        fprintf(f, "set \"PATH=%%TC_BIN%%;%%PATH%%\"\r\n");
+    }
+    fprintf(f, "echo Waiting for %s to exit...\r\n", g_display);
+    fprintf(f, ":waitloop\r\n");
+    fprintf(f, "tasklist /FI \"PID eq %%PARENT_PID%%\" 2>NUL | "
+               "findstr /I \"%%PARENT_PID%%\" >NUL\r\n");
+    fprintf(f, "if not errorlevel 1 (\r\n");
+    fprintf(f, "  ping -n 2 127.0.0.1 >NUL\r\n");
+    fprintf(f, "  goto waitloop\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "cd /d \"%%ROOT%%\"\r\n");
+    fprintf(f, "echo Installing update...\r\n");
+    /* tar ships with Windows 10+ and is what the toolchain unpack already
+     * uses. Unpacking over the tree is safe: the zip is source only. */
+    fprintf(f, "tar -xf \"%%ZIP%%\" -C \"%%ROOT%%\"\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Could not unpack the update. Your install is unchanged.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "del \"%%ZIP%%\" >NUL 2>&1\r\n");
+    fprintf(f, "echo Regenerating...\r\n");
+    fprintf(f, "\"%%PYTHON%%\" \"%%CLI%%\" generate --config \"%%CONFIG%%\" "
+               "--project-root \"%%ROOT%%\"\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Generate failed. Fix the errors above, then rebuild.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "echo Building...\r\n");
+    fprintf(f, "\"%%PYTHON%%\" \"%%CLI%%\" rebuild --project-root \"%%ROOT%%\" "
+               "--config \"%%CONFIG%%\" --build-dir \"%%BUILD_DIR%%\" "
+               "--target \"%%TARGET%%\" --exe-basename \"%%EXE_BASE%%\" "
+               "--no-pgo\r\n");
+    fprintf(f, "if errorlevel 1 (\r\n");
+    fprintf(f, "  echo.\r\n");
+    fprintf(f, "  echo Build failed. Fix the errors above, then rebuild manually.\r\n");
+    fprintf(f, "  pause\r\n");
+    fprintf(f, "  exit /b 1\r\n");
+    fprintf(f, ")\r\n");
+    fprintf(f, "echo Starting %s...\r\n", g_display);
+    fprintf(f, "start \"\" /D \"%%ROOT%%\" \"%%EXE%%\"\r\n");
+    fprintf(f, "endlocal\r\n");
+    fclose(f);
+    return 1;
 #else
+    (void)exe_dir;
+    if (!join_path(g_helper_path, sizeof(g_helper_path), g_build_dir,
+                   "recomp_update.sh")) {
+        snprintf(err_msg, err_cap, "Could not place the update helper.");
+        return 0;
+    }
+    f = fopen(g_helper_path, "wb");
+    if (!f) {
+        snprintf(err_msg, err_cap, "Could not write %s.", g_helper_path);
+        return 0;
+    }
+    fprintf(f, "#!/bin/sh\nset -e\n");
+    fprintf(f, "cd '%s'\n", g_project_root);
+    fprintf(f, "tar -xf '%s' -C '%s'\n", zip_path, g_project_root);
+    fprintf(f, "rm -f '%s'\n", zip_path);
+    fprintf(f, "'%s' '%s' generate --config '%s' --project-root '%s'\n",
+            g_python, g_cli_path, g_game_toml, g_project_root);
+    fprintf(f, "'%s' '%s' rebuild --project-root '%s' --config '%s' "
+               "--build-dir '%s' --target '%s' --exe-basename '%s' --no-pgo\n",
+            g_python, g_cli_path, g_project_root, g_game_toml, g_build_dir,
+            g_cmake_target, g_exe_basename);
+    fprintf(f, "exec '%s'\n", g_exe_path);
+    fclose(f);
+    chmod(g_helper_path, 0755);
+    return 1;
+#endif
+}
+
+int psxrecomp_codegen_host_update_apply(
+    char* out_helper, size_t helper_cap, char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx) {
+    char remote[64], asset[256], url[512], zip_path[1400];
+
+    if (out_helper && helper_cap) out_helper[0] = '\0';
+    if (!g_ready || !g_cfg || !g_cfg->update_repo || !g_cfg->update_repo[0] ||
+        !g_cfg->update_asset_format || !g_cfg->update_asset_format[0]) {
+        snprintf(err_msg, err_cap, "This build has no update source configured.");
+        return 0;
+    }
+    if (!host_remote_latest_tag(g_cfg->update_repo, remote, sizeof(remote))) {
+        snprintf(err_msg, err_cap,
+                 "Could not reach GitHub to fetch the update.");
+        return 0;
+    }
+    /* Assets are named with the bare version; tags usually carry a leading v. */
+    {
+        const char* v = remote;
+        if ((v[0] == 'v' || v[0] == 'V') && v[1] >= '0' && v[1] <= '9')
+            v++;
+        snprintf(asset, sizeof(asset), g_cfg->update_asset_format, v);
+    }
+    snprintf(url, sizeof(url), "https://github.com/%s/releases/download/%s/%s",
+             g_cfg->update_repo, remote, asset);
+
+    if (!resolve_build_paths()) {
+        snprintf(err_msg, err_cap, "Could not work out where to build.");
+        return 0;
+    }
+    if (!join_path(zip_path, sizeof(zip_path), g_build_dir, asset)) {
+        snprintf(err_msg, err_cap, "Could not place the download.");
+        return 0;
+    }
+    if (on_progress)
+        on_progress(progress_ctx, 0.15f, "Downloading update\xE2\x80\xA6");
+    if (!host_download_url_to_file(url, zip_path, err_msg, err_cap))
+        return 0;   /* the downloader already explained itself */
+
+    if (on_progress)
+        on_progress(progress_ctx, 0.6f, "Scheduling install\xE2\x80\xA6");
+    if (!host_write_update_helper(zip_path, err_msg, err_cap))
+        return 0;
+
+    g_relaunch_is_helper = 1;
+    if (out_helper && helper_cap)
+        snprintf(out_helper, helper_cap, "%s", g_helper_path);
+    if (on_progress)
+        on_progress(progress_ctx, 1.0f, "Exiting to install the update\xE2\x80\xA6");
+    return 1;
+}
+
+/* Everything _apply used to do before it started filling in GameInfo. Split
+ * out because none of it is about a launcher: it is discovery of the project
+ * tree, the CLI and the toolchain, which a runtime driving its own first run
+ * needs just as much. */
+int psxrecomp_codegen_host_init(const PsxrecompCodegenHostConfig* cfg) {
+    if (!cfg || !cfg->cmake_target || !cfg->exe_basename)
+        return 0;
 
     g_cfg = cfg;
     g_ready = 0;
@@ -4404,13 +5384,89 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     g_helper_path[0] = '\0';
     g_toolchain_bin[0] = '\0';
     g_cli_toolchain_bin[0] = '\0';
-    /* Keep g_wizard_bios across re-apply within the same process. */
+    /* Keep g_wizard_bios across re-init within the same process. */
 
     snprintf(g_display, sizeof(g_display), "%s",
              cfg_or(cfg->display_name, "Game"));
     snprintf(g_cmake_target, sizeof(g_cmake_target), "%s", cfg->cmake_target);
     snprintf(g_exe_basename, sizeof(g_exe_basename), "%s", cfg->exe_basename);
 
+    if (!discover_project_root(g_project_root, sizeof(g_project_root)))
+        return 0;
+    if (!resolve_cli_path(g_project_root, g_cli_path, sizeof(g_cli_path)))
+        return -1;
+    if (!join_path(g_game_toml, sizeof(g_game_toml), g_project_root,
+                   cfg_or(cfg->game_toml_relpath, "game.toml")))
+        return -2;
+    if (!path_is_file(g_game_toml))
+        return -2;
+
+    /* Ready even when Python is not on PATH yet — the toolchain step installs
+     * a portable CPython, and generate/rebuild re-resolve after
+     * activate_toolchain_path(). */
+    g_ready = 1;
+    activate_toolchain_path();
+    (void)find_python(g_python, sizeof(g_python));
+    /* Where to build, which cmake, which exe. _apply() resolves this
+     * separately to decide whether to offer a rebuild row at all; a
+     * launcher-less caller has no row to offer and just needs it done,
+     * or host_rebuild_game_ex refuses with "CMake build environment is
+     * not available" AFTER generate has already run for several
+     * minutes. Not fatal if it fails: generate alone still works, and
+     * the rebuild reports the real reason. */
+    (void)resolve_build_paths();
+    return 1;
+}
+
+/* The launcher-free first run. The two halves are the same functions the
+ * wizard wires into GameInfo as prepare_with_progress and
+ * rebuild_with_progress; running them back to back is what the wizard does
+ * once the player has picked a disc. */
+int psxrecomp_codegen_host_generate_and_build(
+    const char* disc_path, char* out_exe, size_t out_cap,
+    char* err_msg, size_t err_cap,
+    RecompLauncherCPrepareProgressFn on_progress, void* progress_ctx) {
+    char gen_out[512];
+    if (out_exe && out_cap)
+        out_exe[0] = '\0';
+
+    /* Toolchain FIRST, before generate -- not just before the build.
+     *
+     * Generate runs the psxrecomp CLI, which is Python. find_python looks in
+     * the portable toolchain before it looks on PATH, and the cmake-clang-v1
+     * pack ships a CPython, so a player with no system Python is fine once the
+     * pack is installed. Installing it after generate meant they were not:
+     * generate ran first, found no interpreter anywhere, and cmd returned 9009
+     * -- "not recognized as an internal or external command" -- reported as
+     * "psxrecomp generate failed (exit 9009)".
+     *
+     * Ensuring it here also means the download happens before the long step
+     * rather than after it, so a machine that cannot reach the toolchain finds
+     * out in seconds instead of after several minutes of recompilation. */
+    if (!host_ensure_toolchain(on_progress, progress_ctx, err_msg, err_cap))
+        return 0;
+
+    if (!host_prepare_generate(disc_path, gen_out, sizeof(gen_out), err_msg,
+                               err_cap, on_progress, progress_ctx))
+        return 0;
+    return host_rebuild_game(disc_path, out_exe, out_cap, err_msg, err_cap,
+                             on_progress, progress_ctx);
+}
+
+#if defined(PSX_HAS_RECOMP_LAUNCHER)
+void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
+                                  const PsxrecompCodegenHostConfig* cfg) {
+    if (!gi || !cfg || !cfg->cmake_target || !cfg->exe_basename)
+        return;
+
+#if !defined(PSX_HAS_SETUP_WIZARD)
+    /* Build did not opt into the setup-wizard product surface
+     * (-DPSX_SETUP_WIZARD=ON / ENABLE_SETUP_WIZARD). Leave GameInfo dark so
+     * recomp-ui never opens first-run / Generate & rebuild. */
+    (void)cfg;
+    return;
+#else
+    const int status = psxrecomp_codegen_host_init(cfg);
     const char* force_env =
         cfg_or(cfg->force_setup_env, "PSXRECOMP_FORCE_SETUP");
     const char* force = getenv(force_env);
@@ -4420,11 +5476,13 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
     gi->setup_wizard_supported = 1;
     /* Setup SDKs often link OpenBIOS only (retail C comes from Generate).
      * psx_bios_has_selectable() is then 0 and would hide the BIOS row — keep
-     * the optional SCPH1001 picker so prepare can ingest a dump first. */
-    gi->has_bios = 1;
+     * the optional SCPH1001 picker so prepare can ingest a dump first.
+     * Unless the title runs OpenBIOS and nothing else: then there is no
+     * dump to ingest, and a BIOS step only invites one. */
+    gi->has_bios = host_openbios_only() ? 0 : 1;
 
-    if (!discover_project_root(g_project_root, sizeof(g_project_root))) {
-        /* Still force the wizard when generated/ is missing — discover may
+    if (status == 0) {
+        /* Still force the wizard when generated/ is missing — discovery may
          * fail if the process cwd is unrelated to the project tree. */
         if (force_setup) {
             gi->needs_setup = 1;
@@ -4432,25 +5490,16 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
         }
         return;
     }
-    if (!resolve_cli_path(g_project_root, g_cli_path, sizeof(g_cli_path))) {
+    if (status == -1) {
         if (psxrecomp_codegen_host_sources_missing(cfg) || force_setup) {
             gi->needs_setup = 1;
             gi->prepare_required_before_continue = 1;
         }
         return;
     }
-    if (!join_path(g_game_toml, sizeof(g_game_toml), g_project_root,
-                   cfg_or(cfg->game_toml_relpath, "game.toml")))
-        return;
-    if (!path_is_file(g_game_toml))
+    if (status != 1)
         return;
 
-    /* Wire prepare/rebuild even when Python is not on PATH yet — wizard page 0
-     * installs cmake-clang-v1 (1.0.6+ ships portable CPython under python/).
-     * generate/rebuild re-resolve after activate_toolchain_path. */
-    g_ready = 1;
-    activate_toolchain_path();
-    (void)find_python(g_python, sizeof(g_python));
     gi->persist_setup = host_persist_setup;
     gi->persist_setup_ctx = NULL;
     /* Multi-disc titles only: load_game_toml_disc_roster leaves g_num_discs 0
@@ -4545,5 +5594,46 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
          * first run, not a loop. */
         host_clear_generate_stamp();
     }
+#if !defined(PSX_HAS_GAME_DISPATCH)
+    /* Setup host only (a product build can always PLAY itself).  Sources were
+     * generated once, but the product build is missing or belongs to an older
+     * tree, so forward_if_built declined and this process -- which links no
+     * game code -- is what the player is looking at.  Reopen the first-run
+     * page with Generate & rebuild required: it is the only way out of a
+     * setup host, and PLAY would only reach the runtime's "finish Generate &
+     * rebuild" dialog.  Same check as the forwarder, so the two cannot
+     * disagree. */
+    else if (can_rebuild) {
+        char src_ver[64], built_ver[64];
+        const int stale = host_product_build_stale(
+            src_ver, sizeof(src_ver), built_ver, sizeof(built_ver));
+        if (stale == 1) {
+            snprintf(g_stale_note, sizeof(g_stale_note),
+                     "The last Generate & rebuild did not finish: %s/ has no "
+                     "%s. On Windows a separate console window builds after "
+                     "this one closes; if it was closed early or showed an "
+                     "error, run Generate & rebuild again and leave that "
+                     "window open until %s starts.",
+                     cfg_or(cfg->build_dir_name, "build-release"),
+                     g_exe_basename, g_display);
+        } else if (stale == 2) {
+            snprintf(g_stale_note, sizeof(g_stale_note),
+                     "This download is version %s, but the game built next to "
+                     "it is version %s. Run Generate & rebuild once to bring "
+                     "the build up to date; your saves and settings are not "
+                     "touched.",
+                     src_ver, built_ver);
+        }
+        if (stale) {
+            fprintf(stderr,
+                    "psxrecomp-codegen: product build %s - reopening setup\n",
+                    stale == 1 ? "missing" : "stale");
+            gi->prepare_disc_note = g_stale_note;
+            gi->needs_setup = 1;
+            gi->prepare_required_before_continue = 1;
+        }
+    }
+#endif /* !PSX_HAS_GAME_DISPATCH */
 #endif /* PSX_HAS_SETUP_WIZARD */
 }
+#endif /* PSX_HAS_RECOMP_LAUNCHER */

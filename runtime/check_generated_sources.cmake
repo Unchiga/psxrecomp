@@ -24,7 +24,10 @@ if(DEFINED SOURCES_FILE AND SOURCES_FILE)
             "check_generated_sources.cmake: SOURCES_FILE does not exist:\n"
             "  ${SOURCES_FILE}")
     endif()
-    file(STRINGS "${SOURCES_FILE}" _sources)
+    # ENCODING UTF-8: without it file(STRINGS) keeps ASCII only and a path
+    # such as C:/dev/Usuário/... is split at the accent into two "files"
+    # that do not exist, so a first run in any non-ASCII folder fails here.
+    file(STRINGS "${SOURCES_FILE}" _sources ENCODING UTF-8)
 elseif(DEFINED SOURCES)
     set(_sources ${SOURCES})
 else()
