@@ -270,7 +270,7 @@ def main() -> int:
         and text.find(forwarded_args) < text.find(wrapper_extras),
         "psxrecomp_add_game_runtime forwards target args before EXTRAS_SOURCES",
     )
-    setup_guard = "if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES)"
+    setup_guard = "if((PSX_RECOMP_UI OR PSX_SETUP_HOST) AND PSXG_CODEGEN_SETUP_SOURCES)"
     setup_host = '"${PSXRECOMP_ROOT}/host/psxrecomp_codegen_host.c"'
     check(
         text.find(setup_guard) != -1

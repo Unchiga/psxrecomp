@@ -103,6 +103,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "launcher_boot_timing.h" /* PSX_LAUNCHER_BOOT_TIMING stamps */
 #if defined(PSX_HAS_CODEGEN_SETUP_HOST)
 extern "C" void psx_game_codegen_setup_apply(RecompLauncherCGameInfo* gi);
+extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 extern "C" void psx_game_codegen_relaunch_or_exit(const char* disc_path);
 #endif
 #endif

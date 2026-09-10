@@ -5603,7 +5603,7 @@ void psxrecomp_codegen_host_apply(RecompLauncherCGameInfo* gi,
      * setup host, and PLAY would only reach the runtime's "finish Generate &
      * rebuild" dialog.  Same check as the forwarder, so the two cannot
      * disagree. */
-    else if (can_rebuild) {
+    if (!gi->needs_setup && can_rebuild) {
         char src_ver[64], built_ver[64];
         const int stale = host_product_build_stale(
             src_ver, sizeof(src_ver), built_ver, sizeof(built_ver));

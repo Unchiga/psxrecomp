@@ -638,6 +638,13 @@ if [[ -f "${STAGE}/CMakeLists.txt" ]]; then
     if [[ -n "${guarded}" ]] && grep -qxF -- "${rel}" <<<"${guarded}"; then
       continue
     fi
+    # Explicit exclusions also declare optional/generated project inputs.
+    # They must not be reintroduced merely because a CMake branch names them.
+    excluded=0
+    for ex in "${PROJECT_EXCLUDES[@]}"; do
+      case "${rel}" in "${ex}"|"${ex}"/*) excluded=1 ;; esac
+    done
+    (( excluded )) && continue
     [[ -e "${STAGE}/${rel}" ]] || missing_refs+=("${rel}")
   done < <(grep -oE '\$\{CMAKE_CURRENT_SOURCE_DIR\}/[^"]+' "${cml}" \
              | sed 's|^\${CMAKE_CURRENT_SOURCE_DIR}/||' | sort -u)
