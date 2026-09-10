@@ -110,6 +110,8 @@ static void apply_defaults(void) {
         add_bind(HOST_KEYMAP_SCANLINES, (int)SDLK_F6, (int)SDL_SCANCODE_F6, 0);
     if (want_default(HOST_KEYMAP_TURBO_TOGGLE))
         add_bind(HOST_KEYMAP_TURBO_TOGGLE, (int)SDLK_F9, (int)SDL_SCANCODE_F9, 0);
+    if (s_actions[HOST_KEYMAP_VIDEO_MENU].count == 0)
+        add_bind(HOST_KEYMAP_VIDEO_MENU, (int)SDLK_F10, (int)SDL_SCANCODE_F10, 0);
 }
 
 /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
@@ -169,6 +171,7 @@ static HostKeymapAction action_for_key(const char *name) {
     if (ieq(name, "SaveStateMenu")) return HOST_KEYMAP_SAVE_STATE_MENU;
     if (ieq(name, "Scanlines")) return HOST_KEYMAP_SCANLINES;
     if (ieq(name, "TurboToggle")) return HOST_KEYMAP_TURBO_TOGGLE;
+    if (ieq(name, "VideoMenu")) return HOST_KEYMAP_VIDEO_MENU;
     return HOST_KEYMAP_ACTION_COUNT;
 }
 

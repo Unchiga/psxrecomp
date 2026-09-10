@@ -15,6 +15,13 @@ struct SDL_Window;
 extern "C" {
 #endif
 
+/* Capture the COMPOSITED backbuffer -- the frame with every host overlay
+ * already drawn on it, which is the only capture that can see them.
+ * Queues a request serviced on the render thread just before the swap;
+ * poll gr_present_capture_status for 1 (written), -1 (failed), 0 (pending). */
+int gr_request_present_capture(const char *path);
+int gr_present_capture_status(int *w, int *h);
+
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
@@ -34,6 +41,33 @@ void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,
                                     uint64_t *swaps);
+
+/* Interpolation internals, for the `gl_interp` / `interp_dump` debug commands.
+ * draw_blend / draw_blend_src / draw_blend_dst are the GL blend state observed
+ * in the PRESENTATION context at the last interpolated draw, sampled before
+ * state_fix normalises it: the OSD compositor shares that context and leaves
+ * GL_BLEND armed, which would multiply the presented frame by the PSX mask bit
+ * rather than by any coverage value. */
+typedef struct {
+    int enabled, suspended, valid;
+    int w, h, scale;                       /* history texture size, in hr px */
+    int src_x, src_y, src_w, src_h;        /* VRAM rect of the last capture */
+    int source_path, force_4_3, linear, blend_mode;
+    int prev_idx, cur_idx;
+    int draw_blend, draw_blend_src, draw_blend_dst;
+    int state_fix;
+    float alpha_override;                  /* <0 = follow the frame clock */
+    uint64_t captures, swaps;
+} GlInterpDebug;
+
+void gl_renderer_interp_debug(GlInterpDebug *out);
+/* state_fix < 0 leaves the guard as-is; alpha_override < 0 restores the clock. */
+void gl_renderer_interp_set_debug(int state_fix, double alpha_override);
+/* which: 0 = prev history texture, 1 = current, 2 = the hr FBO re-read live at
+ * the last capture rect. Writes 0xAARRGGBB (alpha = PSX mask bit), `pitch` in
+ * BYTES, row 0 = first VRAM row of the band. Returns pixels written, 0 if
+ * unavailable. Emu thread only. */
+int  gl_renderer_interp_readback(int which, uint32_t *out, int pitch);
 /* Cumulative CPU-upload diagnostics: calls, rects, pixels, conversion ticks,
  * texture-upload ticks, FBO-draw ticks. Active only with PSX_RUNTIME_PERF_DIAG. */
 void gl_renderer_runtime_diag(uint64_t out[6]);
@@ -53,6 +87,18 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
  * Returns 0 only if a texture could not be created. */
 int  gl_renderer_set_bezel(const void *rgba, int w, int h);
 int  gl_renderer_has_bezel(void);
+/* Integer scaling: snap the present rect to a whole multiple of the guest's
+ * native display size (set via gl_renderer_set_present_native_size) instead of
+ * filling the drawable continuously. Off by default. */
+void gl_renderer_set_integer_scale(int on);
+
+/* Current guest display size in native PS1 pixels, BEFORE the internal
+ * supersampling factor. Set once per present; only used by integer scaling. */
+void gl_renderer_set_present_native_size(int w, int h);
+/* Reads it back, for sizing the window to a whole multiple of the picture.
+ * Both outputs are left UNTOUCHED when nothing has been presented yet, so
+ * the caller's own fallback stands instead of being overwritten with 0. */
+void gl_renderer_get_present_native_size(int *w, int *h);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);

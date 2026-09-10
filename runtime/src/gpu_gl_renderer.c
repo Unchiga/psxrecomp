@@ -73,6 +73,9 @@
 #include "host_time.h"
 #include "latency_ring.h"
 #include "frame_pacing.h"
+#include "psx_video_menu.h"
+#include "psx_guest_overlay.h"
+extern int gpu_sprite_watch_query(int max_age, int *x, int *y, int *occluded);
 #include "psx_rewind.h"
 
 #include "psx_sdl.h"
@@ -340,6 +343,19 @@ static int           s_interp_blend_mode = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
 static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
+/* VRAM rect the last capture copied, so a dump can read the SAME rect back out
+ * of the hr FBO and compare it against what actually reached the history. */
+static int           s_interp_src_x = 0, s_interp_src_y = 0;
+static int           s_interp_src_w = 0, s_interp_src_h = 0;
+/* Presentation-context GL state observed at the last interpolated draw.
+ * The interp context is touched by exactly two things: this draw and the OSD
+ * compositor — and gl_draw_osd_image_ex(blend=1) leaves GL_BLEND ENABLED with
+ * no caller restoring it. On the main thread hr_end() disables blend every
+ * frame, so only this context can carry the leak. Probed, not assumed. */
+static int           s_interp_draw_blend = -1;
+static int           s_interp_draw_blend_src = 0, s_interp_draw_blend_dst = 0;
+static int           s_interp_state_fix = 1;   /* force known state before the draw */
+static float         s_interp_alpha_override = -1.f;
 static uint64_t      s_interp_swaps = 0;
 static uint64_t      s_interp_captures = 0;
 static int           s_interp_diag = 0;
@@ -1882,10 +1898,11 @@ static void flush_tex_batch(void) {
 /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
  * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
  * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
-#define FLATBATCH_MAXV 8190                 /* multiple of 3 */
+#define FLATBATCH_MAXV 8190                 /* a multiple of 3 and of 2: triangles or lines */
 static float s_fb[FLATBATCH_MAXV * 6];
 static int   s_fb_n = 0;
 static int   s_fb_semi = -2;
+static GLenum s_fb_mode = GL_TRIANGLES;    /* GL_TRIANGLES or GL_LINES, one per batch */
 static int   s_fb_mask = -1;
 
 static int mirror_flat_batch_center_only(int nverts) {
@@ -1902,17 +1919,19 @@ static int mirror_flat_batch_center_only(int nverts) {
 static void flush_flat_batch(void) {
     if (s_fb_n == 0) return;
     int nverts = s_fb_n, semi = s_fb_semi, mask = s_fb_mask;
+    const GLenum mode = s_fb_mode;
     s_fb_n = 0;
 
     hr_begin(1);
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
+    if (mode == GL_LINES) glLineWidth((float)s_scale);
     p_glUseProgram(s_geo_prog);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * 6 * sizeof(float)),
                    s_fb, PSXGL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, nverts);
+    glDrawArrays(mode, 0, nverts);
 
     if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
         !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts))) {
@@ -1922,7 +1941,7 @@ static void flush_flat_batch(void) {
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, nverts);
+        if (s_ws_ablate != 2) glDrawArrays(mode, 0, nverts);
         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
@@ -1940,8 +1959,17 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     /* Sub-pixel positions only describe a 3-vertex projected triangle. */
     const int precise = s_pc_valid && mode == GL_TRIANGLES && n == 3;
 
-    /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
-    if (mode != GL_TRIANGLES || n < 3) {
+    /* Triangles batch (MotK 0x68 starfields) and so do lines, in batches of
+     * their own kind: a batch is one mode, one blend, one mask. Lines used
+     * to be drawn one at a time as "rare", and each one paid the whole
+     * pipeline -- FBO bind, blend and stencil state, program, a fresh
+     * glBufferData, the draw, the widescreen mirror draw, and the teardown.
+     * Forbidden Memories' credits are wireframe monsters of 1000 to 1300
+     * lines a frame, and that path measured 6 to 16 ms of GPU time per
+     * frame on an RTX 4090 (2026-09-06, frame_perf: per_prim_us 6.3 to
+     * 12.8), which is a pinned 60 fps at 3x speed here and a slideshow on a
+     * laptop GPU. Batched, the same frames are a handful of draws. */
+    if (!((mode == GL_TRIANGLES && n == 3) || (mode == GL_LINES && n == 2))) {
         flush_flat_batch();
         float verts[3 * 6];
         float mask_a = s_mask_set ? 1.0f : 0.0f;
@@ -1979,12 +2007,13 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         return;
     }
 
-    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set))
+    if (s_fb_n > 0 && (s_fb_semi != semi || s_fb_mask != (int)s_mask_set || s_fb_mode != mode))
         flush_flat_batch();
     if (s_fb_n + n > FLATBATCH_MAXV)
         flush_flat_batch();
     s_fb_semi = semi;
     s_fb_mask = (int)s_mask_set;
+    s_fb_mode = mode;
 
     float mask_a = s_mask_set ? 1.0f : 0.0f;
     for (int i = 0; i < n; i++) {
@@ -2461,7 +2490,54 @@ static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
     gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1);
 }
 static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
-static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
+/* Resolve the displayed region straight out of the supersampled FBO.
+ *
+ * This used to defer to sw_render_display_hires, which cannot work here: under
+ * GL the software mirror is deliberately held at scale 1 (glb_set_scale calls
+ * sw_renderer_set_scale(1)), so that resolve always took its own
+ * "g_scale <= 1" fallback and returned a NATIVE-resolution image — while the
+ * screenshot_hires command, seeing a non-zero return, still reported scale N.
+ * The one instrument built to verify hi-res-only effects (ENHANCEMENTS.md
+ * G1.5 added it after native captures produced a wrong verdict on geometry
+ * correction) was therefore reporting exactly the native capture it was meant
+ * to replace, on the only renderer this project ships.
+ *
+ * Returning 0 when there is no hi-res surface is the honest answer: the caller
+ * falls back to the native resolve and reports scale 1. */
+static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){
+    if (!s_ctx || !s_raster_ok || !s_hr_fbo || dw <= 0 || dh <= 0) return 0;
+    const int S  = s_scale > 0 ? s_scale : 1;
+    const int rw = dw * S, rh = dh * S;
+    const int hh = VRAM_H * S;
+
+    /* Realise anything still batched, or the capture predates the frame. */
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+
+    uint8_t *rgba = (uint8_t *)malloc((size_t)rw * rh * 4u);
+    if (!rgba) return 0;
+    /* Row index in this FBO IS the VRAM row: the draw path scissors with raw
+     * VRAM y (hr_begin) and the present blit is what applies the flip on its
+     * way to the window. Reading at dy*S therefore needs no flip here — the
+     * same convention gl_present's hr sample probe already uses. */
+    (void)hh;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glReadPixels(dx * S, dy * S, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+
+    for (int row = 0; row < rh; row++) {
+        const uint8_t *src = rgba + (size_t)row * rw * 4u;
+        uint32_t *dst = (uint32_t *)((uint8_t *)o + (size_t)row * p);
+        for (int col = 0; col < rw; col++)
+            dst[col] = ((uint32_t)src[col * 4 + 0] << 16) |
+                       ((uint32_t)src[col * 4 + 1] << 8) |
+                        (uint32_t)src[col * 4 + 2];
+    }
+    free(rgba);
+    return rw * rh;
+}
 /* While GP1 depth24 is on, packed RGB888 lives in the CPU mirror and is
  * presented via gl_renderer_present — never as 1555 FBO texels. Queuing those
  * MDEC A0 rects hits UP_RECTS_MAX (16) and force-flushes mid-movie (MotK intro
@@ -2724,13 +2800,93 @@ int gl_renderer_get_scanlines(float *strength) {
     return s_scanline_on;
 }
 
+/* Integer-scale state. s_native_* is the PRESENTED source size in native PS1
+ * pixels (pre-supersampling): the current display mode's width for canonical
+ * frames, the wide compositor's full width (canonical + reveal margins) for
+ * native-wide frames. The host sets it on the CPU present paths; the FBO
+ * present paths refresh it themselves — they return before the host's setter
+ * runs, and a stale value here made the integer snap pin a 16:9 wide frame
+ * into multiples of a remembered 320x240, i.e. back into a squeezed 4:3 rect.
+ *
+ * s_present_pin43 remembers whether the LAST presented frame's rect was pinned
+ * to native 4:3 (FMV / menus under an engaged widescreen layer) rather than
+ * letterboxed at the display aspect. Guest-space overlays must map through the
+ * same rect the picture actually used, so the OSD compositor reads this
+ * instead of assuming 4:3. */
+static int s_integer_scale = 0;
+static int s_native_w = 0, s_native_h = 0;
+static int s_present_pin43 = 0;
+
+void gl_renderer_set_integer_scale(int on) { s_integer_scale = on ? 1 : 0; }
+
+void gl_renderer_set_present_native_size(int w, int h) {
+    if (w > 0 && h > 0) { s_native_w = w; s_native_h = h; }
+}
+
+void gl_renderer_get_present_native_size(int *w, int *h) {
+    if (s_native_w <= 0 || s_native_h <= 0) return;   /* nothing presented yet */
+    if (w) *w = s_native_w;
+    if (h) *h = s_native_h;
+}
+
+/* Both derive from psx_video_menu_*, the single definition shared with the
+ * software renderer, so the reserved strip always matches the bar drawn. */
+static int menu_ui_scale(int ww, int wh) {
+    return psx_video_menu_ui_scale(ww, wh);
+}
+
+/* Drawable pixels to reserve at the top of the window for the menu bar. Zero
+ * when the bar is hidden, so 4:3 output is untouched in normal play. */
+static int menu_top_inset(int ww, int wh) {
+    return psx_video_menu_bar_px(ww, wh);
+}
+
 /* Letterbox: largest num:den rect centered in the drawable. */
 static void letterbox_rect_aspect(int ww, int wh, int num, int den,
                                   int *x, int *y, int *w, int *h) {
+    /* Reserve the menu-bar strip so the picture sits BELOW the bar instead of
+     * being covered by it. Everything below fits the remaining height, so
+     * aspect and integer snapping stay correct inside the smaller area. Guard
+     * against a window shorter than the bar itself. */
+    int inset = menu_top_inset(ww, wh);
+    int avail_h = wh - inset;
+    if (avail_h < 16) { inset = 0; avail_h = wh; }
+
     int dw = ww, dh = (ww * den) / num;
-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
+    if (dh > avail_h) { dh = avail_h; dw = (avail_h * num) / den; }
+    /* Integer scaling: snap the rect to a whole multiple of the guest's native
+     * display size so every source pixel covers exactly N x N output pixels.
+     * Without this the rect fills the drawable continuously (e.g. 320x240 into
+     * an 853x640 client area = 2.67x), which straddles source pixels across
+     * output pixels and reads as blur even with nearest filtering.
+     *
+     * This snaps BOTH axes to the native size, matching the usual meaning of
+     * "integer scale". For a 4:3-native mode (320x240) the result is also
+     * aspect-correct. For a non-square mode (e.g. 256x240) the image is shown
+     * at its raw pixel aspect rather than stretched to 4:3 - the standard
+     * trade-off of pixel-exact scaling. Falls back to the continuous rect when
+     * the window is too small for even 1x. */
+    if (s_integer_scale && s_native_w > 0 && s_native_h > 0) {
+        int nx = dw / s_native_w;
+        int ny = dh / s_native_h;
+        int n  = (nx < ny) ? nx : ny;
+        if (n >= 1) {
+            dw = s_native_w * n;
+            dh = s_native_h * n;
+        }
+    }
     *x = (ww - dw) / 2;
-    *y = (wh - dh) / 2;
+    /* Centre within the area below the reserved strip, not the whole window.
+     *
+     * This y is BOTTOM-origin: every consumer feeds it straight to glViewport
+     * (present_target_quad, interp_draw_quad, the CPU-readout present), and
+     * GL's viewport origin is bottom-left. Shrinking avail_h is therefore the
+     * WHOLE of reserving the top strip - the remaining height no longer
+     * reaches the bar, so centring inside it leaves the gap at the top by
+     * construction. Adding inset here would push the picture UP by the bar's
+     * height instead, reserving the strip at the BOTTOM and sliding the
+     * picture under the very bar it was meant to clear. */
+    *y = (avail_h - dh) / 2;
     *w = dw; *h = dh;
 }
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
@@ -3071,6 +3227,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
                          int force_4_3, int content_w) {
     if (!s_ctx) return;
     interp_reset_history();
+    s_present_pin43 = force_4_3 ? 1 : 0;   /* overlay mapping follows this rect */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
@@ -3903,6 +4060,98 @@ void gl_renderer_interpolation_diag(int *enabled, int *suspended,
     if (swaps) *swaps = s_interp_swaps;
 }
 
+void gl_renderer_interp_debug(GlInterpDebug *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->enabled     = s_interp_enabled;
+    out->suspended   = s_interp_suspended;
+    out->valid       = s_interp_valid;
+    out->w           = s_interp_w;
+    out->h           = s_interp_h;
+    out->scale       = s_scale > 0 ? s_scale : 1;
+    out->src_x       = s_interp_src_x;
+    out->src_y       = s_interp_src_y;
+    out->src_w       = s_interp_src_w;
+    out->src_h       = s_interp_src_h;
+    out->source_path = s_interp_source_path;
+    out->force_4_3   = s_interp_force_4_3;
+    out->linear      = s_interp_linear;
+    out->blend_mode  = s_interp_blend_mode;
+    out->prev_idx    = s_interp_prev;
+    out->cur_idx     = s_interp_cur;
+    out->draw_blend      = s_interp_draw_blend;
+    out->draw_blend_src  = s_interp_draw_blend_src;
+    out->draw_blend_dst  = s_interp_draw_blend_dst;
+    out->state_fix       = s_interp_state_fix;
+    out->alpha_override  = s_interp_alpha_override;
+    out->captures    = s_interp_captures;
+    out->swaps       = s_interp_swaps;
+}
+
+void gl_renderer_interp_set_debug(int state_fix, double alpha_override) {
+    if (state_fix >= 0) s_interp_state_fix = state_fix ? 1 : 0;
+    if (alpha_override >= -1.0)
+        s_interp_alpha_override = alpha_override < 0.0
+            ? -1.f : (float)(alpha_override > 1.0 ? 1.0 : alpha_override);
+}
+
+/* Read one interpolation surface back as 0xAARRGGBB, `pitch` BYTES per row.
+ * which: 0 = prev history texture, 1 = current history texture, 2 = the hr FBO
+ * re-read LIVE at the rect the last capture used. Row 0 is the first VRAM row
+ * of the display band — the same top-down convention glb_render_display_hires
+ * uses, so a dump is directly comparable with screenshot_hires.
+ *
+ * ALPHA IS PRESERVED: on this path alpha is the PSX mask bit, and whether it
+ * is zero over a missing layer is exactly the question a dump has to answer.
+ *
+ * Must be called on the thread owning the main GL context (the emu thread) —
+ * the history textures are shared, but only that context writes them, so the
+ * mutex alone orders this against the presenting thread. */
+int gl_renderer_interp_readback(int which, uint32_t *out, int pitch) {
+    if (!s_ctx || !s_raster_ok || !out) return 0;
+    const int w = s_interp_w, h = s_interp_h;
+    const int S = s_scale > 0 ? s_scale : 1;
+    if (s_interp_valid < 1 || w <= 0 || h <= 0) { return 0; }
+    if (which == 1 && s_interp_valid < 1) { return 0; }
+    if (which == 0 && s_interp_valid < 2) { return 0; }
+
+    uint8_t *rgba = (uint8_t *)malloc((size_t)w * h * 4u);
+    if (!rgba) { return 0; }
+
+    if (which == 2) {
+        /* Same flush order gl_renderer_present_vram uses before capturing. */
+        flush_flat_batch();
+        flush_tex_batch();
+        flush_cpu_upload();
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(s_interp_src_x * S, s_interp_src_y * S, w, h,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    } else {
+        const int idx = which == 1 ? s_interp_cur : s_interp_prev;
+        glBindTexture(GL_TEXTURE_2D, s_interp_tex[idx]);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    for (int row = 0; row < h; row++) {
+        const uint8_t *src = rgba + (size_t)row * w * 4u;
+        uint32_t *dst = (uint32_t *)((uint8_t *)out + (size_t)row * pitch);
+        for (int col = 0; col < w; col++)
+            dst[col] = ((uint32_t)src[col * 4 + 3] << 24) |
+                       ((uint32_t)src[col * 4 + 0] << 16) |
+                       ((uint32_t)src[col * 4 + 1] << 8) |
+                        (uint32_t)src[col * 4 + 2];
+    }
+    free(rgba);
+    return w * h;
+}
+
 /* Copy a stable display image out of the mutable VRAM/wide render target.
  * Returns true when temporal blending owns this source-frame interval. */
 static int interp_capture(GLuint fbo, int x, int y, int w, int h,
@@ -3940,12 +4189,38 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
     s_interp_linear = linear;
     s_interp_force_4_3 = force_4_3;
     s_interp_source_path = source_path;
+    s_interp_src_x = x; s_interp_src_y = y;
+    s_interp_src_w = w; s_interp_src_h = h;
     s_interp_captures++;
     return 1;
 }
 
 static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh) {
     int prev = s_interp_prev, curr = s_interp_cur;
+    /* Record the inherited state BEFORE normalising it, so the diagnostic
+     * still reports a leak even while the guard is on. */
+    {
+        GLint sf = 0, df = 0;
+        s_interp_draw_blend = glIsEnabled(GL_BLEND) ? 1 : 0;
+        glGetIntegerv(GL_BLEND_SRC, &sf);
+        glGetIntegerv(GL_BLEND_DST, &df);
+        s_interp_draw_blend_src = (int)sf;
+        s_interp_draw_blend_dst = (int)df;
+    }
+    /* A blend left armed by the OSD compositor multiplies this quad by its
+     * alpha channel — which on the guest path is the PSX MASK BIT, not
+     * coverage. Every VRAM pixel with mask 0 (any plain background image)
+     * would then composite as fully transparent against the black clear,
+     * while mask-set draws survive: one layer of the frame silently
+     * disappears. Nothing in this context depends on inherited state. */
+    if (s_interp_state_fix) {
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    if (s_interp_alpha_override >= 0.f) alpha = s_interp_alpha_override;
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
@@ -4053,8 +4328,13 @@ static void interp_present_source_interval(void) {
 /* Draw one host OSD ARGB image into the default framebuffer at (vx,vy)
  * in top-left window coordinates (y down). Bitmap is ow×oh; viewport is
  * dw×dh (may upscale for HiDPI / large windows). */
-static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
-                              int dw, int dh, int vx, int vy, int ww, int wh) {
+/* blend=0: opaque overwrite (the historical behaviour every host_osd caller
+ * relies on). blend=1: straight alpha blend, for overlays that are mostly
+ * transparent and must let the game show through — a full-window menu bar
+ * drawn unblended writes its transparent pixels as opaque black. */
+static void gl_draw_osd_image_ex(const uint32_t *px, int ow, int oh,
+                                 int dw, int dh, int vx, int vy, int ww, int wh,
+                                 int blend) {
     if (!px || ow <= 0 || oh <= 0 || dw <= 0 || dh <= 0 ||
         !s_present_prog || ww <= 0 || wh <= 0)
         return;
@@ -4081,11 +4361,18 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_DEPTH_TEST);
-    /* host_osd bakes opaque panels (A=0xFF). Do not blend — PSX mode-2
-     * REVERSE_SUBTRACT left armed across FMV present made toasts solid black. */
-    glDisable(GL_BLEND);
+    /* host_osd bakes opaque panels (A=0xFF), so the default is no blending —
+     * PSX mode-2 REVERSE_SUBTRACT left armed across FMV present made toasts
+     * solid black. The equation is reset to FUNC_ADD below either way, so the
+     * blended path cannot inherit that stale state. */
     if (p_glBlendEquationSeparate)
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
+    if (blend) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
     /* GL viewport origin is bottom-left. */
     glViewport(vx, wh - vy - dh, dw, dh);
     p_glUseProgram(s_present_prog);
@@ -4102,9 +4389,110 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
         p_glBindVertexArray(0);
     }
     p_glUseProgram(0);
+    /* Leave blending OFF, which is the state every caller here assumes on
+     * entry (blend=0 disables it, and the guest draw path only ever gets away
+     * with not doing so because hr_end() disables blend every guest frame).
+     * Without this the blended menu-bar draw leaks GL_BLEND into whatever
+     * draws next in the SAME context — and the interpolation thread's context
+     * has no other reset at all, so the leak is permanent there. Its quad's
+     * alpha is the PSX MASK BIT, not coverage, so an inherited blend erases
+     * every mask-0 layer (any plain background image) and keeps the mask-set
+     * draws: one layer of the frame vanishes and the rest looks perfect. */
+    glDisable(GL_BLEND);
+}
+
+/* Opaque overwrite — the behaviour every pre-existing OSD caller expects. */
+static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+                              int dw, int dh, int vx, int vy, int ww, int wh) {
+    gl_draw_osd_image_ex(px, ow, oh, dw, dh, vx, vy, ww, wh, 0);
+}
+
+/* Refresh the menu canvas on the EMU thread, at the moment it hands the swap
+ * to the interpolation thread. That thread then only reads the finished
+ * canvas, so redraw() never runs concurrently with the state it draws. */
+static void menu_prepare_for_present(void) {
+    if (!psx_video_menu_needs_present() || !s_win) return;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    int mui = menu_ui_scale(ww, wh);
+    psx_video_menu_set_layout(ww / mui, wh / mui, mui);
+    psx_video_menu_prepare();
 }
 
 /* Composite host toast + volume bar into the default framebuffer, then swap. */
+/* ---- present capture -------------------------------------------------------
+ *
+ * `screenshot` resolves native 15-bit VRAM and `screenshot_hires` resolves the
+ * supersampled mirror, and BOTH run before anything is composited on top. So
+ * neither can see a single host overlay — not the rank meter, not the CARD
+ * DROPS tags, not an OSD toast. Verified the hard way: an osd_toast that was
+ * demonstrably on screen came back absent from a hi-res capture, which makes
+ * those two commands silently useless for the one kind of work that most needs
+ * a picture.
+ *
+ * This reads the real backbuffer, after every overlay and immediately before
+ * the swap, so the PNG is what the player is looking at. It runs on the render
+ * thread at the one moment the frame is complete, which is why it is a pending
+ * request serviced here rather than something the debug server can do itself.
+ */
+static volatile int  s_capture_pending;
+static char          s_capture_path[512];
+static volatile int  s_capture_result;   /* 1 ok, -1 failed, 0 not done */
+static int           s_capture_w, s_capture_h;
+
+int gr_request_present_capture(const char *path) {
+    if (!path || !*path) return 0;
+    if (s_capture_pending) return 0;
+    strncpy(s_capture_path, path, sizeof s_capture_path - 1);
+    s_capture_path[sizeof s_capture_path - 1] = '\0';
+    s_capture_result = 0;
+    s_capture_pending = 1;
+    /* A static screen skips presenting entirely, so without this the
+     * request would sit unserviced until something else moved. */
+    s_force_present_remaining = 8;
+    return 1;
+}
+
+int gr_present_capture_status(int *w, int *h) {
+    if (w) *w = s_capture_w;
+    if (h) *h = s_capture_h;
+    return s_capture_pending ? 0 : s_capture_result;
+}
+
+static void gl_service_present_capture(void) {
+    if (!s_capture_pending) return;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) { s_capture_result = -1; s_capture_pending = 0; return; }
+
+    uint8_t *rgb = (uint8_t *)malloc((size_t)ww * (size_t)wh * 3u);
+    if (!rgb) { s_capture_result = -1; s_capture_pending = 0; return; }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, ww, wh, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+
+    /* GL hands back bottom-up; PNG wants top-down. */
+    uint8_t *flip = (uint8_t *)malloc((size_t)ww * (size_t)wh * 3u);
+    if (!flip) { free(rgb); s_capture_result = -1; s_capture_pending = 0; return; }
+    for (int y = 0; y < wh; y++)
+        memcpy(flip + (size_t)y * (size_t)ww * 3u,
+               rgb + (size_t)(wh - 1 - y) * (size_t)ww * 3u, (size_t)ww * 3u);
+
+    FILE *f = fopen(s_capture_path, "wb");
+    int ok = 0;
+    if (f) {
+        ok = png_write_rgb(f, flip, (uint32_t)ww, (uint32_t)wh);
+        fclose(f);
+    }
+    free(flip);
+    free(rgb);
+    s_capture_w = ww;
+    s_capture_h = wh;
+    s_capture_result = ok ? 1 : -1;
+    s_capture_pending = 0;
+}
+
 static void gl_swap_with_osd(void) {
     if (s_present_prog && s_ctx) {
         int ww = 0, wh = 0;
@@ -4112,20 +4500,104 @@ static void gl_swap_with_osd(void) {
         if (ww > 0 && wh > 0) {
             const uint32_t *px = NULL;
             int ow = 0, oh = 0;
-            /* OSD authored for ~480-tall present; grow with drawable height. */
+            /* MARGINS are authored for a ~480-tall present and grow with the
+             * drawable; the OSD's own IMAGES no longer are. host_osd
+             * rasterises them at the size they will occupy (antialiased text,
+             * see host_osd.c), so they are blitted 1:1 below rather than
+             * magnified here — magnifying them now would square the scale. */
             int ui = wh / 480;
             int margin;
             if (ui < 1) ui = 1;
             if (ui > 8) ui = 8;
             margin = 8 * ui;
-            if (host_osd_image(&px, &ow, &oh) && px)
-                gl_draw_osd_image(px, ow, oh, ow * ui, oh * ui,
-                                  margin, margin, ww, wh);
+            host_osd_set_layout(ww, wh);
+            /* Guest-space overlays, back to front in registration order.
+             *
+             * Unlike every other overlay here these belong to the GAME's
+             * coordinate space, not the window's: they are authored in guest
+             * pixels so they can sit beside boxes the game draws at fixed guest
+             * coordinates. Map them through the same letterbox rect the picture
+             * uses, so they track the image under scaling, aspect and the
+             * menu-bar inset instead of drifting away from what they label.
+             *
+             * FIRST of all the overlays, because they belong to the PICTURE:
+             * everything below this point - the volume toast, the rewind bar,
+             * the save-state menu, the menu bar, the toasts - is host UI the
+             * player summoned, and host UI must never end up underneath
+             * something the game is wearing. Drawn last, a guest overlay that
+             * happens to cover the screen (a full-screen mod panel) hid the
+             * save-state menu completely: it opened, took input, and could not
+             * be seen. */
+            for (int oi = 0; oi < psx_guest_overlay_count(); oi++) {
+                const PsxGuestOverlay *ov = psx_guest_overlay_at(oi);
+                /* Re-test occlusion HERE, not where the overlay's state is
+                 * decided. That decision runs in the frame loop, so it can only
+                 * see occluders from the frame BEFORE — which means the frame
+                 * where a card view first covers the meter is drawn with it
+                 * still on, a one-frame flash. Compositing happens after all of
+                 * this frame's GPU work, so the answer here is current. */
+                if (ov->occlusion_group >= 0) {
+                    int occluded = 0;
+                    (void)gpu_sprite_watch_query(ov->occlusion_group,
+                                                 NULL, NULL, &occluded);
+                    if (occluded) continue;
+                }
+                if (!ov->image(&px, &ow, &oh) || !px) continue;
+
+                /* Map through the rect the PICTURE actually used this frame,
+                 * not an assumed 4:3: a native-wide frame presents at the
+                 * display aspect with the canonical content offset into the
+                 * wide surface's centre columns, and overlays anchored to
+                 * boxes the game drew must ride the same transform or they
+                 * drift by exactly the reveal margin (and by the aspect
+                 * difference) whenever the widescreen layer presents wide. */
+                int lx, ly, lw, lh;
+                if (s_present_pin43)
+                    letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+                else
+                    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+                if (lw <= 0 || lh <= 0) continue;
+                const int nw = (s_native_w > 0) ? s_native_w : 320;
+                const int nh = (s_native_h > 0) ? s_native_h : 240;
+                /* Guest coordinates are authored in CANONICAL space; on a wide
+                 * frame the canonical content sits g_wide_off columns into the
+                 * presented source. Recognize a wide present by its width. */
+                const int goff = (!s_present_pin43 && g_wide_w > 0 &&
+                                  nw == g_wide_w) ? g_wide_off : 0;
+                /* letterbox_rect_aspect's y is fed straight to glViewport by
+                 * present_target_quad, and GL's viewport origin is BOTTOM-left.
+                 * This overlay path is top-based (gl_draw_osd_image_ex converts
+                 * with wh - vy - dh), so the picture's top in THIS space is
+                 * wh - ly - lh, not ly. Using ly directly put the meter out by
+                 * exactly the menu-bar inset — about 11 guest pixels once
+                 * divided by the magnification, and a different number of guest
+                 * pixels on each display, which is why no single tuned offset
+                 * could ever line it up everywhere. */
+                const int ly_top = wh - ly - lh;
+                int gx = 0, gy = 0;
+                ov->origin(&gx, &gy);
+                const int sub = ov->subpixel_y ? ov->subpixel_y() : 0;
+                const int dx = lx + ((gx + goff) * lw) / nw;
+                const int dy = ly_top + (gy * lh) / nh + (sub * lh) / (2 * nh);
+                int dw = (ow * lw) / nw;
+                int dh = (oh * lh) / nh;
+                if (dw < 1) dw = 1;
+                if (dh < 1) dh = 1;
+                /* Publish the mapping so alignment against the game's own art
+                 * can be checked exactly, instead of being eyeballed out of a
+                 * screenshot full of other pale UI. */
+                if (ov->placed) {
+                    const int o[10] = { lx, ly_top, lw, lh, nw, nh,
+                                        dx, dy, dw, dh };
+                    ov->placed(o);
+                }
+                gl_draw_osd_image_ex(px, ow, oh, dw, dh, dx, dy, ww, wh, 1);
+            }
             if (host_osd_volume_image(&px, &ow, &oh) && px) {
-                const int dw = ow * ui, dh = oh * ui;
-                int vx = (ww > dw + margin) ? (ww - dw - margin) : margin;
-                int vy = (wh > dh) ? ((wh - dh) / 2) : margin;
-                gl_draw_osd_image(px, ow, oh, dw, dh, vx, vy, ww, wh);
+                int vx = (ww > ow + margin) ? (ww - ow - margin) : margin;
+                int vy = (wh > oh) ? ((wh - oh) / 2) : margin;
+                /* Opaque, so the plain overwrite still applies. */
+                gl_draw_osd_image(px, ow, oh, ow, oh, vx, vy, ww, wh);
             }
             if (psx_rewind_overlay_image(&px, &ow, &oh) && px) {
                 float slide = psx_rewind_slide();
@@ -4136,8 +4608,48 @@ static void gl_swap_with_osd(void) {
                 vy = wh - (int)((float)dh * slide + 0.5f);
                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
             }
+            /* The slot browser sizes its canvas to the window now, so this
+             * stretch is 1:1 unless its allocation fell back to the smaller
+             * static buffer — in which case stretching is exactly the old
+             * behaviour and still the right thing to do. */
+            psx_savestate_menu_set_layout(ww, wh);
             if (psx_savestate_menu_overlay_image(&px, &ow, &oh) && px)
                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+
+            /* Menu bar last: it is the topmost UI layer. Blended, because the
+             * canvas is transparent everywhere the bar/dropdown does not cover
+             * and the game must remain visible underneath.
+             *
+             * Draw at an INTEGER magnification of a logical canvas sized to the
+             * window, rather than stretching one fixed canvas across it: an
+             * 8x8 bitmap font stretched by a fractional factor gets visibly
+             * uneven stems. mui starts from the same wh/480 rule the toasts use
+             * and is raised until the logical size fits the menu's canvas cap. */
+            if (psx_video_menu_needs_present()) {
+                int mui = menu_ui_scale(ww, wh);
+                /* set_layout and the redraw inside _overlay_image both MUTATE
+                 * menu state, so neither may run on the presentation thread
+                 * while the emu thread owns that state. There, read the canvas
+                 * the emu thread already prepared (menu_prepare_for_present). */
+                    psx_video_menu_set_layout(ww / mui, wh / mui, mui);
+                    if (psx_video_menu_overlay_image(&px, &ow, &oh) && px)
+                        gl_draw_osd_image_ex(px, ow, oh, ow * mui, oh * mui,
+                                             0, 0, ww, wh, 1);
+            }
+            /* Toasts ABOVE the menu, and inset below the bar.
+             *
+             * Above, because every option a toast reports can only be changed
+             * from an open dropdown — drawn underneath, the message would be
+             * covered by the very panel that triggered it. Inset, because
+             * top-left is exactly where the bar itself sits. */
+            if (host_osd_image(&px, &ow, &oh) && px) {
+                const int bar = psx_video_menu_bar_px(ww, wh);
+                /* BLENDED, unlike the volume bar beside it: the toast is a
+                 * rounded translucent pill now, and an opaque overwrite would
+                 * stamp its transparent corners onto the frame as black. */
+                gl_draw_osd_image_ex(px, ow, oh, ow, oh,
+                                     margin, bar + margin, ww, wh, 1);
+            }
         }
     }
     host_osd_present_done();
@@ -4177,6 +4689,7 @@ static void gl_swap_with_osd(void) {
             present_shot_done(wrote);
         }
     }
+    gl_service_present_capture();
     SDL_GL_SwapWindow(s_win);
 }
 
@@ -4336,12 +4849,13 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
+    menu_prepare_for_present();
     if (s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_VRAM &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
         !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1) &&
-        !host_osd_needs_present() &&
+        !host_osd_needs_present() && !psx_guest_overlay_any_needs_present() &&
         !psx_present_vsync_owns_cadence() &&
         !gl_renderer_interpolation_owns_cadence()) {
         s_probe_skip++;
@@ -4350,6 +4864,11 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         return;
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
+    /* This path returns before the host's per-frame native-size setter runs,
+     * so refresh it here or the integer snap (and the guest-overlay mapping in
+     * gl_swap_with_osd) works from whatever the last CPU-path frame left. */
+    s_native_w = w; s_native_h = h;
+    s_present_pin43 = force_4_3 ? 1 : 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
@@ -4447,12 +4966,13 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
+    menu_prepare_for_present();
     if (s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
         !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1) &&
-        !host_osd_needs_present() &&
+        !host_osd_needs_present() && !psx_guest_overlay_any_needs_present() &&
         !psx_present_vsync_owns_cadence() &&
         !gl_renderer_interpolation_owns_cadence()) {
         s_probe_skip++;
@@ -4461,6 +4981,12 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         return 1;
     }
     gl_perf_present_enter();
+    /* The presented source is the WIDE surface: canonical width + both reveal
+     * margins. Feed that to the integer snap / overlay mapping, not the
+     * canonical display width — snapping a 16:9 frame to multiples of 320x240
+     * is exactly the "widescreen looks 4:3 under integer scaling" bug. */
+    s_native_w = g_wide_w; s_native_h = disp_h;
+    s_present_pin43 = 0;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
