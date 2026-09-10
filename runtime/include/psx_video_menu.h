@@ -1,0 +1,390 @@
+#ifndef PSX_VIDEO_MENU_H
+#define PSX_VIDEO_MENU_H
+
+/* Top menu bar (FILE / VIDEO / GAME) toggled by a hotkey, drawn as an ARGB
+ * overlay in the same style as the save-state menu. Owns the presentation
+ * options the player can change live, plus the modded gameplay constants.
+ *
+ * The module is pure UI + state: it never touches SDL or GL itself. The host
+ * polls psx_video_menu_take_change() once a frame and applies whatever moved,
+ * which keeps the renderer/window plumbing in main.cpp where it already lives. */
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+enum { PSX_VM_SCALING_FILL = 0, PSX_VM_SCALING_INTEGER = 1 };
+enum { PSX_VM_FILTER_NEAREST = 0, PSX_VM_FILTER_LINEAR = 1 };
+enum { PSX_VM_SCREEN_WINDOWED = 0, PSX_VM_SCREEN_BORDERLESS = 1,
+       PSX_VM_SCREEN_EXCLUSIVE = 2 };
+/* Cycle order, deliberately worst-lag first. Mapped to an SDL swap interval by
+ * the host: OFF -> 0, ON -> 1, ADAPTIVE -> -1. */
+enum { PSX_VM_VSYNC_OFF = 0, PSX_VM_VSYNC_ON = 1, PSX_VM_VSYNC_ADAPTIVE = 2 };
+
+typedef struct PsxVideoMenuState {
+    int scaling;         /* PSX_VM_SCALING_*  — present rect snapping */
+    int filter;          /* PSX_VM_FILTER_*   — final present filter  */
+    int texture_filter;  /* PSX_VM_FILTER_*   — in-game texture filter */
+    int screen;          /* PSX_VM_SCREEN_*   */
+    /* Windowed zoom, PSX_VM_WINDOWED_SCALE_MIN..MAX. The window is resized
+     * so the picture lands at exactly this many whole pixels per guest
+     * pixel. Inert unless SCREEN is WINDOWED and SCALING is INTEGER: at
+     * FILL the picture stretches to whatever the window is, so a zoom
+     * factor has nothing to mean, and fullscreen has no window to size. */
+    int windowed_scale;
+    /* PSX_VM_VSYNC_* — cycle index, NOT the SDL swap interval. The host maps
+     * it to 0 / 1 / -1 so the menu order reads worst-lag -> best-lag. */
+    int vsync;
+    /* Internal render scale, 1..PSX_VM_SUPERSAMPLING_MAX. Unlike every other
+     * row here this one canNOT be applied live: the GL backend fixes its scale
+     * when the context comes up (the hi-res texture, scratch texture, depth /
+     * stencil renderbuffer, both FBOs and the wide surfaces are all sized from
+     * it), and nothing in the renderer can resize that set. The menu therefore
+     * persists the choice and it takes effect on the next launch — which the
+     * row's hint says out loud, because a control that silently does nothing
+     * until restart is worse than no control. */
+    int supersampling;
+    int speed;           /* emulation speed multiplier, 1..16 (1 = normal) */
+    /* PSX_VM_LOADS_* — how hard to accelerate disc loads. Drives the emulated
+     * drive's sector delay ONLY, never host pacing: host pacing speeds the
+     * whole machine up while a load is detected, which also speeds the sound
+     * driver, and this title's music tempo rides on that. Shortening the
+     * sector delay instead leaves the game running at normal speed. */
+    int fast_loads;
+    /* Audio buses, 0..100. MASTER scales everything the SPU emits; MUSIC and
+     * SOUND are the split buses (see spu_set_bus_gains). 100/100/100 leaves
+     * the mix bit-for-bit unchanged. */
+    int vol_master;
+    int vol_music;
+    int vol_sound;
+    /* 1 = let the speed governor ease GAME > SPEED down when the machine
+     * stops sustaining the requested cadence, which is what keeps the SPU at
+     * 44.1 kHz (see psx_speed_governor_tick). OFF by default: easing is a
+     * visible speed change the player did not ask for, and on a machine that
+     * can hold the speed it never fires anyway. Turn it on to trade a dip in
+     * speed for clean audio in the heaviest scenes. */
+    int speed_governor;
+    /* 1 = ask GitHub for a newer release on launch and prompt if there is
+     * one. Lives here purely so it persists in menu_settings.ini with the
+     * player's other choices; it is not a video option and has no row.
+     * Set update_check=0 in that file to stop the check entirely - no
+     * request is made at all, not merely a suppressed prompt. */
+    int update_check;
+    /* 0 software, 1 opengl, 2 vulkan. Read from menu_settings.ini at startup
+     * and applied before the window exists; --renderer on the command line
+     * still wins. There is deliberately NO menu row for this.
+     *
+     * It is a file-only control because it cannot be applied live — the
+     * backend is chosen when the window and context come up — so a row would
+     * be one of those controls that silently does nothing until restart.
+     * (Vulkan not compositing this menu used to be the second reason, and the
+     * sharper one: picking it from the menu made the menu itself disappear,
+     * with no way back except editing this file. vk_overlay_pass fixed that,
+     * so only the restart-only argument still stands.)
+     *
+     * -1 means "not present in the file": leave whatever game.toml chose. */
+    int renderer;
+} PsxVideoMenuState;
+
+/* menu_settings.ini `renderer` values. */
+enum { PSX_VM_RENDERER_UNSET = -1, PSX_VM_RENDERER_SOFTWARE = 0,
+       PSX_VM_RENDERER_OPENGL = 1, PSX_VM_RENDERER_VULKAN = 2 };
+
+#define PSX_VM_SPEED_DEFAULT 1
+/* 4, not 16. Speed is now audio-preserving (the pacer and the guest VBlank
+ * period scale together — see psx_set_game_speed), which holds the SPU at
+ * exactly 44.1 kHz as long as the machine can actually reach the requested
+ * frame cadence. Measured ceiling, Yu-Gi-Oh! FM in a duel, 6 s windows:
+ *
+ *   speed 4   240 VBlank/s requested, 240.8 achieved (100%)  SPU 100%, 0 underruns
+ *   speed 5   300 requested,          187.5 achieved ( 62%)  SPU  89%, 29098 underruns
+ *
+ * Past ~240 guest frames/s the emulated GPU cannot keep up (the guest submits
+ * N times the draw commands and the host presents N times per second; guest
+ * CPU cycles/s are constant by construction). The guest then falls behind real
+ * time, the SPU produces fewer samples than the sink consumes, and the audio
+ * breaks up. A ceiling nobody can reach cleanly is not a feature, so the row
+ * stops where the audio still holds. Raising it needs the present path
+ * decoupled from the VBlank rate (present every Nth frame), not a bigger
+ * number here. */
+#define PSX_VM_SPEED_MAX 4
+/* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
+#define PSX_VM_SUPERSAMPLING_MAX 4
+/* Windowed zoom bounds. 3x is the default because 1x is unreadably small on
+ * a modern panel, and 3x still fits a 1080p desktop with room for the title
+ * bar (960x720 plus the menu strip). */
+#define PSX_VM_WINDOWED_SCALE_MIN 1
+#define PSX_VM_WINDOWED_SCALE_MAX 8
+#define PSX_VM_WINDOWED_SCALE_DEFAULT 3
+
+/* Disc-load acceleration levels. OFF is the authentic 1x drive. FAST divides
+ * the sector delay; INSTANT selects cdrom.c's bounded instant scheduler. Both
+ * change WHEN the game receives CD interrupts, which is the risk the built-in
+ * CD Speed mod warns about — hence a small ladder the player can back down,
+ * not a single all-or-nothing switch. */
+enum { PSX_VM_LOADS_OFF = 0, PSX_VM_LOADS_FAST = 1, PSX_VM_LOADS_INSTANT = 2 };
+
+/* Seed the menu with the values the runtime booted with. */
+void psx_video_menu_init(const PsxVideoMenuState *initial);
+
+/* Settings file (plain key=value) kept beside the executable. _load fills *out
+ * with whatever the file specified, leaving untouched fields alone, and returns
+ * 1 when the file was read. Call it BEFORE psx_video_menu_init so the stored
+ * values become the seed. _save writes the current state; returns 1 on success. */
+int  psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out);
+int  psx_video_menu_settings_save(const char *path);
+
+/* Hand every value restored from the settings file to the row that owns it.
+ * Loading only puts the number back in the MENU; the module behind a row
+ * hears about values through its change callback, which a restore does not
+ * fire. Call once the guest is up -- these callbacks touch it. */
+void psx_video_menu_apply_restored(void);
+
+/* Reflect a change made outside the menu (e.g. the fullscreen hotkey) so the
+ * menu never shows a stale value. Does not raise a change event. */
+void psx_video_menu_sync_screen(int screen);
+void psx_video_menu_sync_fast_loads(int level);
+
+/* Two independent pieces of state:
+ *   VISIBLE  — the bar is drawn. It does NOT take input from the game, so you
+ *              can play with it on screen. Only F10 / VIEW > MENU BAR hides it.
+ *   EXPANDED — a dropdown is open. THIS captures the keyboard/pad, so the guest
+ *              sees an idle pad. Clicking into the game collapses the dropdown
+ *              but leaves the bar visible.
+ * psx_video_menu_is_open() means "expanded", i.e. input is captured — that is
+ * the question every input path needs answered. */
+int  psx_video_menu_is_open(void);
+int  psx_video_menu_is_visible(void);
+
+void psx_video_menu_toggle(void);    /* show+expand, or hide entirely */
+void psx_video_menu_hide(void);      /* bar off */
+void psx_video_menu_collapse(void);  /* close the dropdown, keep the bar */
+void psx_video_menu_close(void);     /* alias of collapse (legacy callers) */
+
+/* Renderer tells the menu how big its canvas should be, in pixels, and the
+ * whole-number factor it will be magnified by. That factor is 1 for every
+ * window up to the module's canvas cap: text is rasterised from a real
+ * typeface at the size it will be shown at, so the canvas is authored at
+ * window resolution and a bigger display gets more detail. Magnification
+ * returns only past the cap (see psx_video_menu_ui_scale), where it keeps the
+ * bar full width instead of running out of canvas. */
+void psx_video_menu_set_layout(int logical_w, int logical_h, int ui_scale);
+
+/* Mouse input, in WINDOW pixels (the module divides by ui_scale itself).
+ * _click returns 1 when the click landed on the menu and was consumed. */
+void psx_video_menu_mouse_move(int win_x, int win_y);
+int  psx_video_menu_mouse_click(int win_x, int win_y);
+/* Ends a slider drag. Must be called on mouse-button-up, or a drag started on
+ * a volume track would keep following the pointer after the button is let go. */
+void psx_video_menu_mouse_release(void);
+
+/* Pointer left the window: cancels the hover-to-open dwell and clears the
+ * hover highlight, so a menu never opens itself after the mouse has gone. */
+void psx_video_menu_mouse_leave(void);
+/* The window came or went (first show, minimize, restore, focus change):
+ * collapse, cancel the dwell, and hold hover-to-open until the pointer has
+ * been seen somewhere off the bar. */
+void psx_video_menu_quiet(void);
+
+/* Feed the module a millisecond clock once per frame. Drives hover-to-open:
+ * resting on a title opens its dropdown after a short dwell. The module keeps
+ * no clock of its own, so without this call hover-to-open simply never fires
+ * (everything else still works). */
+void psx_video_menu_tick(unsigned int now_ms);
+
+/* Returns 1 when the key was consumed by the menu (host must not forward it
+ * to the guest). key is an SDL_Keycode; passed as int to keep SDL out of this
+ * header. */
+int  psx_video_menu_handle_key(int key);
+
+/* 1 + fills *out when any option changed since the previous call. */
+int  psx_video_menu_take_change(PsxVideoMenuState *out);
+
+/* 1 exactly once after the player picks FILE > QUIT. */
+int  psx_video_menu_take_quit(void);
+
+/* 1 exactly once after the player picks GAME > SAVE / LOAD STATE. The host
+ * opens its save-state slot overlay; this module owns no part of that and only
+ * reports the request, the same way it does for QUIT. The dropdown has already
+ * collapsed by the time this returns 1, so the overlay is free to take the
+ * keyboard and pad without two menus contending for input. */
+int  psx_video_menu_take_savestate(void);
+
+/* 1 exactly once after the player picks GAME > REWIND. Same hands-off contract
+ * as QUIT and SAVE / LOAD STATE: this module knows nothing about rewind, it
+ * only reports that the row was chosen. The host decides whether rewind can
+ * actually open (it is unavailable during netplay, and off entirely when the
+ * snapshot depth is zero) and says so if not. */
+int  psx_video_menu_take_rewind(void);
+
+/* 1 exactly once after the player picks FILE > CHANGE GAME DISC. Same
+ * hands-off contract as the rows above: this module knows nothing about discs
+ * or file pickers and only reports that the row was chosen. The host opens its
+ * own picker, runs the same identity check the launch path runs, and stores
+ * the answer. The dropdown has already collapsed by the time this returns 1,
+ * so the modal dialog does not come back to a menu still holding the
+ * keyboard. */
+int  psx_video_menu_take_pick_disc(void);
+
+/* ---- per-title menu extension --------------------------------------------
+ *
+ * The framework owns the menus every title has: FILE, VIEW, VIDEO, AUDIO,
+ * GAME, and an empty MODS for mods to fill. Anything specific to one game --
+ * its cheats, its overlays, its own toggles -- is registered here at startup
+ * instead of being written into this module, so the shared menu carries no
+ * game-specific text and the next title inherits the mechanism rather than
+ * the content.
+ *
+ * Register from a PSX_MOD_CONSTRUCTOR (see mod_plugins.h), before
+ * psx_video_menu_init(). Registered rows appear after a menu's built-in rows,
+ * in registration order.
+ *
+ * `settings_key` names the row in menu_settings.ini; pass NULL for a value
+ * that must NOT persist -- a live cheat written straight into guest RAM would
+ * clobber the player's real save if it were re-applied at startup.
+ *
+ * All strings must outlive the process: string literals, not stack buffers.
+ */
+enum { PSX_VM_ROW_OPTION = 0, PSX_VM_ROW_NUMBER = 1, PSX_VM_ROW_ACTION = 2 };
+
+/* Built-in menus a title may add rows to. */
+enum { PSX_VM_MENU_VIEW = 1, PSX_VM_MENU_GAME = 4,
+       PSX_VM_MENU_CHEATS = 5, PSX_VM_MENU_MODS = 6 };
+
+/* A new top-level menu. Returns its id, or -1 when full. */
+int psx_video_menu_add_menu(const char *title);
+
+/* Cycling option. `choices[value]` is shown. Returns a row handle, or -1. */
+int psx_video_menu_add_option(int menu, const char *label, const char *hint,
+                              const char *const *choices, int choice_count,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int value));
+
+/* Integer row. `slider` draws a drag track instead of type-only entry. */
+int psx_video_menu_add_number(int menu, const char *label, const char *hint,
+                              int lo, int hi, int slider,
+                              const char *settings_key, int initial,
+                              void (*on_change)(int value));
+
+/* Fires a callback when chosen; holds no value. */
+int psx_video_menu_add_action(int menu, const char *label, const char *hint,
+                              void (*on_activate)(void));
+
+/* Read back / drive a registered row by its handle. Setting a value fires the
+ * row's on_change, so a caller that changed the underlying thing itself
+ * should not call this. */
+/* Optional per-choice hints for an option row: hints[value] is shown instead
+ * of the row's single hint. The array must hold choice_count entries and
+ * outlive the process. Without it the row keeps one fixed hint. */
+void psx_video_menu_set_row_hints(int row_handle, const char *const *hints);
+
+/* Optional notch on a slider row's track, at `value`. Use it to mark a stock
+ * value so it stays findable by eye after dragging. -1 (the default) = none. */
+void psx_video_menu_set_row_mark(int row_handle, int value);
+
+/* 1 while psx_video_menu_apply_restored() is replaying stored values. A row
+ * callback that shows a toast should skip it when this is set: the player
+ * did not touch the row, the settings file did. */
+int  psx_video_menu_is_restoring(void);
+
+int  psx_video_menu_get_row(int row_handle);
+void psx_video_menu_set_row(int row_handle, int value);
+
+/* Display order within a menu: rows sort by this, then by registration.
+ * Default 0. A row that must stay at the bottom of its menu whatever
+ * registers after it (constructor order is link order) asks for a high
+ * value. */
+void psx_video_menu_set_row_order(int row_handle, int order);
+
+/* Walk the registered rows: handles are 0..count-1. settings_key is NULL for
+ * a row that does not persist. A title that bundles its settings into a
+ * share file reads and drives rows through this and psx_video_menu_get_row /
+ * _set_row, then calls psx_video_menu_note_change so the host writes
+ * menu_settings.ini the way it does after a click. */
+int  psx_video_menu_row_count(void);
+int  psx_video_menu_row_info(int row_handle, int *menu, int *kind,
+                             const char **settings_key, const char **label);
+void psx_video_menu_note_change(void);
+/* Put a row back to the value it registered with (its mod's default), firing
+ * on_change like a click. 1 when it changed. */
+int  psx_video_menu_reset_row(int row_handle);
+/* The registered rows of one menu in DISPLAY order (after its built-in
+ * rows): nth = 0.. until it returns 0. What a test reads to check an order. */
+int  psx_video_menu_menu_row_label(int menu, int nth, const char **label);
+
+/* Bar height in DESIGN UNITS: a 480-tall screen's worth. The menu lays itself
+ * out in these and scales them by the canvas height, so this is a PROPORTION,
+ * not a pixel count, and multiplying it by the ui scale no longer gives
+ * drawable pixels — use psx_video_menu_bar_h_px for that. It stays exported
+ * because psx_savestate_menu.c authors its own panel on a 640x480 canvas, the
+ * same reference, and needs to know how much of it the bar covers. */
+int  psx_video_menu_bar_height(void);
+
+/* Canonical whole-number magnification for a given drawable size, and the
+ * bar's height in those drawable pixels. Defined HERE, not in a renderer, so
+ * every backend reserves exactly the strip that gets drawn — two copies of
+ * this formula would drift the moment either changed.
+ *
+ * _bar_h_px always reports the strip; _bar_px reports 0 while the bar is
+ * hidden. Reserve space with the former (the letterbox is sized once, so F10
+ * uncovers the strip instead of rescaling the picture) and composite with the
+ * latter. */
+int  psx_video_menu_ui_scale(int drawable_w, int drawable_h);
+int  psx_video_menu_bar_h_px(int drawable_w, int drawable_h);
+int  psx_video_menu_bar_px(int drawable_w, int drawable_h);
+
+int  psx_video_menu_needs_present(void);
+
+/* Overlay pixels, split by which thread is asking.
+ *
+ * The reported height is only the rows that carry anything -- the canvas is as
+ * wide as the window, and both backends re-upload every reported row each
+ * presented frame, so handing back the whole buffer would spend megabytes a
+ * frame on transparent pixels. The image always starts at the TOP-LEFT of the
+ * window, so a renderer draws it at (0,0) scaled by ui_scale and must NOT
+ * stretch it to the full window height.
+ *
+ * _overlay_image redraws when dirty and must therefore only be called from the
+ * thread that owns this module's state (the emu thread). The frame-
+ * interpolation presenter runs on a SECOND thread, so it uses the _ro variant
+ * and the emu thread calls _prepare once per frame before handing over the
+ * swap. Both are no-ops when the bar is hidden. */
+void psx_video_menu_prepare(void);
+int  psx_video_menu_overlay_image_ro(const uint32_t **pixels, int *w, int *h);
+int  psx_video_menu_overlay_image(const uint32_t **pixels, int *w, int *h);
+
+/* Read-only snapshot of the menu's internal state, for the TCP debug server.
+ * Without this the only way to ask "is the dropdown actually open?" is to
+ * inspect presented pixels, which cannot tell an open dropdown from a hover
+ * highlight and cannot see the state at all when the overlay fails to draw. */
+typedef struct PsxVideoMenuDebug {
+    int visible;      /* bar drawn */
+    int expanded;     /* dropdown open (captures input) */
+    int menu;         /* selected top-level menu index */
+    int item;         /* selected row within that menu */
+    int hover_menu;   /* -1 when the cursor is off the titles */
+    int hover_row;
+    int editing;      /* inline numeric entry active */
+    int dirty;        /* canvas needs re-rendering */
+    int logical_w, logical_h, ui_scale;
+    int rows;         /* rows in the selected menu */
+    int vol_master, vol_music, vol_sound;   /* audio buses, 0..100 */
+    int speed_governor;    /* AUDIO > AUTO SLOW FOR AUDIO, 0 off 1 on */
+    /* The menu's OWN copy of the stored choices. Compare against the values
+     * the subsystems actually hold (e.g. fast_loads vs cdrom game_divisor) to
+     * tell "the ini never reached the menu" apart from "the menu has it but
+     * the subsystem does not". */
+    int fast_loads;        /* 0 authentic, 1 fast, 2 instant */
+    int speed;             /* emulation speed multiplier */
+    int supersampling;     /* internal render scale */
+} PsxVideoMenuDebug;
+
+void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PSX_VIDEO_MENU_H */

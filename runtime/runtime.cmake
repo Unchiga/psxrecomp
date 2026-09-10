@@ -341,6 +341,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
+    ${PSXRECOMP_ROOT}/runtime/src/debug_cmds_hardware.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_trace_ranges.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
@@ -359,7 +360,18 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/bios_hle.c
     ${PSXRECOMP_ROOT}/runtime/src/bios_hle_plan.c
     ${PSXRECOMP_ROOT}/runtime/src/savestate.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_host.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_game_hooks.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_debug_commands.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_guest_overlay.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ui_font.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_ui_draw.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_input_config.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/psx_host_audio.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_post_load_probe.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_perf.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c
@@ -411,6 +423,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_bios_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_netplay.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_lobby_client.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_update_check.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
     ${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp
     # (sljit Tier-2 in-process JIT backend removed 2026-07-15 — was disabled by
@@ -430,6 +443,13 @@ option(PSX_NETPLAY "Link recomp-net delay-sync (opt-in; needs recomp-net)" OFF)
 # titles that have not tested the self-build flow do not advertise it. Opt in
 # with -DPSX_SETUP_WIZARD=ON (or ENABLE_SETUP_WIZARD on psxrecomp_add_game_runtime
 # after setting the cache before include, same pattern as PSX_NETPLAY).
+# Compile the setup host (disc -> generate -> rebuild -> relaunch) for a build
+# that has no recomp-ui. The engine never needed the launcher; only three
+# symbols did, and psxrecomp_launcher_compat.h supplies them. A title turning
+# this on drives the flow from its own first-run path instead of the wizard.
+option(PSX_SETUP_HOST
+    "Compile the setup host for launcher-less first-run generate + rebuild" OFF)
+
 option(PSX_SETUP_WIZARD
     "Advertise first-run setup wizard + Generate & rebuild in recomp-ui" OFF)
 set(RECOMP_NET_ROOT "" CACHE PATH "Path to recomp-net; empty = auto-discover")
@@ -1206,6 +1226,7 @@ function(psxrecomp_add_runtime_target target)
         LAUNCHER_BRAND
         EXE_NAME
         GAME_VERSION
+        UPDATE_REPO
         MAX_PLAYERS
         APP_ICON
         # The title's own mod catalog source directory -- the one shaped like
@@ -1455,6 +1476,54 @@ function(psxrecomp_add_runtime_target target)
             set(PSXRT_APP_ICON "${PSXRECOMP_ROOT}/assets/psxrecomp.ico")
         endif()
     endif()
+    # --- Windows: UTF-8 as the process ANSI code page ------------------------
+    # The runtime carries its paths as UTF-8 (SDL hands them over that way, and
+    # std::filesystem on MinGW assumes it) but opens files through the narrow C
+    # runtime and the "A" Win32 APIs, which decode in the user's ANSI page. On
+    # a US install the two agree on every character a path is likely to hold;
+    # on a Brazilian, Spanish, German... install they agree on ASCII only, and
+    # a game folder or user name with an accent (C:\Users\Usuário\...) makes
+    # game_options.toml unreadable, generate fail, or the host crash at boot.
+    # Rather than audit every fopen, declare activeCodePage=UTF-8 in the app
+    # manifest (Windows 10 1903+): the whole process then agrees on UTF-8. The
+    # codegen host's batch writers convert from CP_ACP, so they follow along.
+    # Kept out of the APP_ICON block so a title with no icon still gets it.
+    if(WIN32)
+        enable_language(RC)
+        if(NOT CMAKE_RC_COMPILER)
+            find_program(CMAKE_RC_COMPILER
+                NAMES llvm-rc llvm-windres windres
+                HINTS
+                    "$ENV{RETCOMM_TOOLCHAIN}/bin"
+                    "$ENV{CMAKE_CLANG_V1}/bin"
+                DOC "Windows resource compiler for the app manifest / icon")
+        endif()
+        if(CMAKE_RC_COMPILER)
+            set(_psxrt_manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8.manifest")
+            file(WRITE "${_psxrt_manifest}"
+"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">
+  <assemblyIdentity type=\"win32\" name=\"psxrecomp.${target}\" version=\"1.0.0.0\"/>
+  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">
+    <windowsSettings>
+      <activeCodePage xmlns=\"http://schemas.microsoft.com/SMI/2019/WindowsSettings\">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
+")
+            string(REPLACE "\\" "/" _psxrt_manifest_fwd "${_psxrt_manifest}")
+            set(_psxrt_manifest_rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_utf8_manifest.rc")
+            # 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST. Numeric
+            # so windres and llvm-rc both take it without a winuser.h include.
+            file(WRITE "${_psxrt_manifest_rc}" "1 24 \"${_psxrt_manifest_fwd}\"\n")
+            target_sources(${target} PRIVATE "${_psxrt_manifest_rc}")
+            message(STATUS "psxrecomp ${target}: app manifest activeCodePage=UTF-8 (RC=${CMAKE_RC_COMPILER})")
+        else()
+            message(WARNING
+                "psxrecomp ${target}: no RC compiler (llvm-rc/windres) — no UTF-8 "
+                "manifest; paths with non-ASCII characters will not work")
+        endif()
+    endif()
     if(PSXRT_APP_ICON AND EXISTS "${PSXRT_APP_ICON}")
         if(WIN32)
             # clang/llvm-mingw CI needs an RC compiler or the .rc is ignored and
@@ -1682,6 +1751,22 @@ function(psxrecomp_add_runtime_target target)
         "${PSXRECOMP_ROOT}/runtime/src/psx_lobby_client.c"
         PROPERTIES COMPILE_DEFINITIONS "PSX_GAME_VERSION=\"${PSXRT_GAME_VERSION}\""
     )
+    # The update check needs the same version string, plus the repo to ask
+    # about. With no UPDATE_REPO the module compiles to a no-op and the
+    # build makes no network access at all.
+    if(PSXRT_UPDATE_REPO)
+        set_source_files_properties(
+            "${PSXRECOMP_ROOT}/runtime/src/psx_update_check.c"
+            PROPERTIES COMPILE_DEFINITIONS
+            "PSX_GAME_VERSION=\"${PSXRT_GAME_VERSION}\";PSX_UPDATE_REPO=\"${PSXRT_UPDATE_REPO}\""
+        )
+    endif()
+    # WinHTTP: the update check's transport, and the setup host's last-resort
+    # toolchain download (psxrecomp_codegen_host.c, no curl.exe / PowerShell).
+    # Elsewhere both bodies are #ifdef'd out, so there is nothing to link.
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE winhttp)
+    endif()
     set_source_files_properties(
         "${PSXRECOMP_ROOT}/runtime/src/crash_trace.c"
         PROPERTIES COMPILE_DEFINITIONS "PSX_BUILD_REV=\"${PSX_GIT_REV}\""
@@ -1759,6 +1844,31 @@ function(psxrecomp_add_runtime_target target)
                 "${PSXRECOMP_BUNDLED_BIOS_SOURCE}"
                 "${PSXRECOMP_BUNDLED_BIOS_LICENSE}")
         endif()
+
+    # UI font notices. Inter (SIL OFL 1.1) and Material Symbols (Apache 2.0)
+    # are COMPILED INTO the binary as subset C arrays -- there is no font file
+    # for a player to find -- so both licences have to ride alongside the
+    # executable the same way the BIOS notice does, or the build ships
+    # redistributable fonts with nothing saying so. FATAL rather than a warning:
+    # a missing notice is a licence problem, not a cosmetic one, and it is
+    # exactly the kind of thing that goes unnoticed until a release is out.
+    set(_psxrt_font_licenses
+        "${PSXRECOMP_ROOT}/runtime/third_party/fonts/Inter-OFL.txt"
+        "${PSXRECOMP_ROOT}/runtime/third_party/fonts/MaterialSymbols-LICENSE.txt")
+    foreach(_lic IN LISTS _psxrt_font_licenses)
+        if(NOT EXISTS "${_lic}")
+            message(FATAL_ERROR "UI font licence notice is missing: ${_lic}")
+        endif()
+        get_filename_component(_lic_name "${_lic}" NAME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:${target}>/licenses"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_lic}" "$<TARGET_FILE_DIR:${target}>/licenses/${_lic_name}"
+            COMMENT "Staging UI font notice ${_lic_name}"
+            VERBATIM)
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${_lic}")
+    endforeach()
 
     # Mod catalog: the framework's builtin packages AND the title's own, both
     # staged into mods/bundled by _psxrt_stage_mod_catalog (see its header).
@@ -1843,6 +1953,12 @@ function(psxrecomp_add_runtime_target target)
     if(PSX_SETUP_WIZARD)
         target_compile_definitions(${target} PRIVATE PSX_HAS_SETUP_WIZARD=1)
     endif()
+    # Launcher-less first run. Distinct from PSX_HAS_GAME_CODEGEN, which every
+    # game runtime defines: this says the title supplies the codegen_setup
+    # entry points AND wants the runtime to drive them itself.
+    if(PSX_SETUP_HOST)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_SETUP_HOST=1)
+    endif()
 
     # First-divergence co-sim oracle (COSIM_ORACLE.md): the clean, deterministic build.
     # PSX_COSIM activates the cosim engine/hooks; PSX_NO_DEBUG_TOOLS strips ALL the laggy
@@ -1907,6 +2023,8 @@ function(psxrecomp_add_runtime_target target)
                 "entry) to pick up the ON default.")
         endif()
         set(RECOMP_UI_SDL3 ${PSX_SDL3})
+        # recomp-ui's GL discovery is find_package(OpenGL REQUIRED); make it
+        # survive a host with no GL headers first (Steam Deck).
         include("${RECOMP_UI_ROOT}/recomp_ui.cmake")
 
         # Asset staging is console-scoped in recomp-ui. Select PSX once here so
@@ -1923,6 +2041,15 @@ function(psxrecomp_add_runtime_target target)
             list(APPEND _psx_recomp_ui_args BRAND "${PSXRT_LAUNCHER_BRAND}")
         endif()
         recomp_target_launcher_ui(${target} ${_psx_recomp_ui_args})
+        # Set HERE, beside the call that actually compiles recomp-ui's sources
+        # into the target, because that is the only thing this macro asserts:
+        # the launcher IMPLEMENTATION is linked. PSX_HAS_RECOMP_LAUNCHER is a
+        # different claim -- "recomp_launcher.h is reachable" -- and is keyed
+        # on RECOMP_UI_ROOT alone, which is true whenever the submodule sits on
+        # disk even with PSX_RECOMP_UI=OFF. Conflating the two left the codegen
+        # host dropping its own fallback recomp_launcher_relaunch_exe() while
+        # nothing supplied the real one: an undefined symbol at link.
+        target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_LAUNCHER_IMPL=1)
         target_compile_definitions(${target} PRIVATE
             RECOMP_UI_PSX_HAS_REWIND=$<BOOL:${PSXRECOMP_HAS_RBENGINE_SNAP}>)
     endif()
@@ -2350,6 +2477,35 @@ function(psxrecomp_add_game_runtime target)
         endif()
     endif()
 
+    # ENABLE_NETPLAY_IF_PRESENT is nearly always a no-op, and used to be one
+    # silently. By the time this function runs, runtime.cmake has already been
+    # INCLUDED, and the include resolved recomp-net and decided whether the
+    # netplay TUs compile for real or as stubs (see the PSX_NETPLAY block near
+    # the top of this file). The option(PSX_NETPLAY ... OFF) up there has also
+    # already made the `NOT DEFINED` test above false. So the flag can only
+    # ever matter to a caller that set PSX_NETPLAY before the include -- which
+    # is exactly what the scaffold's pre-include block does, and that block is
+    # the real switch. Say so instead of leaving the caller to discover from a
+    # stubbed binary that the flag they passed did nothing.
+    if(PSXG_ENABLE_NETPLAY_IF_PRESENT AND NOT PSX_NETPLAY)
+        if(EXISTS "${PSXRECOMP_ROOT}/lib/recomp-net/CMakeLists.txt")
+            message(WARNING
+                "ENABLE_NETPLAY_IF_PRESENT was passed but PSX_NETPLAY is OFF, so "
+                "netplay stays stubbed. This argument is read after "
+                "runtime.cmake has already been included and wired netplay, so "
+                "it cannot turn it on by itself. Set it BEFORE the include:\n"
+                "  if(EXISTS \"\${PSXRECOMP_ROOT}/lib/recomp-net/CMakeLists.txt\")\n"
+                "      set(PSX_NETPLAY ON CACHE BOOL \"\" FORCE)\n"
+                "  endif()")
+        else()
+            message(WARNING
+                "ENABLE_NETPLAY_IF_PRESENT was passed but recomp-net is not "
+                "checked out (${PSXRECOMP_ROOT}/lib/recomp-net), so netplay "
+                "stays stubbed. Run: git -C psxrecomp submodule update --init "
+                "lib/recomp-net")
+        endif()
+    endif()
+
     # Title default lobby WebSocket URL (compile-time; env PSX_NET_LOBBY_URL wins).
     if(PSXG_NETPLAY_LOBBY_URL)
         set(PSX_NET_LOBBY_DEFAULT_URL "${PSXG_NETPLAY_LOBBY_URL}" CACHE STRING
@@ -2366,15 +2522,19 @@ function(psxrecomp_add_game_runtime target)
             FORCE)
     endif()
 
-    # Setup-host CI (-DPSXRECOMP_FORCE_SETUP_HOST=ON) without the wizard ships a
-    # zip that never opens first-run / Generate & rebuild (BPE regression).
-    if(PSXRECOMP_FORCE_SETUP_HOST AND NOT PSX_SETUP_WIZARD)
+    # A setup-host zip must have SOME way to reach first run, or it ships a
+    # build that can never generate anything (BPE regression). Either surface
+    # counts: the recomp-ui wizard, or a title driving the flow itself.
+    if(PSXRECOMP_FORCE_SETUP_HOST AND NOT PSX_SETUP_WIZARD AND NOT PSX_SETUP_HOST)
         message(FATAL_ERROR
-            "PSXRECOMP_FORCE_SETUP_HOST=ON requires PSX_SETUP_WIZARD=ON.\n"
-            "Add ENABLE_SETUP_WIZARD to psxrecomp_add_game_runtime(...), and/or:\n"
+            "PSXRECOMP_FORCE_SETUP_HOST=ON needs a first-run surface.\n"
+            "With recomp-ui: add ENABLE_SETUP_WIZARD to "
+            "psxrecomp_add_game_runtime(...), and/or:\n"
             "  set(PSX_SETUP_WIZARD ON CACHE BOOL \"…\" FORCE)\n"
             "before include(runtime.cmake), and/or pass -DPSX_SETUP_WIZARD=ON\n"
-            "on the cmake command line (setup-release CI does this).")
+            "on the cmake command line (setup-release CI does this).\n"
+            "Without recomp-ui: pass -DPSX_SETUP_HOST=ON and call\n"
+            "psxrecomp_codegen_host_generate_and_build() from your first-run path.")
     endif()
 
     if(NOT PSXG_GEN_MARKER)
@@ -2406,10 +2566,8 @@ function(psxrecomp_add_game_runtime target)
     endif()
 
     set(_psxg_extras)
-    # psxrecomp_codegen_host.c unconditionally includes recomp_launcher.h, so
-    # the title's setup host and the shared host implementation can only be
-    # built alongside the recomp-ui submodule (PSX_RECOMP_UI).
-    if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES)
+    # The compatibility header also supports launcher-less setup hosts.
+    if((PSX_RECOMP_UI OR PSX_SETUP_HOST) AND PSXG_CODEGEN_SETUP_SOURCES)
         list(APPEND _psxg_extras ${PSXG_CODEGEN_SETUP_SOURCES})
         list(APPEND _psxg_extras
             "${PSXRECOMP_ROOT}/host/psxrecomp_codegen_host.c")
@@ -2481,7 +2639,7 @@ function(psxrecomp_add_game_runtime target)
         # C is linked"): this only fires when a codegen_setup.c-style host was
         # actually provided, since that file needs recomp-ui/launcher headers
         # that a --no-recomp-ui build does not have.
-        if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES)
+        if((PSX_RECOMP_UI OR PSX_SETUP_HOST) AND PSXG_CODEGEN_SETUP_SOURCES)
             target_compile_definitions(${_psxg_t} PRIVATE PSX_HAS_CODEGEN_SETUP_HOST=1)
         endif()
 
@@ -2502,8 +2660,66 @@ function(psxrecomp_add_game_runtime target)
     endif()
     if(RECOMP_UI_ROOT)
         list(APPEND _psxg_inc "${RECOMP_UI_ROOT}/src")
+        # The real recomp_launcher.h is reachable, so the codegen host takes it
+        # and keeps its launcher-facing _apply(). Without this it falls back to
+        # psxrecomp_launcher_compat.h, which declares only the progress typedef
+        # and the relaunch query -- the whole of what the engine actually uses.
+        #
+        # HEADER REACHABILITY ONLY. The submodule being on disk says nothing
+        # about whether its sources are compiled in -- PSX_RECOMP_UI=OFF leaves
+        # them out entirely. Anything that needs a launcher SYMBOL to exist must
+        # test PSX_HAS_RECOMP_LAUNCHER_IMPL, which is set beside the
+        # recomp_target_launcher_ui() call that adds those sources.
+        target_compile_definitions(${target} PRIVATE PSX_HAS_RECOMP_LAUNCHER=1)
     endif()
     foreach(_psxg_t IN LISTS _psxg_targets)
         target_include_directories(${_psxg_t} PRIVATE ${_psxg_inc})
     endforeach()
 endfunction()
+
+# menu_preview: render a host overlay to a PNG with no window and no guest --
+# the F10 menu, a toast, or the save-state slot browser.
+#
+# The debug server's `screenshot` resolves native VRAM BEFORE anything is
+# composited, so it cannot see any of them -- which left "does it look right"
+# answerable only by asking a human to look at the window. This builds the same
+# modules the runtime links and writes the exact ARGB image the renderers
+# composite, so a layout change can be checked without a game running. Rides on PSX_DEBUG_TOOLS because it is a debug tool and that
+# flag is already what separates a dev tree from a release one.
+#
+# Guarded on the target name: runtime.cmake is included by BOTH the framework
+# tree and every game tree, and two definitions of one target is a configure
+# error rather than a warning.
+if(PSX_DEBUG_TOOLS AND NOT TARGET menu_preview)
+    add_executable(menu_preview
+        ${PSXRECOMP_ROOT}/runtime/tests/menu_preview.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_video_menu.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_ui_font.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_ui_draw.c
+        ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
+        ${PSXRECOMP_ROOT}/runtime/src/host_osd.c)
+    target_include_directories(menu_preview PRIVATE
+        ${PSXRECOMP_ROOT}/runtime/include ${PSX_SDL_INCLUDE_DIRS})
+    # psx_video_menu.c needs SDL only for the SDLK_* keycodes and host_osd.c
+    # only for its clock, so take the headers WITHOUT linking the library: a
+    # preview tool that needs SDL3.dll beside it to start is a preview tool
+    # nobody runs. PSX_SDL_INCLUDE_DIRS is empty on the FetchContent path,
+    # where the include dirs live on the imported target instead.
+    if(TARGET SDL3::SDL3)
+        target_include_directories(menu_preview PRIVATE
+            $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
+    elseif(TARGET SDL3::SDL3-static)
+        target_include_directories(menu_preview PRIVATE
+            $<TARGET_PROPERTY:SDL3::SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>)
+    endif()
+    # PSX_SDL_NO_RENDER drops host_osd.c's SDL_Renderer path, which is the only
+    # part of these modules that needs SDL to LINK rather than merely to
+    # compile -- and per the note above this tool links no SDL at all.
+    # menu_preview.c stubs the two symbols that survive that.
+    target_compile_definitions(menu_preview PRIVATE
+        SDL_MAIN_HANDLED PSX_SDL_NO_RENDER=1
+        $<$<BOOL:${PSX_SDL3}>:PSX_SDL3=1>)
+    if(NOT MSVC)
+        target_link_libraries(menu_preview PRIVATE m)
+    endif()
+endif()
