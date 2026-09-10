@@ -208,7 +208,7 @@ void handle_geom_correction(int id, const char *json)
     uint32_t lookups = 0, hits = 0, unrec = 0, ambig = 0;
     gte_geometry_correction_stats(&lookups, &hits, &unrec, &ambig);
     uint32_t pa = 0, pns = 0, pnp = 0, pz = 0;
-    gpu_texture_correction_stats(&pa, &pns, &pnp, &pz);
+    gpu_texture_provenance_stats(&pa, &pns, &pnp, &pz);
     /* PGXP dataflow census (per-vertex): the primary provenance source.
      * dataflow_hit is the number that had to move — the G1.9 gate is a
      * dataflow-hit share dramatically above the 5.2% the position table
@@ -216,11 +216,20 @@ void handle_geom_correction(int id, const char *json)
      * but described a different word (stale = provenance hole to hunt). */
     PGXPStats ps;
     pgxp_get_stats(&ps);
+    /* Perspective arming, with its real denominator. perspective_triangles on
+     * its own could only be compared against gp0_draw, which counts untextured
+     * primitives that are correctly never armed — so it read as a coverage
+     * figure without being one. texcorr.attempts counts exactly the textured
+     * triangles that reach the predicate. */
+    uint64_t tc_att = 0, tc_arm = 0, tc_off = 0, tc_nosrc = 0, tc_noz = 0;
+    gpu_texture_correction_stats(&tc_att, &tc_arm, &tc_off, &tc_nosrc, &tc_noz);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"geometry_correction\":%d,"
              "\"perspective_texturing\":%d,"
              "\"geometry_vertex_hits\":%u,"
              "\"perspective_triangles\":%u,"
+             "\"texcorr\":{\"attempts\":%llu,\"armed\":%llu,"
+             "\"no_correction\":%llu,\"no_source\":%llu,\"no_depth\":%llu},"
              "\"lookups\":%u,\"miss_unrecorded\":%u,\"miss_ambiguous\":%u,"
              "\"persp_attempts\":%u,\"persp_no_source\":%u,"
              "\"persp_no_provenance\":%u,\"persp_zero_z\":%u,"
@@ -234,6 +243,9 @@ void handle_geom_correction(int id, const char *json)
              gpu_texture_correction_enabled(),
              (unsigned)hits,
              (unsigned)gpu_texture_correction_hits(),
+             (unsigned long long)tc_att, (unsigned long long)tc_arm,
+             (unsigned long long)tc_off, (unsigned long long)tc_nosrc,
+             (unsigned long long)tc_noz,
              (unsigned)lookups, (unsigned)unrec, (unsigned)ambig,
              (unsigned)pa, (unsigned)pns, (unsigned)pnp, (unsigned)pz,
              pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
@@ -255,7 +267,7 @@ void handle_geom_correction(int id, const char *json)
  * geom_correction's "pgxp" object, flattened). */
 void handle_pgxp(int id, const char *json)
 {
-    /* Live toggles for the one-toggle-at-a-time A/B protocol (ENHANCEMENTS.md
+    /* Live toggles for the one-toggle-at-a-time A/B protocol (docs/ENHANCEMENTS.md
      * G1.6 method rule): same scene, flip one knob, screenshot_hires. */
     int geom = json_get_int(json, "geometry", -1);
     int tex = json_get_int(json, "texture", -1);
@@ -329,6 +341,7 @@ void handle_gpu_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
+             "\"screen_offset_y\":%d,"
              "\"depth\":%d,\"depth24\":%d,"
              "\"disabled\":%d,"
              "\"h_display\":[%u,%u],\"v_display\":[%u,%u],"
@@ -357,6 +370,7 @@ void handle_gpu_state(int id, const char *json)
              "\"max_vanilla\":%u,\"max_widened\":%u}}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
+             di.screen_offset_y,
              di.depth24 ? 24 : 15, di.depth24,
              di.disabled,
              hx1, hx2, hy1, hy2, hr1, hr2,
@@ -632,6 +646,8 @@ void handle_cdrom_state(int id, const char *json)
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
              "\"read_hold_cycles\":%llu,\"read_hold_events\":%llu,"
              "\"int1_pended\":%llu,\"int1_lost\":%llu,\"int1_pending_now\":%u,"
+             "\"accel_consumer_waits\":%llu,\"accel_consumer_wait_cycles\":%llu,"
+             "\"ring_starved\":%llu,\"ring_dropped\":%llu,"
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
@@ -657,6 +673,10 @@ void handle_cdrom_state(int id, const char *json)
              (unsigned long long)s.int1_pended,
              (unsigned long long)s.int1_lost,
              s.int1_pending_now,
+             (unsigned long long)s.accel_consumer_waits,
+             (unsigned long long)s.accel_consumer_wait_cycles,
+             (unsigned long long)s.ring_starved,
+             (unsigned long long)s.ring_dropped,
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
@@ -839,10 +859,11 @@ void handle_cdrom_command_history(int id, const char *json)
         if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
 
         pos += snprintf(buf + pos, bufsz - pos,
-                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\","
+                        "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"kind\":\"%s\","
                         "\"cmd\":\"0x%02X\",\"param_count\":%u,\"params\":[",
                         emitted ? "," : "",
-                        (unsigned long long)e->seq, e->frame,
+                        (unsigned long long)e->seq,
+                        (unsigned long long)e->cycle, e->frame,
                         cdrom_command_kind_name(e->kind),
                         e->cmd, e->param_count);
         for (uint8_t i = 0; i < e->param_count && i < 16 && pos < bufsz - 96; i++) {
@@ -962,7 +983,7 @@ void handle_dma_state(int id, const char *json)
     DMADebugState s;
     dma_debug_get_state(&s);
 
-    char buf[2048];
+    char buf[4096];
     size_t pos = 0;
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "{\"id\":%d,\"ok\":true,\"dpcr\":\"0x%08X\","
@@ -980,7 +1001,54 @@ void handle_dma_state(int id, const char *json)
                         s.channels[i].remaining_words,
                         s.channels[i].cycles_accum);
     }
-    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+
+    {
+        DMAGpuOtStats ot;
+        dma_debug_get_gpu_ot_stats(&ot);
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        ",\"gpu_ot\":{\"starts\":%llu,\"starts_dropped\":%llu,"
+                        "\"completes\":%llu,\"cancels\":%llu,"
+                        "\"nodes_last\":%u,\"nodes_max\":%u,"
+                        "\"words_last\":%u,\"words_max\":%u,"
+                        "\"cycles_last\":%llu,\"cycles_max\":%llu,"
+                        "\"active\":%u}",
+                        (unsigned long long)ot.starts,
+                        (unsigned long long)ot.starts_dropped,
+                        (unsigned long long)ot.completes,
+                        (unsigned long long)ot.cancels,
+                        ot.nodes_last, ot.nodes_max,
+                        ot.words_last, ot.words_max,
+                        (unsigned long long)ot.cycles_last,
+                        (unsigned long long)ot.cycles_max,
+                        ot.active);
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        ",\"gpu_ot_chcr\":{\"reads_total\":%llu,"
+                        "\"reads_in_walk\":%llu,\"cancel_ring_count\":%u,"
+                        "\"initiator_pc\":\"0x%08X\"},"
+                        "\"gpu_ot_cancels\":[",
+                        (unsigned long long)ot.chcr_reads_total,
+                        (unsigned long long)ot.chcr_reads_in_walk,
+                        ot.cancel_ring_count,
+                        ot.initiator_pc);
+        unsigned n = ot.cancel_ring_count < DMA_GPU_OT_CANCEL_RING
+                   ? ot.cancel_ring_count : DMA_GPU_OT_CANCEL_RING;
+        uint32_t first = ot.cancel_ring_count > DMA_GPU_OT_CANCEL_RING
+                       ? ot.cancel_ring_count - DMA_GPU_OT_CANCEL_RING : 0u;
+        for (unsigned k = 0; k < n && pos < sizeof(buf) - 192; k++) {
+            const DMAGpuOtCancel *c = &ot.cancel_ring[(first + k) %
+                                                      DMA_GPU_OT_CANCEL_RING];
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "%s{\"pc\":\"0x%08X\",\"chcr\":\"0x%08X\","
+                            "\"nodes\":%u,\"words\":%u,\"cycles\":%u,"
+                            "\"polls\":%u}",
+                            k ? "," : "", c->pc, c->chcr,
+                            c->nodes, c->words, c->cycles, c->polls);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+    }
+
+    snprintf(buf + pos, sizeof(buf) - pos, "}");
     debug_server_send_line(buf);
 }
 

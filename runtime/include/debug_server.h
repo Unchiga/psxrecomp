@@ -105,6 +105,12 @@ int  debug_server_fmv_quiet(void);
 uint64_t debug_server_get_tcp_stall_ms(void);
 uint32_t debug_server_get_tcp_drops(void);
 
+/* Simulated-vblank counter. The stamp every display / trace / write ring
+ * uses, so anything sampling per vblank (including a title's own rings, via
+ * psx_game_add_vblank_hook) can be compared against them entry-for-entry.
+ * Advances in release builds too, where the debug server is compiled out. */
+uint64_t debug_server_frame_number(void);
+
 /* Record the current frame's state into the ring buffer.
  * Call after vblank processing. */
 void debug_server_record_frame(void);
@@ -199,6 +205,8 @@ int debug_server_get_input_override(void);
  * 0..255, 0x80 = centre). Returns 1 and fills st[lx,ly,rx,ry] when armed,
  * 0 when the injection is buttons-only. */
 int debug_server_get_axis_override(unsigned char st[4]);
+/* SIO pad slot the current override targets (0 = port 1, 1 = port 2). */
+int debug_server_get_input_slot(void);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and
  * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */
