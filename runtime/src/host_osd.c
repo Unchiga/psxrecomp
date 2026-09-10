@@ -467,31 +467,7 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
     if (!renderer) return;
     s_sdl_ren = renderer;
     sdl_logical_size(renderer, &lw, &lh);
-#if HOST_OSD_VISUAL
-    {
-        const uint32_t *px;
-        int w, h;
-        int ui, margin;
-        host_osd_set_layout(lw, lh);
-        /* Margins still scale off a 480-tall reference; the IMAGES no longer
-         * do, because they are rasterised at their final size and blitted 1:1
-         * rather than magnified here. */
-        ui = lh / 480;
-        if (ui < 1) ui = 1;
-        if (ui > 8) ui = 8;
-        margin = 8 * ui;
-        if (host_osd_image(&px, &w, &h) && px)
-            sdl_blit_argb(renderer, &s_sdl_tex, &s_sdl_tw, &s_sdl_th, px, w, h,
-                          margin, margin, w, h);
-        if (host_osd_volume_image(&px, &w, &h) && px) {
-            int x = (lw > w + margin) ? (lw - w - margin) : margin;
-            int y = (lh > h) ? ((lh - h) / 2) : margin;
-            sdl_blit_argb(renderer, &s_sdl_vol_tex, &s_sdl_vol_tw, &s_sdl_vol_th,
-                          px, w, h, x, y, w, h);
-        }
-    }
-    host_osd_present_done();
-#endif
+
     {
         const uint32_t *px = NULL;
         int w = 0, h = 0;
@@ -516,7 +492,7 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
     /* F10 is host UI, in drawable pixels rather than the game's letterboxed
      * logical coordinates. The SDL present path used to process its input
      * and reserve the bar inset without ever compositing this image. */
-    if (psx_video_menu_is_visible()) {
+    {
         const uint32_t *px = NULL;
         int w = 0, h = 0, ow = 0, oh = 0, old_w = 0, old_h = 0;
         float sx = 1.0f, sy = 1.0f;
@@ -547,10 +523,31 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
 #endif
         if (ow > 0 && oh > 0) {
             const int ui = psx_video_menu_ui_scale(ow, oh);
+#if HOST_OSD_VISUAL
+            int margin_scale = oh / 480;
+            if (margin_scale < 1) margin_scale = 1;
+            if (margin_scale > 8) margin_scale = 8;
+            const int margin = 8 * margin_scale;
+            host_osd_set_layout(ow, oh);
+            if (host_osd_volume_image(&px, &w, &h) && px) {
+                int x = ow > w + margin ? ow - w - margin : margin;
+                int y = oh > h ? (oh - h) / 2 : margin;
+                sdl_blit_argb(renderer, &s_sdl_vol_tex, &s_sdl_vol_tw,
+                              &s_sdl_vol_th, px, w, h, x, y, w, h);
+            }
+#endif
             psx_video_menu_set_layout(ow / ui, oh / ui, ui);
             if (psx_video_menu_overlay_image(&px, &w, &h) && px)
                 sdl_blit_argb(renderer, &s_sdl_menu_tex, &s_sdl_menu_tw,
                               &s_sdl_menu_th, px, w, h, 0, 0, w * ui, h * ui);
+#if HOST_OSD_VISUAL
+            /* Match GL/Vulkan: feedback stays above its triggering dropdown,
+             * below the bar, and is rasterized at the actual output size. */
+            if (host_osd_image(&px, &w, &h) && px)
+                sdl_blit_argb(renderer, &s_sdl_tex, &s_sdl_tw, &s_sdl_th,
+                              px, w, h, margin,
+                              psx_video_menu_bar_px(ow, oh) + margin, w, h);
+#endif
         }
 #if defined(PSX_SDL3)
         SDL_SetRenderLogicalPresentation(renderer, old_w, old_h, mode);
@@ -564,6 +561,7 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
         SDL_RenderSetClipRect(renderer, clipped ? &clip : NULL);
 #endif
     }
+    host_osd_present_done();
 #else
     (void)renderer;
 #endif /* PSX_SDL_NO_RENDER */
