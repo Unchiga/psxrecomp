@@ -34,6 +34,12 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_interp_mod_entry_guards.py")
         add_test(NAME gpu_textured_dot_nw_shift_test COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_textured_dot_nw_shift.py")
+        if(UNIX AND NOT CMAKE_CROSSCOMPILING)
+            add_test(NAME gpu_sw_raster_parity_test COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_sw_raster_parity.py")
+            set_tests_properties(gpu_sw_raster_parity_test PROPERTIES
+                ENVIRONMENT "CC=${CMAKE_C_COMPILER}")
+        endif()
         add_test(NAME gl_readback_runner_test COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_readback_runner.py")
     endif()
