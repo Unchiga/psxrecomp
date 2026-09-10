@@ -3,9 +3,10 @@
 #include "psx_guest_overlay.h"
 
 /* Fixed capacity, no allocation: registration runs during static
- * initialisation. Three is what this title needs; eight leaves room without
- * pretending the composite loop is free.  */
-#define PSX_GUEST_OVERLAY_MAX 8
+ * initialisation. Titles can legitimately compose several independent HUD,
+ * privacy, diagnostic and modal layers; twelve still fits Vulkan's fourteen
+ * total overlay slots after reserving its menu and toast layers. */
+#define PSX_GUEST_OVERLAY_MAX 12
 
 static PsxGuestOverlay s_ov[PSX_GUEST_OVERLAY_MAX];
 static int             s_count;

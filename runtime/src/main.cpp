@@ -30,6 +30,7 @@
 #include "psx_savestate_menu.h"
 #include "psx_game_hooks.h"
 #include "psx_video_menu.h"
+#include "psx_guest_overlay.h"
 #include "psx_update_check.h"  /* "is there a newer release?", off the boot path */
 #include "host_osd.h"
 #include "psx_host_input.h"   /* our own exports: injection, pad mask, lag ring */
@@ -548,6 +549,118 @@ static bool     s_force_present_after_load = false;
 static int s_sw_hold_valid = 0;
 static SDL_Rect s_sw_hold_src;
 static SDL_Rect s_sw_hold_dst;
+static int s_sw_hold_native_w;
+static int s_sw_hold_native_h;
+static int s_sw_hold_guest_xoff;
+
+#ifndef PSX_SDL_NO_RENDER
+/* Software presentation used to skip the guest-space overlay registry
+ * entirely. Keep one streaming texture per registry slot, just as the GL and
+ * Vulkan paths keep per-layer upload state, and map each layer through the
+ * exact picture rectangle passed to SDL_RenderCopy. */
+#define SW_GUEST_OVERLAY_MAX 16
+struct SwGuestOverlayTexture {
+    SDL_Texture *tex;
+    int w;
+    int h;
+};
+static SwGuestOverlayTexture s_sw_guest_tex[SW_GUEST_OVERLAY_MAX];
+static SDL_Renderer *s_sw_guest_renderer;
+
+static void sw_guest_overlay_forget_textures(bool destroy)
+{
+    for (int i = 0; i < SW_GUEST_OVERLAY_MAX; i++) {
+        if (destroy && s_sw_guest_tex[i].tex)
+            SDL_DestroyTexture(s_sw_guest_tex[i].tex);
+        s_sw_guest_tex[i] = SwGuestOverlayTexture{};
+    }
+    s_sw_guest_renderer = nullptr;
+}
+
+extern "C" int gpu_sprite_watch_query(int max_age, int *x, int *y,
+                                        int *occluded);
+
+static void sw_draw_guest_overlays(SDL_Renderer *renderer,
+                                   const SDL_Rect& picture,
+                                   int native_w, int native_h,
+                                   int guest_xoff)
+{
+    if (!renderer || picture.w <= 0 || picture.h <= 0 ||
+        native_w <= 0 || native_h <= 0)
+        return;
+    if (s_sw_guest_renderer != renderer) {
+        /* A renderer destroys all of its textures. If the pointer changed,
+         * merely forget the now-invalid handles; normal shutdown explicitly
+         * destroys them before destroying the renderer. */
+        sw_guest_overlay_forget_textures(false);
+        s_sw_guest_renderer = renderer;
+    }
+
+    const int count = psx_guest_overlay_count();
+    for (int i = 0; i < count && i < SW_GUEST_OVERLAY_MAX; i++) {
+        const PsxGuestOverlay *ov = psx_guest_overlay_at(i);
+        const uint32_t *px = nullptr;
+        int w = 0, h = 0;
+        if (!ov || !ov->image || !ov->origin) continue;
+        if (ov->occlusion_group >= 0) {
+            int occluded = 0;
+            (void)gpu_sprite_watch_query(ov->occlusion_group,
+                                         nullptr, nullptr, &occluded);
+            if (occluded) continue;
+        }
+        if (!ov->image(&px, &w, &h) || !px || w <= 0 || h <= 0)
+            continue;
+
+        SwGuestOverlayTexture& slot = s_sw_guest_tex[i];
+        if (!slot.tex || slot.w != w || slot.h != h) {
+            if (slot.tex) SDL_DestroyTexture(slot.tex);
+            slot.tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_STREAMING, w, h);
+            slot.w = w;
+            slot.h = h;
+            if (slot.tex)
+                SDL_SetTextureBlendMode(slot.tex, SDL_BLENDMODE_BLEND);
+        }
+        if (!slot.tex) continue;
+#if defined(PSX_SDL3)
+        if (!SDL_UpdateTexture(slot.tex, nullptr, px,
+                               w * (int)sizeof(uint32_t)))
+            continue;
+#else
+        if (SDL_UpdateTexture(slot.tex, nullptr, px,
+                              w * (int)sizeof(uint32_t)) != 0)
+            continue;
+#endif
+
+        int gx = 0, gy = 0;
+        ov->origin(&gx, &gy);
+        const int sub = ov->subpixel_y ? ov->subpixel_y() : 0;
+        SDL_Rect dst = {
+            picture.x + ((gx + guest_xoff) * picture.w) / native_w,
+            picture.y + (gy * picture.h) / native_h +
+                (sub * picture.h) / (2 * native_h),
+            (w * picture.w) / native_w,
+            (h * picture.h) / native_h
+        };
+        if (dst.w < 1) dst.w = 1;
+        if (dst.h < 1) dst.h = 1;
+#if defined(PSX_SDL3)
+        (void)psx_sdl_render_copy(renderer, slot.tex, nullptr, &dst);
+#else
+        SDL_RenderCopy(renderer, slot.tex, nullptr, &dst);
+#endif
+        if (ov->placed) {
+            const int placement[10] = {
+                picture.x, picture.y, picture.w, picture.h,
+                native_w, native_h, dst.x, dst.y, dst.w, dst.h
+            };
+            ov->placed(placement);
+        }
+    }
+}
+#else
+static void sw_guest_overlay_forget_textures(bool) {}
+#endif
 
 static Uint64   s_fps_last_time = 0;
 static uint64_t s_fps_last_frame = 0;
@@ -583,6 +696,9 @@ static void present_session_reset(void) {
     s_disabled_frame_presented = false;
     s_force_present_after_load = false;
     s_sw_hold_valid = 0;
+    s_sw_hold_native_w = 0;
+    s_sw_hold_native_h = 0;
+    s_sw_hold_guest_xoff = 0;
     s_fps_last_time = 0;
     s_fps_last_frame = 0;
     s_fps_base_title.clear();
@@ -3617,6 +3733,7 @@ static void teardown_game_session_keep_lobby(void) {
         gl_renderer_shutdown();
         g_gl_active = false;
     }
+    sw_guest_overlay_forget_textures(true);
     if (sdl_texture) { SDL_DestroyTexture(sdl_texture); sdl_texture = nullptr; }
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
@@ -5443,6 +5560,9 @@ static void netplay_hold_last_present_tick(void) {
         SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
         SDL_RenderClear(sdl_renderer);
         SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src, &s_sw_hold_dst);
+        sw_draw_guest_overlays(sdl_renderer, s_sw_hold_dst,
+                               s_sw_hold_native_w, s_sw_hold_native_h,
+                               s_sw_hold_guest_xoff);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
         did = 1;
@@ -6435,6 +6555,10 @@ static void rewind_pause_present(void) {
         if (sdl_texture && s_sw_hold_valid)
             SDL_RenderCopy(sdl_renderer, sdl_texture, &s_sw_hold_src,
                            &s_sw_hold_dst);
+        if (s_sw_hold_valid)
+            sw_draw_guest_overlays(sdl_renderer, s_sw_hold_dst,
+                                   s_sw_hold_native_w, s_sw_hold_native_h,
+                                   s_sw_hold_guest_xoff);
         host_osd_draw_sdl(sdl_renderer);
         SDL_RenderPresent(sdl_renderer);
     }
@@ -7653,6 +7777,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
     bool pin_43    = false;  /* pillarbox this present (FMV, or a native-wide
                                 game frame that could not present wide) */
+    bool wide_present = false;
     bool depth24_frame = false;
     bool local_viewport_crop_applied = false;
     if (s_force_present_after_load && g_gl_active)
@@ -7725,9 +7850,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* Native-wide present: on a game frame, if the active backend has the
          * wide compositor, present the wider surface (canonical width + EXTRA)
          * from the displayed buffer's surface. FMV/menu frames stay 4:3. */
-        bool wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&
-                             ws_native_wide_active() && gr_wide_supported() &&
-                             (!local_viewport_crop || local_viewport_wide));
+        wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&
+                        ws_native_wide_active() && gr_wide_supported() &&
+                        (!local_viewport_crop || local_viewport_wide));
         if (wide_present) {
             present_w = local_viewport_wide
                 ? (uint32_t)gpu_ws_netplay_local_viewport_width()
@@ -8035,6 +8160,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+    /* Guest overlays are part of the picture, below every host menu/toast.
+     * Map canonical coordinates through this frame's actual letterbox rect;
+     * native-wide places canonical content in the surface's centre columns. */
+    const int guest_xoff = wide_present
+        ? ((int)present_w - (int)w) / 2 : 0;
+    sw_draw_guest_overlays(sdl_renderer, dst,
+                           (int)present_w, (int)present_h, guest_xoff);
     host_osd_draw_sdl(sdl_renderer);
     /* Fulfil a staged present_shot here: after RenderCopy + OSD, before
      * RenderPresent, the renderer holds exactly the composed frame the player
@@ -8128,6 +8260,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* §33: remember active rect for resim hold-last (not full 640x512). */
     s_sw_hold_src = src;
     s_sw_hold_dst = dst;
+    s_sw_hold_native_w = (int)present_w;
+    s_sw_hold_native_h = (int)present_h;
+    s_sw_hold_guest_xoff = guest_xoff;
     s_sw_hold_valid = 1;
 
     /* Vsync self-heal. PRESENTVSYNC is only armed when driver vsync owns
@@ -16904,6 +17039,7 @@ session_reboot:
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
     if (g_vk_active) vk_renderer_shutdown();
+    sw_guest_overlay_forget_textures(true);
     SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
     SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
