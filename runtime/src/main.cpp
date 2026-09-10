@@ -2136,6 +2136,7 @@ static std::filesystem::path resolve_existing_runtime_path(const char* requested
 /* Reported in the boot banner and used for the one-time "your saves moved"
  * notice, so the player is told rather than left to discover it. */
 static std::string g_player_data_dir;
+static std::filesystem::path g_cli_user_data_dir;
 
 /* Published to mods: a mod that ships an editable config must write it where
  * the player's other files live, not next to the exe. */
@@ -2172,6 +2173,9 @@ static std::filesystem::path psx_documents_dir() {
 }
 
 static std::filesystem::path psx_user_data_dir(const char* argv0) {
+    /* Resolve the fleet override before the cached per-user default. Menu
+     * settings, keybinds and BIOS sidecars must share the cards' isolation. */
+    if (!g_cli_user_data_dir.empty()) return g_cli_user_data_dir;
     static std::filesystem::path cached;
     static bool resolved = false;
     if (resolved) return cached;
@@ -2200,6 +2204,7 @@ static std::filesystem::path psx_user_data_dir(const char* argv0) {
  * location, so the fallback fades out on first save rather than persisting. */
 static std::filesystem::path sidecar_cfg_path(const char* argv0, const char* filename) {
     const std::filesystem::path user = psx_user_data_dir(argv0) / filename;
+    if (!g_cli_user_data_dir.empty()) return user;
     std::error_code ec;
     if (std::filesystem::exists(user, ec)) return user;
     const std::filesystem::path legacy = exe_dir_from_argv(argv0) / filename;
@@ -12882,6 +12887,10 @@ static bool resolve_boot_config(int argc, char** argv, PsxBootConfig& boot) {
             boot.cli_debug_port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
             boot.cli_memcard_dir = consume_path_arg(i);
+            g_cli_user_data_dir = std::filesystem::path(boot.cli_memcard_dir);
+            if (g_cli_user_data_dir.is_relative())
+                g_cli_user_data_dir = exe_dir_from_argv(argv[0]) / g_cli_user_data_dir;
+            g_cli_user_data_dir = g_cli_user_data_dir.lexically_normal();
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
             const char* r = argv[++i];
             if      (std::strcmp(r, "software") == 0) boot.cli_renderer = 0;
