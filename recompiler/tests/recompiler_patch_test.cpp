@@ -644,6 +644,16 @@ void codegen_tests() {
           applied.find("cpu->gpr[2] = 1;") != std::string::npos,
           "codegen applies exact patch through physical alias");
 
+    PSXRecomp::CodeGenConfig mod_entry_config;
+    mod_entry_config.mod_function_entry_funcs.insert(0x80010000u);
+    const std::string replaceable_entry = generate_first_instruction(
+        original, {}, false, mod_entry_config);
+    check(replaceable_entry.find(
+              "if (psx_mod_function_entry(cpu, 0x80010000u)) { "
+              "cpu->pc = cpu->gpr[31]; return; }") !=
+              std::string::npos,
+          "codegen lets an opted-in mod callback replace a guest function");
+
     check_throws(
         [&] { (void)generate_first_instruction(0x24020003u,
                                                {physical_alias}, false); },

@@ -78,22 +78,11 @@ RuntimeMods& state() {
     return value;
 }
 
-struct FunctionEntryPlugin {
-    std::string id;
-    uint32_t address = 0;
-    PSXModFunctionEntryCallback callback = nullptr;
-};
-
 struct StatePlugin {
     std::string id;
     PSXModStateCallback before_save = nullptr;
     PSXModStateCallback after_load = nullptr;
 };
-
-std::vector<FunctionEntryPlugin>& function_entry_plugins() {
-    static std::vector<FunctionEntryPlugin> value;
-    return value;
-}
 
 std::vector<StatePlugin>& state_plugins() {
     static std::vector<StatePlugin> value;
@@ -1458,20 +1447,6 @@ extern "C" uint32_t psx_mod_display_height(void) {
     return info.height;
 }
 
-extern "C" int psx_mod_register_function_entry_plugin(
-    const char* id, uint32_t address, PSXModFunctionEntryCallback callback) {
-    using namespace PSXRecompV4;
-    if (!id || !*id || !address || !callback) return 0;
-    auto& plugins = function_entry_plugins();
-    const auto duplicate = std::find_if(
-        plugins.begin(), plugins.end(), [&](const FunctionEntryPlugin& item) {
-            return item.id == id && item.address == address;
-        });
-    if (duplicate != plugins.end()) return 0;
-    plugins.push_back(FunctionEntryPlugin{id, address, callback});
-    return 1;
-}
-
 extern "C" int psx_mod_register_state_plugin(
     const char* id, PSXModStateCallback before_save,
     PSXModStateCallback after_load) {
@@ -1495,14 +1470,6 @@ extern "C" void mod_runtime_before_savestate_save(void) {
 extern "C" void mod_runtime_after_savestate_load(void) {
     using namespace PSXRecompV4;
     for (const StatePlugin& plugin : state_plugins()) plugin.after_load();
-}
-
-extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
-    using namespace PSXRecompV4;
-    if (!cpu) return;
-    for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
-        if (plugin.address == address) plugin.callback(cpu, address);
-    }
 }
 
 extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,

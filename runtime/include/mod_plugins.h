@@ -35,7 +35,11 @@ int psx_mod_register_state_plugin(const char* id,
 int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback);
 /* Called only from generated functions explicitly listed by the game config. */
-void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+int psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+/* A callback may intentionally replace a listed guest function with a no-op.
+ * The generated/interpreted wrapper publishes $ra and returns without running
+ * the guest body. It is valid only from the callback currently being run. */
+void psx_mod_skip_current_function(struct CPUState* cpu);
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);

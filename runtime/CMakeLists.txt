@@ -23,6 +23,12 @@ psxrecomp_add_runtime_target(psx-runtime
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    add_executable(mod_function_entry_test
+        tests/test_mod_function_entry.cpp
+        src/mod_function_entry.cpp)
+    target_include_directories(mod_function_entry_test PRIVATE include)
+    add_test(NAME mod_function_entry_test COMMAND mod_function_entry_test)
+
     # Optional real-hardware regression. Configure its dependencies explicitly;
     # absence must remain visible, never counted as a passing GPU test.
     set(PSX_GL_READBACK_SDL_ROOT "" CACHE PATH "SDL3 static build root for GL readback test")
