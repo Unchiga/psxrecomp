@@ -5,11 +5,11 @@
 #include "psx_debug_commands.h"
 
 /* Fixed capacity, no allocation: registration runs during static
- * initialisation, before anything could report a failure usefully. This title
- * registers 18; a title needing more than this many distinct commands is
- * likely describing one subsystem's state through a dozen verbs rather than
- * one command with fields. */
-#define PSX_DEBUG_CMD_MAX 64
+ * initialisation, before anything could report a failure usefully. Keep
+ * enough headroom for mature title-side diagnostic surfaces; silently
+ * dropping every command after slot 64 made unrelated, previously registered
+ * probes disappear as soon as a title added one more command. */
+#define PSX_DEBUG_CMD_MAX 128
 
 typedef struct { const char *name; PsxDebugCmdHandler fn; } PsxDebugCmdEntry;
 

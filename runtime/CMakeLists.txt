@@ -89,6 +89,12 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME psx_cyc_batch_test COMMAND psx_cyc_batch_test)
 
+    add_executable(debug_command_registry_test
+        tests/test_debug_command_registry.c
+        src/psx_debug_commands.c)
+    target_include_directories(debug_command_registry_test PRIVATE include)
+    add_test(NAME debug_command_registry_test COMMAND debug_command_registry_test)
+
     add_executable(psx_icache_fastpath_test
         tests/test_psx_icache_fastpath.c
         src/psx_icache.c
