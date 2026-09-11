@@ -742,10 +742,16 @@ static int collect_toolchain_cache_bases(char bases[][1400], int max_n) {
     return w;
 }
 
-/* Preferred install root for new downloads (first retcomm cache base). */
+/* Preferred install root for new downloads: RETCOMM_TOOLCHAIN_CACHE when
+ * set (it is always bases[0]), else the first retcomm cache base. */
 static int preferred_toolchain_cache_root(char* out, size_t cap) {
     char bases[12][1400];
     int n = collect_toolchain_cache_bases(bases, 12);
+    const char* cache = getenv("RETCOMM_TOOLCHAIN_CACHE");
+    if (cache && cache[0] && n > 0) {
+        snprintf(out, cap, "%s", bases[0]);
+        return 1;
+    }
     for (int i = 0; i < n; ++i) {
         if (strstr(bases[i], "retcomm") != NULL) {
             snprintf(out, cap, "%s", bases[i]);
@@ -2515,7 +2521,7 @@ static int zip_extract_builtin(const char* zip_path, const char* dest_dir,
     if (!eocd) {
         free(tail);
         fclose(f);
-        snprintf(err, cap, "No zip directory in %s", zip_path);
+        snprintf(err, cap, "%s is not a complete zip (download cut short?)", zip_path);
         return 0;
     }
     entries = zip_le16(eocd + 10);
@@ -2897,76 +2903,6 @@ static int host_download_url_to_file(const char* url, const char* dest,
     return 0;
 }
 
-static int host_extract_zip(const char* zip_path, const char* dest_dir,
-                            char* err_msg, size_t err_cap) {
-    char cmd[3200];
-    DWORD code = 1;
-    char parent[1400];
-    if (!path_is_file(zip_path)) {
-        snprintf(err_msg, err_cap, "Toolchain zip not found: %s", zip_path);
-        return 0;
-    }
-    if (!dirname_copy(parent, sizeof(parent), dest_dir)) {
-        snprintf(err_msg, err_cap, "Bad extract destination.");
-        return 0;
-    }
-    mkdir_p(parent);
-    rmtree_path(dest_dir);
-    mkdir_p(dest_dir);
-    /* tar.exe on Windows 10+ extracts .zip; PowerShell's Expand-Archive is
-     * the second choice; the built-in extractor covers Wine/Proton and
-     * images that ship neither. */
-    snprintf(cmd, sizeof(cmd), "tar.exe -xf \"%s\" -C \"%s\"", zip_path,
-             dest_dir);
-    if (!run_cmdline_wait(cmd, &code) || code != 0) {
-        char why[600];
-        rmtree_path(dest_dir);
-        mkdir_p(dest_dir);
-        code = 1;
-        snprintf(cmd, sizeof(cmd),
-                 "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
-                 "-Command \"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"",
-                 zip_path, dest_dir);
-        if (!run_cmdline_wait(cmd, &code) || code != 0) {
-            rmtree_path(dest_dir);
-            mkdir_p(dest_dir);
-            why[0] = '\0';
-            if (!zip_extract_builtin(zip_path, dest_dir, why, sizeof(why))) {
-                snprintf(err_msg, err_cap,
-                         "Failed to extract the toolchain zip (tar.exe and "
-                         "PowerShell unavailable or failed; built-in: %s).", why);
-                return 0;
-            }
-        }
-    }
-    if (pack_root_has_cmake(dest_dir))
-        return 1;
-    /* Single nested directory layout — resolve_toolchain_bin_under handles it. */
-    {
-        WIN32_FIND_DATAA fd;
-        char pattern[1400], child[1400];
-        HANDLE h;
-        snprintf(pattern, sizeof(pattern), "%s\\*", dest_dir);
-        h = FindFirstFileA(pattern, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                    continue;
-                if (fd.cFileName[0] == '.')
-                    continue;
-                if (!join_path(child, sizeof(child), dest_dir, fd.cFileName))
-                    continue;
-                if (pack_root_has_cmake(child)) {
-                    FindClose(h);
-                    return 1;
-                }
-            } while (FindNextFileA(h, &fd));
-            FindClose(h);
-        }
-    }
-    snprintf(err_msg, err_cap, "Toolchain zip missing bin/cmake.exe.");
-    return 0;
-}
 #else
 static int host_download_url_to_file(const char* url, const char* dest,
                                      char* err_msg, size_t err_cap) {
@@ -2998,10 +2934,40 @@ static int host_download_url_to_file(const char* url, const char* dest,
     return 0;
 }
 
+#endif
+
+/* Unpack the toolchain zip into dest_dir (recreated) and confirm bin/cmake
+ * landed at its root or one directory down.
+ *
+ * The built-in extractor goes first. It needs no external program and it
+ * has been checked byte for byte, modes included, against unzip on the real
+ * cmake-clang-v1 packs. The platform tools are only fallbacks for a pack it
+ * cannot read (zip64, symlinks), and their exit status is never trusted on
+ * its own: Wine's powershell.exe is a stub that exits 0 having done nothing,
+ * LTSC images ship no tar.exe, and GNU tar refuses zips outright. Every
+ * attempt is judged by whether cmake is there afterwards. */
 static int host_extract_zip(const char* zip_path, const char* dest_dir,
                             char* err_msg, size_t err_cap) {
-    char cmd[3200];
     char parent[1400];
+    char why[600];
+    char cmd[3200];
+    int i;
+#if defined(_WIN32)
+    static const char* const k_tool_fmt[] = {
+        "tar.exe -xf \"%s\" -C \"%s\"",
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        "-Command \"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"",
+    };
+    const char* tools_desc = "tar.exe and PowerShell";
+    const char* cmake_name = "bin\\cmake.exe";
+#else
+    static const char* const k_tool_fmt[] = {
+        "unzip -q \"%s\" -d \"%s\"",
+        "tar -xf \"%s\" -C \"%s\"",
+    };
+    const char* tools_desc = "unzip and tar";
+    const char* cmake_name = "bin/cmake";
+#endif
     if (!path_is_file(zip_path)) {
         snprintf(err_msg, err_cap, "Toolchain zip not found: %s", zip_path);
         return 0;
@@ -3013,52 +2979,36 @@ static int host_extract_zip(const char* zip_path, const char* dest_dir,
     mkdir_p(parent);
     rmtree_path(dest_dir);
     mkdir_p(dest_dir);
-    snprintf(cmd, sizeof(cmd), "unzip -q \"%s\" -d \"%s\"", zip_path, dest_dir);
-    if (system(cmd) != 0) {
+    why[0] = '\0';
+    if (zip_extract_builtin(zip_path, dest_dir, why, sizeof(why))) {
+        if (pack_root_has_cmake(dest_dir))
+            return 1;
+        snprintf(why, sizeof(why), "unpacked, but no %s inside", cmake_name);
+    }
+    for (i = 0; i < (int)(sizeof(k_tool_fmt) / sizeof(k_tool_fmt[0])); ++i) {
         rmtree_path(dest_dir);
         mkdir_p(dest_dir);
-        snprintf(cmd, sizeof(cmd), "tar -xf \"%s\" -C \"%s\"", zip_path,
-                 dest_dir);
-        if (system(cmd) != 0) {
-            char why[600];
-            rmtree_path(dest_dir);
-            mkdir_p(dest_dir);
-            why[0] = '\0';
-            if (!zip_extract_builtin(zip_path, dest_dir, why, sizeof(why))) {
-                snprintf(err_msg, err_cap,
-                         "Failed to extract the toolchain zip (unzip and tar "
-                         "unavailable or failed; built-in: %s).", why);
-                return 0;
-            }
+        snprintf(cmd, sizeof(cmd), k_tool_fmt[i], zip_path, dest_dir);
+#if defined(_WIN32)
+        {
+            DWORD code = 1;
+            (void)run_cmdline_wait(cmd, &code);
         }
+#else
+        (void)system(cmd);
+#endif
+        if (pack_root_has_cmake(dest_dir))
+            return 1;
     }
-    if (pack_root_has_cmake(dest_dir))
-        return 1;
-    /* Nested child with bin/ is fine — resolve_toolchain_bin_under handles it. */
-    {
-        DIR* dir = opendir(dest_dir);
-        struct dirent* ent;
-        if (!dir) {
-            snprintf(err_msg, err_cap, "Toolchain zip missing bin/cmake.");
-            return 0;
-        }
-        while ((ent = readdir(dir)) != NULL) {
-            char child[1400];
-            if (ent->d_name[0] == '.')
-                continue;
-            if (!join_path(child, sizeof(child), dest_dir, ent->d_name))
-                continue;
-            if (path_is_dir(child) && pack_root_has_cmake(child)) {
-                closedir(dir);
-                return 1;
-            }
-        }
-        closedir(dir);
-    }
-    snprintf(err_msg, err_cap, "Toolchain zip missing bin/cmake.");
+    rmtree_path(dest_dir);
+    snprintf(err_msg, err_cap,
+             "Failed to extract the toolchain zip (built-in extractor: %s; %s "
+             "left no %s either). If it was just downloaded it may be "
+             "incomplete: try again. Or unpack it by hand and point "
+             "RETCOMM_TOOLCHAIN_DIR at the folder that holds %s.",
+             why, tools_desc, cmake_name, cmake_name);
     return 0;
 }
-#endif
 
 static int link_or_stamp_project_toolchain(const char* pack_root) {
     char root[1400], proj_tc[1200], bin[1400];
