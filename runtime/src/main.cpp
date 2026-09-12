@@ -618,8 +618,16 @@ static void sw_draw_guest_overlays(SDL_Renderer *renderer,
                                          SDL_TEXTUREACCESS_STREAMING, w, h);
             slot.w = w;
             slot.h = h;
-            if (slot.tex)
+            if (slot.tex) {
                 SDL_SetTextureBlendMode(slot.tex, SDL_BLENDMODE_BLEND);
+                /* Guest overlays are authored pixel-for-pixel in the same
+                 * native coordinate system as the game. Pin their sampling
+                 * to nearest, matching the GL and Vulkan overlay paths;
+                 * otherwise SDL inherits the global present-filter hint and
+                 * blurs Card Shop text even though that setting is supposed
+                 * to describe the game framebuffer. */
+                SDL_SetTextureScaleMode(slot.tex, SDL_ScaleModeNearest);
+            }
         }
         if (!slot.tex) continue;
 #if defined(PSX_SDL3)
@@ -668,6 +676,7 @@ static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
 static int      s_turbo_present_skip = 0;
+static int      s_speed_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
 /* Netplay + depth24: present every other vblank (admit still every tick). */
 static int      s_netplay_depth24_present_skip = 0;
@@ -704,6 +713,7 @@ static void present_session_reset(void) {
     s_fps_base_title.clear();
     s_frame_pacer = FramePacer{ 0 };
     s_turbo_present_skip = 0;
+    s_speed_present_skip = 0;
     s_fmv_skip_present_skip = 0;
     s_netplay_depth24_present_skip = 0;
     s_fmv_skip_last_mdec = 0;
@@ -1151,6 +1161,7 @@ extern "C" void interrupts_set_vblank_divisor(uint32_t mult);
  * easing off, and the menu keeps showing the player's choice either way. */
 static int g_speed_requested = 1;
 static int g_speed_effective = 1;
+static int g_native_rate_rendering = 1;
 
 /* Defined with the other present-cadence helpers; needed here because the
  * speed multiplier decides whether driver vsync may own the cadence at all. */
@@ -1177,6 +1188,13 @@ extern "C" void psx_set_game_speed(int mult) {
     g_speed_requested = mult;
     speed_apply_effective(mult);
     psx_speed_governor_reset();
+}
+
+static void psx_set_native_rate_rendering(int on) {
+    g_native_rate_rendering = on ? 1 : 0;
+    /* Start a fresh cadence when toggled instead of inheriting a partial
+     * modulo cycle from the previous mode. */
+    s_speed_present_skip = 0;
 }
 
 /* Last device-time rate the governor measured, as a percentage of the real
@@ -6301,6 +6319,9 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
                           s->supersampling);
         } else if (s->speed != prev.speed) {
             std::snprintf(msg, sizeof(msg), "Speed: %dx", s->speed);
+        } else if (s->native_rate_rendering != prev.native_rate_rendering) {
+            std::snprintf(msg, sizeof(msg), "Native-rate rendering: %s",
+                          s->native_rate_rendering ? "on" : "off");
         } else if (s->vol_master != prev.vol_master) {
             std::snprintf(msg, sizeof(msg), "Master volume: %d%%", s->vol_master);
         } else if (s->vol_music != prev.vol_music) {
@@ -6331,6 +6352,7 @@ static void psx_apply_video_menu_state(const PsxVideoMenuState *s) {
          * settable independently. */
         psx_set_game_speed(sp);
     }
+    psx_set_native_rate_rendering(s->native_rate_rendering);
     /* AUDIO > AUTO SLOW FOR AUDIO. After the speed above, because switching the
      * governor off restores the requested speed and that has to be the speed
      * this state actually asks for. */
@@ -7724,6 +7746,27 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         }
     } else {
         refresh_widescreen_projection();
+    }
+
+    /* GAME > SPEED advances the guest at N times its normal VBlank rate.
+     * Uploading and scaling N full-resolution frames for every native frame is
+     * especially expensive at 4K and can steal enough CPU/GPU time from the
+     * real-time SPU pump to make menu sounds crackle. Keep simulation, input,
+     * audio, hooks and wall pacing on every VBlank; present at the game's
+     * native visual cadence so the accelerated state is still current without
+     * multiplying rendering work. Forced post-load refreshes and temporal
+     * interpolation always present. */
+    if (!psx_netplay_active() && !psx_selfcheck_resim_active() &&
+        g_native_rate_rendering && !g_frame_interpolation &&
+        !s_force_present_after_load &&
+        g_speed_effective > 1 && g_frame_period_ms > 0.0) {
+        const int present_every = g_speed_effective;
+        s_speed_present_skip =
+            (s_speed_present_skip + 1) % present_every;
+        if (s_speed_present_skip != 0)
+            return ep;
+    } else {
+        s_speed_present_skip = 0;
     }
 
     /* Rollback resim (§33/§47): short catch-up keeps hold-last; long catch-up
@@ -16543,6 +16586,7 @@ session_reboot:
             vms.supersampling = eff;
         }
         vms.speed       = PSX_VM_SPEED_DEFAULT;
+        vms.native_rate_rendering = 1;
         /* Authentic drive timing unless the player asks otherwise, matching the
          * built-in CD Speed mod's default-off stance. */
         vms.fast_loads  = PSX_VM_LOADS_OFF;
@@ -16667,6 +16711,7 @@ session_reboot:
             if (sp > PSX_VM_SPEED_MAX) sp = PSX_VM_SPEED_MAX;
             psx_set_game_speed(sp);   /* pacer AND VBlank divisor together */
         }
+        psx_set_native_rate_rendering(vms.native_rate_rendering);
         /* Same reason as the speed above: psx_apply_video_menu_state only fires
          * on a CHANGE, so a stored governor choice needs seeding here or the
          * row would read ON while nothing eased. */

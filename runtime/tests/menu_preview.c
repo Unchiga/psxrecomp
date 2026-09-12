@@ -190,6 +190,7 @@ static int preview_menu(int w, int h, int menu, int row,
     st.vsync = PSX_VM_VSYNC_OFF;
     st.supersampling = 1;
     st.speed = PSX_VM_SPEED_DEFAULT;
+    st.native_rate_rendering = 1;
     st.fast_loads = PSX_VM_LOADS_OFF;
     st.vol_master = 100; st.vol_music = 80; st.vol_sound = 100;
     st.speed_governor = 0;
@@ -242,6 +243,7 @@ static void test_seed(PsxVideoMenuState *st)
     st->vsync = PSX_VM_VSYNC_OFF;
     st->supersampling = 1;
     st->speed = 1;
+    st->native_rate_rendering = 1;
     st->vol_master = st->vol_music = st->vol_sound = 100;
     st->update_check = 1;
     st->renderer = PSX_VM_RENDERER_UNSET;
@@ -338,6 +340,25 @@ static int menu_selftest(void)
     psx_video_menu_set_row(row, 1);
     CHECK(psx_video_menu_get_row(row) == 1);
     CHECK(s_test_changed == 1);
+
+    /* GAME row 1 is the native-rate presentation toggle directly under
+     * Speed. Exercise the same Enter path used by keyboard and controller. */
+    test_seed(&st);
+    psx_video_menu_init(&st);
+    test_open();
+    psx_video_menu_handle_key(1073741903); /* File -> View */
+    psx_video_menu_handle_key(1073741903); /* View -> Video */
+    psx_video_menu_handle_key(1073741903); /* Video -> Audio */
+    psx_video_menu_handle_key(1073741903); /* Audio -> Game */
+    psx_video_menu_handle_key(1073741905); /* down: Native-rate rendering */
+    psx_video_menu_handle_key(13);
+    psx_video_menu_debug_snapshot(&d);
+    CHECK(d.menu == PSX_VM_MENU_GAME);
+    CHECK(d.item == 1);
+    CHECK(d.rows == 5);
+    CHECK(d.native_rate_rendering == 0);
+    CHECK(psx_video_menu_take_change(&st) == 1);
+    CHECK(st.native_rate_rendering == 0);
 
     test_seed(&st);
     psx_video_menu_init(&st);

@@ -133,6 +133,10 @@ enum { MENU_FILE = 0, MENU_VIEW = 1, MENU_VIDEO = 2, MENU_AUDIO = 3,
        MENU_GAME = 4, MENU_CHEATS = 5, MENU_MODS = 6, MENU_COUNT = 7 };
 /* AUDIO rows. MASTER scales everything; MUSIC and SOUND are the split buses. */
 enum { AUD_MASTER = 0, AUD_MUSIC = 1, AUD_SOUND = 2, AUD_SPEED_GOV = 3 };
+/* Keep these named: the native-rate toggle deliberately sits immediately
+ * below Speed, and action dispatch must not drift when a row is inserted. */
+enum { GAME_SPEED = 0, GAME_NATIVE_RATE = 1, GAME_FAST_LOADS = 2,
+       GAME_SAVESTATE = 3, GAME_REWIND = 4 };
 
 /* ---- per-title registration ---------------------------------------------
  * Rows a game registers live here rather than in the dispatch chains below,
@@ -232,6 +236,7 @@ static const char *const VSYNC_LABELS[]   = { "Off \xe2\x80\x94 lowest lag", "On
 static const char *const SSAA_LABELS[]    = { "Native (1x)", "2x", "3x", "4x" };
 static const char *const LOADS_LABELS[]   = { "Off \xe2\x80\x94 authentic", "Fast", "Instant" };
 static const char *const SPEEDGOV_LABELS[] = { "Off", "On" };
+static const char *const NATIVE_RATE_LABELS[] = { "Off", "On" };
 /* Write-only cheat: index IS the number of copies given, 0 = do nothing. */
 
 static int s_visible;    /* bar drawn; does not capture input */
@@ -291,6 +296,7 @@ static PsxVideoMenuState s_state = {
     .supersampling  = 1,
     .fast_loads     = PSX_VM_LOADS_OFF,
     .speed          = PSX_VM_SPEED_DEFAULT,
+    .native_rate_rendering = 1,
     .vol_master     = 100,
     .vol_music      = 100,
     .vol_sound      = 100,
@@ -317,7 +323,7 @@ static int num_range(int m, int row, int *lo, int *hi) {
             *lo = r->lo; *hi = r->hi; return 1;
         }
     }
-    if (m == MENU_GAME && row == 0) {
+    if (m == MENU_GAME && row == GAME_SPEED) {
         *lo = 1; *hi = PSX_VM_SPEED_MAX; return 1;
     }
     if (m == MENU_VIDEO && row == 4) {   /* WINDOWED SCALE */
@@ -334,7 +340,7 @@ static int num_range(int m, int row, int *lo, int *hi) {
 
 static int num_get(int m, int row) {
     { VmRegRow *r = row_reg(m, row); if (r) return r->value; }
-    if (m == MENU_GAME && row == 0) return s_state.speed;
+    if (m == MENU_GAME && row == GAME_SPEED) return s_state.speed;
     if (m == MENU_VIDEO && row == 4) return s_state.windowed_scale;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER) return s_state.vol_master;
@@ -354,7 +360,7 @@ static void num_set(int m, int row, int v) {
             return;
         }
     }
-    if (m == MENU_GAME && row == 0) s_state.speed = v;
+    if (m == MENU_GAME && row == GAME_SPEED) s_state.speed = v;
     if (m == MENU_VIDEO && row == 4) s_state.windowed_scale = v;
     if (m == MENU_AUDIO) {
         if (row == AUD_MASTER)     s_state.vol_master = v;
@@ -403,7 +409,7 @@ static int builtin_rows(int m) {
     if (m == MENU_VIDEO) return 7;
     if (m == MENU_AUDIO) return 4;
     if (m == MENU_CHEATS) return 0;   /* titles fill this; empty until they do */
-    if (m == MENU_GAME) return 4;
+    if (m == MENU_GAME) return 5;
     if (m == MENU_MODS) return 0;   /* mods fill this; empty until they do */
     return 1;
 }
@@ -447,7 +453,8 @@ static int row_kind(int m, int row) {
      * it are a number and an option, so unlike FILE this menu has no
      * whole-menu answer, and num_range below reports 0 here, which would
      * otherwise make it an IT_OPTION that cycles nothing. */
-    if (m == MENU_GAME && (row == 2 || row == 3)) return IT_ACTION;
+    if (m == MENU_GAME && (row == GAME_SAVESTATE || row == GAME_REWIND))
+        return IT_ACTION;
     if (num_range(m, row, &lo, &hi)) return IT_NUMBER;
     return IT_OPTION;
 }
@@ -542,9 +549,10 @@ static const char *row_label(int m, int row) {
                           : "Quit to Desktop";
     if (m == MENU_VIEW) return "Menu bar";
     if (m == MENU_GAME)
-        return (row == 0) ? "Speed"
-             : (row == 1) ? "Fast loading"
-             : (row == 2) ? "Save / load state"
+        return (row == GAME_SPEED) ? "Speed"
+             : (row == GAME_NATIVE_RATE) ? "Native-rate rendering"
+             : (row == GAME_FAST_LOADS) ? "Fast loading"
+             : (row == GAME_SAVESTATE) ? "Save / load state"
                           : "Rewind";
     if (m == MENU_AUDIO)
         return (row == AUD_MASTER) ? "Master"
@@ -623,7 +631,9 @@ static const char *row_value(int m, int row) {
     if (m == MENU_VIEW) return "Visible   F10";
     if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
         return SPEEDGOV_LABELS[s_state.speed_governor ? 1 : 0];
-    if (m == MENU_GAME && row == 1)
+    if (m == MENU_GAME && row == GAME_NATIVE_RATE)
+        return NATIVE_RATE_LABELS[s_state.native_rate_rendering ? 1 : 0];
+    if (m == MENU_GAME && row == GAME_FAST_LOADS)
         return LOADS_LABELS[(s_state.fast_loads >= 0 && s_state.fast_loads <= 2)
                                 ? s_state.fast_loads : 0];
     if (m != MENU_VIDEO) return NULL;
@@ -674,7 +684,11 @@ static const char *row_hint(int m, int row) {
                           ? "End this session and return to the launcher"
                           : "End this session and close the application";
     if (m == MENU_VIEW) return "Press F10 any time to show or hide";
-    if (m == MENU_GAME && row == 1)
+    if (m == MENU_GAME && row == GAME_NATIVE_RATE)
+        return s_state.native_rate_rendering
+                   ? "Caps rendering at 59.94 FPS; game and audio keep selected speed"
+                   : "Renders every accelerated frame \xe2\x80\x94 much heavier at 4K";
+    if (m == MENU_GAME && row == GAME_FAST_LOADS)
         return s_state.fast_loads == PSX_VM_LOADS_OFF
                    ? "Real drive timing"
              : s_state.fast_loads == PSX_VM_LOADS_FAST
@@ -682,11 +696,11 @@ static const char *row_hint(int m, int row) {
                    : "Fastest \xe2\x80\x94 back off if a load stalls";
     /* Says the quiet part out loud: the overlay this opens freezes the guest,
      * which is expected from a hotkey but surprising from a menu row. */
-    if (m == MENU_GAME && row == 2)
+    if (m == MENU_GAME && row == GAME_SAVESTATE)
         return "Pauses the game until you pick a slot";
     /* Names the hotkey as well as the effect: the row exists because the
      * feature was previously reachable only by a key nothing advertised. */
-    if (m == MENU_GAME && row == 3)
+    if (m == MENU_GAME && row == GAME_REWIND)
         return "Step back through recent frames \xe2\x80\x94 also F8";
     if (m == MENU_AUDIO && row == AUD_SPEED_GOV)
         return s_state.speed_governor
@@ -699,7 +713,7 @@ static const char *row_hint(int m, int row) {
                    ? "BGM and CD audio \xe2\x80\x94 Enter to type"
                    : "Sound effects only \xe2\x80\x94 Enter to type";
     if (num_range(m, row, &lo, &hi)) {
-        if (m == MENU_GAME && row == 0)
+        if (m == MENU_GAME && row == GAME_SPEED)
             /* No longer "audio may distort": the pacer and the guest VBlank
              * period now scale together, so device time — and with it the
              * SPU's 44.1 kHz — is unchanged at every setting. */
@@ -752,7 +766,8 @@ static int row_choices(int m, int row) {
     { VmRegRow *r = row_reg(m, row);
       if (r) return (r->kind == PSX_VM_ROW_OPTION) ? r->choice_count : 0; }
     if (m == MENU_AUDIO) return (row == AUD_SPEED_GOV) ? 2 : 0;
-    if (m == MENU_GAME)  return (row == 1) ? 3 : 0;
+    if (m == MENU_GAME)
+        return row == GAME_NATIVE_RATE ? 2 : row == GAME_FAST_LOADS ? 3 : 0;
     if (m != MENU_VIDEO) return 0;
     switch (row) {
         case 0: case 1: case 2: return 2;
@@ -786,7 +801,13 @@ static void cycle_row(int m, int row, int delta) {
         s_dirty = 1;
         return;
     }
-    if (m == MENU_GAME && row == 1) {
+    if (m == MENU_GAME && row == GAME_NATIVE_RATE) {
+        s_state.native_rate_rendering = s_state.native_rate_rendering ? 0 : 1;
+        s_changed = 1;
+        s_dirty = 1;
+        return;
+    }
+    if (m == MENU_GAME && row == GAME_FAST_LOADS) {
         int v = s_state.fast_loads + delta;
         while (v < 0) v += 3;
         while (v > 2) v -= 3;
@@ -1772,6 +1793,7 @@ void psx_video_menu_debug_snapshot(PsxVideoMenuDebug *out) {
     out->speed_governor = s_state.speed_governor ? 1 : 0;
     out->fast_loads    = s_state.fast_loads;
     out->speed         = s_state.speed;
+    out->native_rate_rendering = s_state.native_rate_rendering ? 1 : 0;
     out->supersampling = s_state.supersampling;
 }
 
@@ -2010,7 +2032,7 @@ int psx_video_menu_mouse_click(int win_x, int win_y) {
                  * about to open runs its own pause loop and takes the keyboard
                  * and pad, so an expanded dropdown would fight it for keys. */
                 if (s_menu == MENU_GAME) {
-                    if (r == 3) s_rewind = 1;
+                    if (r == GAME_REWIND) s_rewind = 1;
                     else        s_savestate = 1;
                 } else if (s_menu == MENU_FILE && r == ACT_DISC) {
                     s_pick_disc = 1;
@@ -2122,7 +2144,7 @@ int psx_video_menu_handle_key(int key) {
                     /* See the mouse path: raise the one-shot, then collapse so
                      * the save-state overlay's pause loop owns the keyboard. */
                     if (s_menu == MENU_GAME) {
-                        if (s_item[s_menu] == 3) s_rewind = 1;
+                        if (s_item[s_menu] == GAME_REWIND) s_rewind = 1;
                         else                     s_savestate = 1;
                     } else if (s_menu == MENU_FILE &&
                                s_item[s_menu] == ACT_DISC) {
@@ -2405,6 +2427,8 @@ int psx_video_menu_settings_load(const char *path, PsxVideoMenuState *out) {
         else if (!strcmp(key, "speed")) {
             if (v >= 1 && v <= PSX_VM_SPEED_MAX) out->speed = v;
         }
+        else if (!strcmp(key, "native_rate_rendering"))
+            out->native_rate_rendering = v ? 1 : 0;
         else if (!strcmp(key, "fast_loads")) out->fast_loads = (v >= 0 && v <= 2) ? v : 0;
         else if (!strcmp(key, "vol_master")) out->vol_master = (v >= 0 && v <= 100) ? v : 100;
         else if (!strcmp(key, "speed_governor")) out->speed_governor = v ? 1 : 0;
@@ -2523,6 +2547,7 @@ int psx_video_menu_settings_save(const char *path) {
         "supersampling=%d   # internal render scale 1..4; applies on next launch\n"
         "speed=%d           # emulation speed multiplier, 1.."
         PSX_VM_STR(PSX_VM_SPEED_MAX) " (1 = normal)\n"
+        "native_rate_rendering=%d # 1 = cap rendering at native 59.94 FPS above 1x\n"
         "fast_loads=%d      # 0 authentic, 1 fast, 2 instant disc loads\n"
         "vol_master=%d      # 0..100 master volume\n"
         "vol_music=%d       # 0..100 music bus (enveloped SPU voices + CD/XA)\n"
@@ -2541,6 +2566,7 @@ int psx_video_menu_settings_save(const char *path) {
          s_state.supersampling <= PSX_VM_SUPERSAMPLING_MAX) ? s_state.supersampling : 1,
         (s_state.speed >= 1 && s_state.speed <= PSX_VM_SPEED_MAX)
             ? s_state.speed : PSX_VM_SPEED_DEFAULT,
+        s_state.native_rate_rendering ? 1 : 0,
         (s_state.fast_loads >= 0 && s_state.fast_loads <= 2) ? s_state.fast_loads : 0,
         (s_state.vol_master >= 0 && s_state.vol_master <= 100) ? s_state.vol_master : 100,
         (s_state.vol_music  >= 0 && s_state.vol_music  <= 100) ? s_state.vol_music  : 100,

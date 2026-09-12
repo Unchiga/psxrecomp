@@ -46,7 +46,12 @@ typedef struct PsxVideoMenuState {
      * row's hint says out loud, because a control that silently does nothing
      * until restart is worse than no control. */
     int supersampling;
-    int speed;           /* emulation speed multiplier, 1..16 (1 = normal) */
+    int speed;           /* emulation speed multiplier, 1..4 (1 = normal) */
+    /* 1 = at speeds above 1x, keep full-resolution presentation at the
+     * game's native 59.94 Hz while simulation/input/audio still run at the
+     * selected multiplier. This protects the SPU budget on high-resolution
+     * displays without changing game speed. */
+    int native_rate_rendering;
     /* PSX_VM_LOADS_* — how hard to accelerate disc loads. Drives the emulated
      * drive's sector delay ONLY, never host pacing: host pacing speeds the
      * whole machine up while a load is detected, which also speeds the sound
@@ -101,14 +106,10 @@ enum { PSX_VM_RENDERER_UNSET = -1, PSX_VM_RENDERER_SOFTWARE = 0,
  *   speed 4   240 VBlank/s requested, 240.8 achieved (100%)  SPU 100%, 0 underruns
  *   speed 5   300 requested,          187.5 achieved ( 62%)  SPU  89%, 29098 underruns
  *
- * Past ~240 guest frames/s the emulated GPU cannot keep up (the guest submits
- * N times the draw commands and the host presents N times per second; guest
- * CPU cycles/s are constant by construction). The guest then falls behind real
- * time, the SPU produces fewer samples than the sink consumes, and the audio
- * breaks up. A ceiling nobody can reach cleanly is not a feature, so the row
- * stops where the audio still holds. Raising it needs the present path
- * decoupled from the VBlank rate (present every Nth frame), not a bigger
- * number here. */
+ * Native-rate rendering now decouples presentation from that VBlank rate, but
+ * the guest still submits N times the game-side GPU/CPU work. Four remains the
+ * tested, useful ceiling; raising it needs scene-level device-rate validation,
+ * not merely a larger menu range. */
 #define PSX_VM_SPEED_MAX 4
 /* Matches the recompiler's [video] supersampling range (config_loader: 1..4). */
 #define PSX_VM_SUPERSAMPLING_MAX 4
@@ -393,6 +394,7 @@ typedef struct PsxVideoMenuDebug {
      * the subsystem does not". */
     int fast_loads;        /* 0 authentic, 1 fast, 2 instant */
     int speed;             /* emulation speed multiplier */
+    int native_rate_rendering; /* GAME > NATIVE-RATE RENDERING */
     int supersampling;     /* internal render scale */
 } PsxVideoMenuDebug;
 
