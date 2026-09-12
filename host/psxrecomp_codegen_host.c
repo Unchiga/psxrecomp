@@ -4423,6 +4423,19 @@ static int write_windows_deferred_rebuild_helper(int force_pgo,
     bat_write_set(f, "EXE", g_exe_path);
     bat_write_set(f, "DISPLAY", g_display);
     {
+        /* Relaunch the same entry point the player opened.  A setup host then
+         * takes its already-tested forward_if_built path into the product,
+         * while an in-game rebuild simply starts the rebuilt product again.
+         * Launching EXE_FINAL directly used to leave some Windows first-run
+         * installs at the desktop even though the build completed; manually
+         * opening the setup exe immediately afterwards worked because its
+         * Win32 CreateProcess forwarder handled the handoff. */
+        char self_exe[1100];
+        DWORD n = GetModuleFileNameA(NULL, self_exe, (DWORD)sizeof(self_exe));
+        if (n > 0 && n < (DWORD)sizeof(self_exe))
+            bat_write_set(f, "RELAUNCH_EXE", self_exe);
+    }
+    {
         /* Post-build sanity: the dispatch file the launcher will gate on. */
         char marker_abs[1200];
         if (join_path(marker_abs, sizeof(marker_abs), g_project_root,
@@ -4505,7 +4518,17 @@ static int write_windows_deferred_rebuild_helper(int force_pgo,
             "  exit /b 1\r\n"
             ")\r\n"
             "echo Starting %%DISPLAY%%...\r\n"
-            "start \"\" /D \"%%ROOT%%\" \"%%EXE_FINAL%%\" --launcher\r\n"
+            "if not defined RELAUNCH_EXE set \"RELAUNCH_EXE=%%EXE_FINAL%%\"\r\n"
+            "if not exist \"%%RELAUNCH_EXE%%\" set \"RELAUNCH_EXE=%%EXE_FINAL%%\"\r\n"
+            /* Python just completed the build, so use its argument-list based
+             * process creation instead of relying solely on cmd.exe's unusual
+             * START quoting rules. The fallback still covers an unexpected
+             * interpreter failure after a successful build. */
+            "\"%%PYTHON%%\" -c \"import os,subprocess; "
+            "subprocess.Popen([os.environ['RELAUNCH_EXE'],'--launcher'],"
+            "cwd=os.environ['ROOT'],close_fds=True)\"\r\n"
+            "if errorlevel 1 start \"\" /D \"%%ROOT%%\" "
+            "\"%%RELAUNCH_EXE%%\" --launcher\r\n"
             "endlocal\r\n");
     fclose(f);
     return 1;
