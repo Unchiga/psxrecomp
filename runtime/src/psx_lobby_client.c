@@ -153,6 +153,7 @@ void psx_lobby_clear_launch_pending(void) {}
 #include "recomp_net/lan_beacon.h"
 #include "recomp_net/rtt_probe.h"
 #include "recomp_net/chat_filter.h"
+#include "recomp_net/auth.h"
 #include "host_time.h"
 
 #if defined(_WIN32)
@@ -1868,12 +1869,22 @@ static void queue_hello(void)
 {
     char name_esc[PSX_LOBBY_NAME_LEN * 2 + 8];
     char game_esc[PSX_LOBBY_NAME_LEN * 2 + 8];
-    char msg[PSX_LOBBY_NAME_LEN * 4 + 64];
+    char session_esc[2048];
+    char msg[PSX_LOBBY_NAME_LEN * 4 + 2176];
+    const char *session = rnet_account_session();
     json_escape(g_lc.display_name, name_esc, sizeof(name_esc));
     json_escape(g_lc.filter_game_name, game_esc, sizeof(game_esc));
-    snprintf(msg, sizeof(msg),
-             "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
-             name_esc, game_esc);
+    if (session && session[0]) {
+        json_escape(session, session_esc, sizeof(session_esc));
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\","
+                 "\"session\":\"%s\"}",
+                 name_esc, game_esc, session_esc);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "{\"op\":\"hello\",\"display_name\":\"%s\",\"game_name\":\"%s\"}",
+                 name_esc, game_esc);
+    }
     queue_send(msg);
     flush_pending();
 }

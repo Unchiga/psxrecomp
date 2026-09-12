@@ -66,6 +66,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "psx_netplay_rb.h"
 #include "psx_selfcheck.h"
 #include "psx_lobby_client.h"
+#include "recomp_net/auth.h"
 #if defined(PSX_HAS_RECOMP_NET)
 #include "recomp_net/chat_filter.h" /* chat profanity mask, LAN rooms too */
 #endif
@@ -10769,6 +10770,18 @@ namespace {
         }
         return psx_lobby_send_chat(line);
     }
+
+    int ae_np_account_available(void*) { return rnet_account_available(); }
+    int ae_np_account_login_begin(void*) { return rnet_account_login_begin(); }
+    int ae_np_account_state(void*) { return rnet_account_state(); }
+    const char* ae_np_account_handle(void*) { return rnet_account_handle(); }
+    const char* ae_np_account_username(void*) { return rnet_account_username(); }
+    const char* ae_np_account_error(void*) { return rnet_account_error(); }
+    int ae_np_account_sign_out(void*) { return rnet_account_sign_out(); }
+    int ae_np_account_set_handle(void*, const char* handle) {
+        return rnet_account_set_handle(handle);
+    }
+
     int ae_np_chat_count(void*) {
         ae_np_chat_track_room();
         if (g_lnch_hosting_lan || g_lnch_joined_lan) return g_lnch_lan_chat_count;
@@ -10974,6 +10987,7 @@ namespace {
     void ae_np_set_lobby_url(void*, const char* url) {
         g_lnch_lobby_url = url && url[0] ? url : psx_lobby_default_url();
         ae_np_save_identity(nullptr, g_lnch_lobby_url.c_str());
+        rnet_account_init(g_lnch_lobby_url.c_str());
     }
 
     int ae_np_connect(void*) {
@@ -11601,6 +11615,7 @@ namespace {
 
     void ae_np_pump(void*) {
         psx_lobby_pump();
+        rnet_account_pump();
         ae_np_lan_browse_pump();
         ae_np_lan_udp_pump();
         /* Lobby UI has no Ready toggle; production WS still requires every
@@ -12855,6 +12870,10 @@ namespace {
         gi->window_icon_path = psx_window_icon_path(g_lnch_argv0);
 #if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
         g_lnch_game_players = game_players_n;
+        const std::string account_secret_path =
+            player_file_path(g_lnch_argv0 ? g_lnch_argv0 : "", "netplay_secret").string();
+        rnet_account_set_secret_path(account_secret_path.c_str());
+        rnet_account_init(ae_np_default_url(nullptr));
         /* ae_disc_verify only fills netplay_ok/disc_fp when this is true. */
         g_lnch_netplay_available =
             game_players_n >= 2 && game_players_n <= PSX_MAX_PLAYERS;
@@ -12872,6 +12891,16 @@ namespace {
         g_lnch_netplay_callbacks.server_chat_send = ae_np_server_chat_send;
         g_lnch_netplay_callbacks.server_chat_count = ae_np_server_chat_count;
         g_lnch_netplay_callbacks.server_chat_get = ae_np_server_chat_get;
+#if defined(RECOMP_LAUNCHER_HAS_ACCOUNT)
+        g_lnch_netplay_callbacks.account_available = ae_np_account_available;
+        g_lnch_netplay_callbacks.account_login_begin = ae_np_account_login_begin;
+        g_lnch_netplay_callbacks.account_state = ae_np_account_state;
+        g_lnch_netplay_callbacks.account_handle = ae_np_account_handle;
+        g_lnch_netplay_callbacks.account_username = ae_np_account_username;
+        g_lnch_netplay_callbacks.account_error = ae_np_account_error;
+        g_lnch_netplay_callbacks.account_sign_out = ae_np_account_sign_out;
+        g_lnch_netplay_callbacks.account_set_handle = ae_np_account_set_handle;
+#endif
         g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
         g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
         g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;
