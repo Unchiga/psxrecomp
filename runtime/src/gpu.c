@@ -3112,7 +3112,149 @@ void gpu_vblank_flush_present(void) {
     s_flushing_present = 0;
 }
 
+/* ---- Transient CLUT overrides (see gpu.h) ---------------------------------
+ * Host enhancement for mods that need more palettes than the guest's VRAM
+ * layout has room for; nothing here runs unless a slot is set. Every slot
+ * borrows a span of one shared scratch row. The span's guest contents are
+ * copied out of vram[] (the CPU VRAM every backend keeps current for
+ * CPU->VRAM transfers) before the first palette goes in, and written back
+ * before any command that could read or write the span, and at vblank. */
+typedef struct {
+    uint8_t  used, depth;          /* depth: texpage colour mode, 0 = 4-bit, 1 = 8-bit */
+    uint16_t tag, x, n;            /* tag as a GP0 CLUT field; x = scratch span start */
+    uint32_t pages;
+    uint16_t pal[256];
+} ClutOverride;
+static ClutOverride s_clut_ov[GPU_CLUT_OVERRIDE_MAX];
+static int      s_clut_ov_used;              /* slots set */
+static int      s_clut_ov_row = -1;          /* scratch row shared by the slots */
+static int      s_clut_ov_claimed;           /* span holds host palettes */
+static uint32_t s_clut_ov_lo, s_clut_ov_hi;  /* claimed span [lo, hi) of the row */
+static int8_t   s_clut_ov_owner[64];         /* slot per 16-entry block, -1 = guest */
+static uint16_t s_clut_ov_saved[1024];       /* guest contents while claimed */
+static uint64_t s_clut_ov_hits, s_clut_ov_installs, s_clut_ov_restores;
+
+static void clut_ov_restore(void) {
+    if (!s_clut_ov_claimed) return;
+    s_clut_ov_claimed = 0;
+    s_clut_ov_restores++;
+    gr_vram_transfer_in((int)s_clut_ov_lo, s_clut_ov_row, (int)(s_clut_ov_hi - s_clut_ov_lo),
+                        1, &s_clut_ov_saved[s_clut_ov_lo]);
+}
+
+static void clut_ov_install(int slot) {
+    const ClutOverride *o = &s_clut_ov[slot];
+    if (!s_clut_ov_claimed) {
+        s_clut_ov_lo = 1024u; s_clut_ov_hi = 0;
+        for (int i = 0; i < GPU_CLUT_OVERRIDE_MAX; i++) {
+            if (!s_clut_ov[i].used) continue;
+            if (s_clut_ov[i].x < s_clut_ov_lo) s_clut_ov_lo = s_clut_ov[i].x;
+            if (s_clut_ov[i].x + s_clut_ov[i].n > s_clut_ov_hi) s_clut_ov_hi = s_clut_ov[i].x + s_clut_ov[i].n;
+        }
+        memcpy(&s_clut_ov_saved[s_clut_ov_lo], &vram[(uint32_t)s_clut_ov_row * 1024u + s_clut_ov_lo],
+               (s_clut_ov_hi - s_clut_ov_lo) * sizeof *vram);
+        memset(s_clut_ov_owner, -1, sizeof s_clut_ov_owner);
+        s_clut_ov_claimed = 1;
+    }
+    int current = 1;
+    for (uint32_t b = o->x / 16u; b < (uint32_t)(o->x + o->n) / 16u; b++)
+        if (s_clut_ov_owner[b] != slot) { current = 0; s_clut_ov_owner[b] = (int8_t)slot; }
+    if (current) return;
+    s_clut_ov_installs++;
+    gr_vram_transfer_in(o->x, s_clut_ov_row, o->n, 1, o->pal);
+}
+
+int gpu_clut_override_set(int slot, uint16_t tag_x, uint16_t tag_y, int depth,
+                          uint32_t page_mask, uint16_t scratch_x,
+                          uint16_t scratch_y, const uint16_t *pal, int n) {
+    if (slot < 0 || slot >= GPU_CLUT_OVERRIDE_MAX || !pal) return -1;
+    if ((depth != 4 && depth != 8) || (n != 16 && n != 256)) return -1;
+    if ((tag_x & 15u) || tag_x > 1008u || tag_y > 511u) return -1;
+    if ((scratch_x & 15u) || scratch_x + (unsigned)n > 1024u || scratch_y > 511u) return -1;
+    ClutOverride *o = &s_clut_ov[slot];
+    if (s_clut_ov_used - o->used > 0 && scratch_y != s_clut_ov_row) return -1;
+    clut_ov_restore();
+    if (!o->used) s_clut_ov_used++;
+    s_clut_ov_row = scratch_y;
+    o->used  = 1;
+    o->depth = depth == 8;
+    o->tag   = (uint16_t)((tag_y << 6) | (tag_x >> 4));
+    o->x     = scratch_x;
+    o->pages = page_mask;
+    o->n     = (uint16_t)n;
+    memcpy(o->pal, pal, (size_t)n * sizeof *pal);
+    return 0;
+}
+
+void gpu_clut_override_clear(int slot) {
+    if (slot < 0 || slot >= GPU_CLUT_OVERRIDE_MAX || !s_clut_ov[slot].used) return;
+    clut_ov_restore();
+    s_clut_ov[slot].used = 0;
+    s_clut_ov_used--;
+}
+
+void gpu_clut_override_stats(uint64_t *hits, uint64_t *installs, uint64_t *restores) {
+    if (hits) *hits = s_clut_ov_hits;
+    if (installs) *installs = s_clut_ov_installs;
+    if (restores) *restores = s_clut_ov_restores;
+}
+
+static int clut_ov_span_hit(uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1) {
+    const uint32_t row = (uint32_t)s_clut_ov_row;
+    return y0 <= row && row <= y1 && x0 < s_clut_ov_hi && s_clut_ov_lo <= x1;
+}
+
+/* Runs before every GP0 command. */
+static void clut_ov_before_command(uint8_t op) {
+    /* NOPs and draw-environment commands touch no VRAM (a sprite run
+     * interleaves E1 texpages). */
+    if (op <= 0x01u || (op >= 0xE1u && op <= 0xE6u)) return;
+    const int draw = op >= 0x20u && op <= 0x7Fu;
+    const int textured = draw && (op & 0x04u) && !(op >= 0x40u && op <= 0x5Fu);
+    uint16_t clut = 0;
+    uint32_t page = 0, depth = 0;
+    if (textured) {
+        clut = (uint16_t)((gp0_cmd_buf[2] >> 16) & 0x7FFFu);
+        if (op < 0x40u) {   /* polygon: texpage in the second vertex's UV word */
+            const uint16_t tp = (uint16_t)(gp0_cmd_buf[(op & 0x10u) ? 5 : 4] >> 16);
+            page  = (tp & 0xFu) | (((tp >> 4) & 1u) << 4);
+            depth = (tp >> 7) & 3u;
+        } else {            /* rectangle: current GP0(E1) texpage */
+            page  = texpage_x | (texpage_y << 4);
+            depth = texpage_colors;
+        }
+        for (int i = 0; i < GPU_CLUT_OVERRIDE_MAX; i++) {
+            const ClutOverride *o = &s_clut_ov[i];
+            if (!o->used || o->tag != clut || o->depth != depth || !((o->pages >> page) & 1u))
+                continue;
+            clut_ov_install(i);
+            gp0_cmd_buf[2] = (gp0_cmd_buf[2] & 0xFFFFu) |
+                             ((uint32_t)(((unsigned)s_clut_ov_row << 6) | (o->x >> 4)) << 16);
+            s_clut_ov_hits++;
+            return;
+        }
+    }
+    if (!s_clut_ov_claimed) return;
+    if (draw) {
+        /* A draw can write inside its draw area and read its CLUT and page. */
+        int touches = clut_ov_span_hit(draw_area_left, draw_area_right,
+                                       draw_area_top, draw_area_bottom);
+        if (textured) {
+            const uint32_t tx = (page & 15u) * 64u, ty = (page >> 4) * 256u;
+            touches |= clut_ov_span_hit(tx, tx + (64u << (depth > 2u ? 2u : depth)) - 1u,
+                                        ty, ty + 255u);
+            if (depth < 2u) {
+                const uint32_t cx = (clut & 0x3Fu) * 16u, cy = (clut >> 6) & 0x1FFu;
+                touches |= clut_ov_span_hit(cx, cx + (depth ? 255u : 15u), cy, cy);
+            }
+        }
+        if (!touches) return;
+    }
+    clut_ov_restore();   /* fills, VRAM transfers and anything else */
+}
+
 void gpu_vblank_tick(void) {
+    clut_ov_restore();
     /* Close out the frame's dimmer tally before anything reads it, so
      * consumers always see a COMPLETE frame rather than a partial one. */
     gpu_fade_dimmer_latch();
@@ -5624,6 +5766,8 @@ static void gp0_execute_command(void) {
     else if (opcode >= 0x20 && opcode <= 0x7F) gp0_draw_count++;
     else if (opcode >= 0x80 && opcode <= 0xDF) gp0_copy_count++;
     else if (opcode >= 0xE1 && opcode <= 0xE6) gp0_env_count++;
+
+    if (s_clut_ov_used || s_clut_ov_claimed) clut_ov_before_command(opcode);
 
     switch (opcode) {
         case 0x00:

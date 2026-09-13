@@ -94,6 +94,28 @@ int  gpu_last_frame_vertical_split_screen(void);
 void gpu_vertical_split_debug(int *active, int *left_age, int *right_age);
 uint16_t gpu_vram_peek(int x, int y);
 
+/* Transient CLUT overrides (host enhancement; off unless a slot is set).
+ * A textured primitive whose CLUT field names (tag_x, tag_y), whose colour
+ * depth is `depth` (4 or 8) and whose texture page is in `page_mask` (bit n =
+ * page x/64 + 16 * (y/256)) draws through `pal` (n = 16 or 256 entries): the
+ * palette is written to (scratch_x, scratch_y) just before the primitive and
+ * the primitive's CLUT field is pointed there. All slots share one scratch
+ * row (set fails otherwise); 4-bit slots can sit side by side in it. The
+ * row's guest contents are copied from the CPU-side VRAM before the first
+ * palette goes in and written back before any command whose draw area, CLUT
+ * or texture page reaches the span, before any fill or VRAM transfer, and at
+ * vblank, so the guest never samples a host palette. The CPU-side VRAM
+ * tracks CPU->VRAM transfers on every backend, so the span must be one the
+ * guest fills only by transfer, and redirected primitives must not draw into
+ * it. The palette is copied. */
+#define GPU_CLUT_OVERRIDE_MAX 16
+int  gpu_clut_override_set(int slot, uint16_t tag_x, uint16_t tag_y, int depth,
+                           uint32_t page_mask, uint16_t scratch_x,
+                           uint16_t scratch_y, const uint16_t *pal, int n);
+void gpu_clut_override_clear(int slot);
+/* Primitives redirected, palette writes and span restores since start. */
+void gpu_clut_override_stats(uint64_t *hits, uint64_t *installs, uint64_t *restores);
+
 /* Shaded quad vertex capture (Phase 4.5 debug). */
 typedef struct {
     int32_t vx[4], vy[4];
