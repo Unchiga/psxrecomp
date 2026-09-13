@@ -67,6 +67,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "texture_pack.h"
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
@@ -408,6 +409,21 @@ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
+/* HD texture-pack replacement atlas (texture_pack.c owns matching; this file
+ * owns turning its answer into GL state). One shared RGBA8 texture, unit 1
+ * (VRAM keeps unit 0), sized texpack_atlas_dim() square, created lazily and
+ * topped up from texpack_take_pending() right before every textured draw. */
+static GLuint s_atlas_tex = 0;
+static int    s_atlas_dim = 0;
+static GLint  s_uAtlas = -1, s_uRepl = -1, s_uReplOrg = -1, s_uAtlasDim = -1;
+/* The replacement state the currently-OPEN textured batch was built with.
+ * Per-primitive state normally rides in the vertex (see TEXV/gpu_textured_
+ * triangle), but a replacement is one texture for potentially many prims and
+ * texpack_on_draw() is a real (if cheap-after-first-hit) lookup, so this is a
+ * batch key -- flush-on-change, same as mask/filter/texture-window already
+ * are -- rather than four more floats on every textured vertex. */
+static TexPackHit s_tb_repl;
+static int        s_tb_repl_on = 0;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
  * canonical). When wide is off these stay 0 / 512 so the canonical pass is
@@ -1113,6 +1129,15 @@ static const char *TEX_FS =
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
     "uniform float u_shift;\n"
+    /* HD texture-pack replacement. u_repl.w == 0 means "draw stock", and the
+     * whole branch below is then dead -- a build with no pack loaded, or a
+     * primitive nothing matched, costs one comparison. */
+    "uniform sampler2D u_atlas;\n"
+    "uniform vec4 u_repl;      /* atlas_x, atlas_y, scale, 1+mode (0=stock) */\n"
+    "uniform vec2 u_replorg;   /* source region origin, in THIS prim's own\n"
+    "                            texel space -- uv and org_u/org_v share that\n"
+    "                            space, atlas_x/y and scale do not */\n"
+    "uniform float u_atlasdim; /* atlas side, texels -- normalizes atlas_xy */\n"
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
@@ -1143,7 +1168,58 @@ static const char *TEX_FS =
     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
     "   * default is the PS1's affine (noperspective) mapping. */\n"
     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
-    "  if (u_filter == 0) {\n"
+    "  if (u_repl.w != 0.0) {\n"
+    /* Colour and cutout come from the replacement's own alpha, so edges stay
+     * smooth at the replacement's real resolution instead of inheriting the
+     * source texel grid's stair-steps. mode is carried as 1+real_mode so
+     * u_repl.w == 0 unambiguously means "no replacement" (mode 0 is a real,
+     * valid mode). See TexPackHit's own comment (texture_pack.h) for what
+     * each mode means; FLAT and TINTED are decoded directly, INDEXED
+     * re-derives colour from the game's OWN live CLUT so it stays correct
+     * under every palette the sheet is drawn through, the same as sampling
+     * VRAM itself would, just at the replacement's resolution. The .idx
+     * source PNG carries index*max_idx/255 in its own red channel -- the
+     * same "grey index map" scaling psx_wa_catalog_decode_rows uses so a
+     * human can actually see and paint it -- so this undoes that scale, not
+     * a raw 0..15/0..255 index. */
+    /* Bilinear on a SHARED atlas will happily blend across into whatever is
+     * packed next to this cell the moment the sample point sits within half
+     * an atlas texel of its edge -- the GPU's own 2x2 tap footprint, not
+     * anything this code controls directly. v_limits is this primitive's own
+     * inclusive source-texel bound (same one fetch_texel() already clamps
+     * to), so its size * u_repl.z gives this cell's real atlas-space extent
+     * without a new uniform; clamping the ATLAS coordinate half a texel
+     * inside that extent keeps every tap inside the cell regardless of how
+     * tightly it is packed against its neighbours. Caught live: adjacent
+     * tiles of one multi-primitive image (the boot Konami screen) showed
+     * visible seams before this. */
+    "    vec2 uv_c = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
+    "    vec2 cell_lo = u_repl.xy + vec2(0.5);\n"
+    "    vec2 cell_hi = u_repl.xy + (vec2(v_limits.zw - v_limits.xy) + vec2(1.0)) * u_repl.z - vec2(0.5);\n"
+    "    vec2 ap = clamp(u_repl.xy + (uv_c - u_replorg) * u_repl.z, cell_lo, cell_hi);\n"
+    "    vec4 rc = texture(u_atlas, ap / u_atlasdim);\n"
+    "    if (rc.a < 0.02) discard;\n"
+    "    int rmode = int(u_repl.w) - 1;\n"
+    "    if (rmode == 2) {\n"
+    "      float max_idx = (v_depth == 0) ? 15.0 : 255.0;\n"
+    "      int idx = int(rc.r * max_idx + 0.5);\n"
+    "      rgb = col5(vram_at(v_clut.x + idx, v_clut.y));\n"
+    "    } else if (rmode == 1) {\n"
+    "      rgb = col5(fetch_texel(int(floor(uv.x)), int(floor(uv.y))));\n"
+    "    } else {\n"
+    "      rgb = rc.rgb;\n"
+    "    }\n"
+    /* A replacement has no per-texel STP bit of its own (it is a plain RGBA
+     * image, not a BGR555+STP one) -- but a primitive drawn with semi-
+     * transparency enabled at all (v_semi != 0) still has to land in the
+     * blended pass below, or it draws fully opaque instead of blended
+     * (u_semipass's two-pass split keys on stp, and mode 4's dst_factor
+     * gates on stp too). Treating every visible replacement texel as STP
+     * exactly when the primitive itself is semi-enabled reproduces that at
+     * primitive granularity, which is the only granularity a replacement
+     * image actually has. */
+    "    stp = (v_semi != 0) ? 1 : 0;\n"
+    "  } else if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (raw == 0) discard;\n"
     "    rgb = col5(raw);\n"
@@ -1854,18 +1930,65 @@ static int mirror_batch_center_only(int nverts) {
     return mirror_x_center_only((int)floorf(flo), (int)ceilf(fhi));
 }
 
+/* Created on first use, never resized -- texpack_atlas_dim() is fixed for
+ * the process's life (texture_pack.c's own header). GL_RGBA8 + GL_LINEAR:
+ * replacement art is drawn at real resolution, so filtering it like any
+ * other image (unlike the VRAM texture's own point/bilinear PS1 emulation
+ * above) is the correct default. */
+static void ensure_atlas(void) {
+    if (s_atlas_tex) return;
+    s_atlas_dim = texpack_atlas_dim();
+    if (s_atlas_dim <= 0) return;
+    glGenTextures(1, &s_atlas_tex);
+    glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s_atlas_dim, s_atlas_dim, 0,
+                GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+/* texture_pack.h: "Call in a loop before drawing." Cheap when nothing is
+ * pending (one call, no match), so this runs unconditionally at the top of
+ * every textured-batch flush rather than only when THIS batch has a
+ * replacement -- a later batch this same frame might need art a draw just
+ * upload. */
+static void pump_atlas_uploads(void) {
+    ensure_atlas();
+    if (!s_atlas_tex) return;
+    int x, y, w, h; const uint8_t *rgba;
+    glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+    while (texpack_take_pending(&x, &y, &w, &h, &rgba))
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+}
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
+    const int repl_on = s_tb_repl_on;
+    const TexPackHit repl = s_tb_repl;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
+    pump_atlas_uploads();
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
     p_glUniform1i(s_uVram, 0);
+    if (repl_on && s_atlas_tex) {
+        p_glActiveTexture(PSXGL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
+        p_glActiveTexture(PSXGL_TEXTURE0);   /* leave unit 0 current, matching every other path here */
+        p_glUniform1i(s_uAtlas, 1);
+        p_glUniform4f(s_uRepl, repl.atlas_x, repl.atlas_y, repl.scale, (float)(repl.mode + 1));
+        p_glUniform2f(s_uReplOrg, repl.org_u, repl.org_v);
+        p_glUniform1f(s_uAtlasDim, (float)s_atlas_dim);
+    } else {
+        p_glUniform4f(s_uRepl, 0.0f, 0.0f, 0.0f, 0.0f);   /* w == 0: stock path, shader's whole branch is dead */
+    }
     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glUniform1i(s_uFilter, s_tb_filter);
@@ -2072,6 +2195,16 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
 
+    /* HD texture-pack lookup. base_x/base_y/depth/clut_x/clut_y/lim are
+     * exactly texpack_on_draw()'s own parameter shape -- this prim's texpage
+     * origin, bit depth and CLUT already computed above, and lim is the
+     * sampled uv bound either passed in or just derived above. dst (screen
+     * bbox) is NULL: nothing here consumes the export-reassembly feature
+     * that argument exists for. */
+    TexPackHit repl_hit;
+    const int repl_on = texpack_on_draw(base_x, base_y, depth, clut_x, clut_y, lim, NULL, &repl_hit);
+    texpack_debug_note_prim(rawtex, col);
+
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
@@ -2107,6 +2240,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
          * prim alone (composited fully before the next), let opaque prims
          * keep batching. Cost is one draw per semi prim. */
         int isolate = (semi >= 0);
+        /* Replacement identity is also a batch key -- one texture (the stock
+         * VRAM page, or one specific atlas placement) per batch, same reason
+         * mask/filter/texture-window are. Comparing atlas_x/atlas_y is enough
+         * to tell "the same matched asset" from "a different one" or "none":
+         * texpack_on_draw() caches per distinct asset, so a given asset's
+         * atlas placement is stable for the process's life. Not folded into
+         * `reason`/s_batch_reason[] -- that array is a fixed-size diagnostic
+         * already read elsewhere (debug_server.c) as exactly 7 slots. */
+        const int repl_changed = (repl_on != s_tb_repl_on) ||
+            (repl_on && (repl_hit.atlas_x != s_tb_repl.atlas_x ||
+                        repl_hit.atlas_y != s_tb_repl.atlas_y));
         int reason = -1;
         if (s_tb_n > 0) {
             if (isolate) reason = 0;
@@ -2120,11 +2264,14 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (reason >= 0) {
             s_batch_reason[reason]++;
             flush_tex_batch();
+        } else if (repl_changed && s_tb_n > 0) {
+            flush_tex_batch();
         }
         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+            s_tb_repl_on = repl_on; if (repl_on) s_tb_repl = repl_hit;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
@@ -2974,6 +3121,10 @@ static int init_gpu_raster(void) {
     s_uMaskset  = p_glGetUniformLocation(s_tex_prog, "u_maskset");
     s_uFilter   = p_glGetUniformLocation(s_tex_prog, "u_filter");
     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
+    s_uAtlas    = p_glGetUniformLocation(s_tex_prog, "u_atlas");
+    s_uRepl     = p_glGetUniformLocation(s_tex_prog, "u_repl");
+    s_uReplOrg  = p_glGetUniformLocation(s_tex_prog, "u_replorg");
+    s_uAtlasDim = p_glGetUniformLocation(s_tex_prog, "u_atlasdim");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
