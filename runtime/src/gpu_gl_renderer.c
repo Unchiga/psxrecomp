@@ -1182,22 +1182,57 @@ static const char *TEX_FS =
      * same "grey index map" scaling psx_wa_catalog_decode_rows uses so a
      * human can actually see and paint it -- so this undoes that scale, not
      * a raw 0..15/0..255 index. */
-    /* Bilinear on a SHARED atlas will happily blend across into whatever is
-     * packed next to this cell the moment the sample point sits within half
-     * an atlas texel of its edge -- the GPU's own 2x2 tap footprint, not
-     * anything this code controls directly. v_limits is this primitive's own
-     * inclusive source-texel bound (same one fetch_texel() already clamps
-     * to), so its size * u_repl.z gives this cell's real atlas-space extent
-     * without a new uniform; clamping the ATLAS coordinate half a texel
-     * inside that extent keeps every tap inside the cell regardless of how
-     * tightly it is packed against its neighbours. Caught live: adjacent
-     * tiles of one multi-primitive image (the boot Konami screen) showed
-     * visible seams before this. */
+    /* Bilinear on a shared atlas will happily blend across into whatever is
+     * packed next to a texel the moment the sample point sits within half an
+     * atlas texel of its edge -- the GPU's own 2x2 tap footprint, not
+     * anything this code controls directly. THREE things were tried here to
+     * stop it with a sampling-side clamp, all in the campaign_characters/
+     * compounded-backgrounds investigation of 2026-09-12/13, and none of
+     * them worked for every case: clamping to the whole shared cell stopped
+     * bleeding into a DIFFERENT atlas entry but let two primitives sampling
+     * adjacent sub-rectangles of the SAME entry (Simon's eyebrows and
+     * moustache) each lose their own outermost half-texel at the shared
+     * edge; clamping to each primitive's own uv footprint (v_limits) fixed
+     * that but re-opened bleeding between two DIFFERENT entries meant to
+     * tile edge-to-edge (a compounded background's own halves) -- an entry
+     * boundary and a same-entry sibling boundary need OPPOSITE answers from
+     * one clamp, which no single rectangle can give.
+     *
+     * The actual fix lives on the CPU side instead: every atlas entry now
+     * carries a 1px border replicating its own edge pixels (see TpEntry's
+     * pad_x/y/w/h in texture_pack.c). A tap landing up to half a texel past
+     * this crop's true edge reads an exact copy of that edge, not a seam and
+     * not a neighbour, so no clamp is needed here at all -- for either kind
+     * of boundary, in either direction. uv_c still clamps to v_limits for
+     * the reason it always did (the PS1's own uv-wrap semantics, same as
+     * fetch_texel's stock path), which is unrelated to atlas packing. */
     "    vec2 uv_c = clamp(uv, vec2(v_limits.xy), vec2(v_limits.zw));\n"
-    "    vec2 cell_lo = u_repl.xy + vec2(0.5);\n"
-    "    vec2 cell_hi = u_repl.xy + (vec2(v_limits.zw - v_limits.xy) + vec2(1.0)) * u_repl.z - vec2(0.5);\n"
-    "    vec2 ap = clamp(u_repl.xy + (uv_c - u_replorg) * u_repl.z, cell_lo, cell_hi);\n"
-    "    vec4 rc = texture(u_atlas, ap / u_atlasdim);\n"
+    "    vec2 ap = u_repl.xy + (uv_c - u_replorg) * u_repl.z;\n"
+    /* GL_LINEAR is intrinsically half a texel off-centre for any
+     * INTEGER atlas coordinate: bilinear's weights are computed from
+     * floor(ap - 0.5), so a sample landing exactly on a texel's own
+     * address (which every unscaled replacement's sample always does)
+     * blends 50/50 with its lower/left neighbour by construction, not by
+     * accident. Padding (see TpEntry's own comment) makes that safe --
+     * the neighbour is never WRONG content -- but it does not make it
+     * NEUTRAL: two different real texels blended together is still a
+     * different colour than either one alone, and fetch_texel's stock
+     * path (a hard index lookup, zero interpolation) never does this at
+     * all. At u_repl.z (scale) == 1 there is no upscaling to smooth FOR --
+     * one destination pixel is exactly one source texel, same as stock --
+     * so texelFetch (zero interpolation, reads exactly one texel,
+     * ignores the sampler's own filter state) reproduces stock's crisp
+     * behaviour exactly. Caught live 2026-09-13: a compounded
+     * background's two tile halves, read back from the actual GPU atlas
+     * and confirmed correctly padded and individually accurate, still
+     * showed a seam under HD -- not from bleeding into wrong content, but
+     * from smoothing across a real, sharp brightness edge in the art (an
+     * ink outline) that stock's exact-texel sampling never blurs. Bilinear
+     * still applies above scale 1, where a genuinely upscaled replacement
+     * benefits from smoothing between fewer source texels. */
+    "    vec4 rc = (u_repl.z <= 1.0)\n"
+    "        ? texelFetch(u_atlas, ivec2(floor(ap)), 0)\n"
+    "        : texture(u_atlas, ap / u_atlasdim);\n"
     "    if (rc.a < 0.02) discard;\n"
     "    int rmode = int(u_repl.w) - 1;\n"
     "    if (rmode == 2) {\n"
@@ -1212,13 +1247,27 @@ static const char *TEX_FS =
     /* A replacement has no per-texel STP bit of its own (it is a plain RGBA
      * image, not a BGR555+STP one) -- but a primitive drawn with semi-
      * transparency enabled at all (v_semi != 0) still has to land in the
-     * blended pass below, or it draws fully opaque instead of blended
+     * blended pass below for whichever texels the game actually marked
+     * semi, or those texels draw fully opaque instead of blended
      * (u_semipass's two-pass split keys on stp, and mode 4's dst_factor
-     * gates on stp too). Treating every visible replacement texel as STP
-     * exactly when the primitive itself is semi-enabled reproduces that at
-     * primitive granularity, which is the only granularity a replacement
-     * image actually has. */
-    "    stp = (v_semi != 0) ? 1 : 0;\n"
+     * gates on stp too).
+     *
+     * The injector never touches VRAM itself -- matching works BY hashing
+     * the genuine upload sitting there -- so the real stock texel, STP bit
+     * included, is still one fetch_texel() away even inside this branch.
+     * Blanket-treating every visible replacement texel as STP whenever the
+     * PRIMITIVE is semi-enabled (the previous approach) forced assets that
+     * mix opaque and semi texels within one page -- campaign_characters,
+     * whose primitive is semi-enabled for a few highlight texels but whose
+     * portrait itself is stock-opaque -- into rendering the WHOLE
+     * replacement translucent, since it discarded from the opaque pass
+     * outright. Reading STOCK's own bit instead reproduces exactly the
+     * game's own selectivity: only the texels actually marked semi in the
+     * real VRAM data blend, at the replacement's own resolution and colour
+     * everywhere else. */
+    "    stp = (v_semi != 0)\n"
+    "        ? ((fetch_texel(int(floor(uv.x)), int(floor(uv.y))) >> 15) & 1)\n"
+    "        : 0;\n"
     "  } else if (u_filter == 0) {\n"
     "    int raw = fetch_texel(int(floor(uv.x)), int(floor(uv.y)));\n"
     "    if (raw == 0) discard;\n"
@@ -2198,11 +2247,25 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     /* HD texture-pack lookup. base_x/base_y/depth/clut_x/clut_y/lim are
      * exactly texpack_on_draw()'s own parameter shape -- this prim's texpage
      * origin, bit depth and CLUT already computed above, and lim is the
-     * sampled uv bound either passed in or just derived above. dst (screen
-     * bbox) is NULL: nothing here consumes the export-reassembly feature
-     * that argument exists for. */
+     * sampled uv bound either passed in or just derived above. twin is this
+     * prim's CURRENT GP0 texture window (s_tw_* is GPU environment state,
+     * already valid for this prim by submission order -- the same values
+     * flush_tex_batch() later feeds to u_twin) -- diagnostic-only, see
+     * texpack_on_draw()'s own comment. dst is this prim's own screen
+     * bounding box -- previously always NULL (nothing here consumed the
+     * export-reassembly feature it exists for); now also fed to
+     * texpack_draw_log_json() so a screen position seen live can be matched
+     * back to the asset/region that drew it, built 2026-09-13 to root-cause
+     * campaign_characters' composited-portrait gap without guessing. */
+    const int twin[4] = { s_tw_mask_x, s_tw_mask_y, s_tw_off_x, s_tw_off_y };
+    int dx0 = xs[0], dx1 = xs[0], dy0 = ys[0], dy1 = ys[0];
+    for (int i = 1; i < 3; i++) {
+        if (xs[i] < dx0) dx0 = xs[i]; if (xs[i] > dx1) dx1 = xs[i];
+        if (ys[i] < dy0) dy0 = ys[i]; if (ys[i] > dy1) dy1 = ys[i];
+    }
+    const int prim_dst[4] = { dx0, dy0, dx1, dy1 };
     TexPackHit repl_hit;
-    const int repl_on = texpack_on_draw(base_x, base_y, depth, clut_x, clut_y, lim, NULL, &repl_hit);
+    const int repl_on = texpack_on_draw(base_x, base_y, depth, clut_x, clut_y, lim, twin, prim_dst, &repl_hit);
     texpack_debug_note_prim(rawtex, col);
 
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
@@ -2485,6 +2548,37 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+
+    /* This copy never goes through texpack_on_upload -- it moves raw words,
+     * not a tracked CPU->VRAM transfer, so nothing here would otherwise
+     * notice it happened (see texpack_note_copy()'s own header comment in
+     * texture_pack.h, and texpack_invalidate_rect()'s). Two distinct
+     * consequences, both real:
+     *
+     * texpack_note_copy() is the documented SOURCE-side case -- an asset
+     * whose content gets copied elsewhere and drawn from THERE instead,
+     * which looks identical to "genuinely never drawn" from
+     * texpack_on_draw()'s own side (ui/menu_labels_1's confirmed case).
+     * Diagnostic only; declared since the HD texture-pack work landed but
+     * never actually wired to a call site until now.
+     *
+     * texpack_invalidate_rect() is the DESTINATION-side case this call site
+     * was missing entirely: a whole page uploads once, matches by content
+     * hash, and gets registered -- then THIS copy pastes different content
+     * (a game-composited mouth shape onto a base portrait, say) into part of
+     * that same page, invisibly to the region that's still claiming it.
+     * Every later draw of that page kept matching the STALE region and
+     * showing OUR replacement's original (disc-byte) pixels instead of what
+     * the game actually composited into VRAM -- campaign_characters'
+     * dialogue portraits, confirmed live 2026-09-13: the mouth-shape overlay
+     * never showed under HD replacement because the composited page's own
+     * region was never invalidated by the very copy that changed it.
+     * Dropping the region here means that spot correctly falls back to
+     * stock quality (a real primitive is still drawing what's really in
+     * VRAM) rather than confidently showing the wrong content -- the same
+     * trade-off texpack makes everywhere else in this file. */
+    texpack_note_copy(sx, sy, w, h, dx, dy);
+    texpack_invalidate_rect(dx, dy, w, h);
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
@@ -3577,6 +3671,34 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
     glReadPixels(x, y, w, h, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, out);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    return 1;
+}
+
+/* Diagnostic (debug server "gl_atlas_peek"): read back a rect of the HD
+ * texture-pack's actual GPU-side atlas texture -- what got uploaded, not
+ * what the CPU side (texture_pack.c) thinks it built. Built 2026-09-13 after
+ * a compounded-background seam investigation exhausted every hypothesis
+ * checkable from disc/source content and CPU-side crop math (both verified
+ * correct by direct reconstruction) without ever looking at the atlas
+ * texture the shader actually samples -- this closes that gap. Binds the
+ * atlas as a temporary FBO color attachment (it is an ordinary glTexImage2D
+ * texture, never rendered to directly, so it has none of its own) purely to
+ * read it back; never written to here. */
+int gl_renderer_atlas_peek(int x, int y, int w, int h, uint8_t *out_rgba) {
+    if (!s_raster_ok || !s_ctx || !s_atlas_tex) return 0;
+    if (x < 0 || y < 0 || w < 1 || h < 1 ||
+        x + w > s_atlas_dim || y + h > s_atlas_dim) return 0;
+    pump_atlas_uploads();   /* make sure anything pending has actually landed */
+    GLuint fbo = 0;
+    p_glGenFramebuffers(1, &fbo);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    p_glFramebufferTexture2D(PSXGL_READ_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0,
+                            GL_TEXTURE_2D, s_atlas_tex, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glDeleteFramebuffers(1, &fbo);
     return 1;
 }
 
