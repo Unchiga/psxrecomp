@@ -332,8 +332,32 @@ void psx_ui_blit_scaled(PsxUiCanvas *c, int x, int y, int w, int h,
             cov = 0.5f - rr_dist((float)dx + 0.5f, (float)dy + 0.5f,
                                  ccx, ccy, chw, chh, r);
             if (cov <= 0.0f) continue;
-            for (i = 0; i < 3; i++) {
-                const int sft = 16 - i * 8;
+            /* Source alpha first (i=0, sft 24), folded into cov rather than
+             * left in `out` -- psx_ui_blend already multiplies argb's alpha
+             * by cov (sa = ((argb>>24)&0xFF)*cov), so this makes cov carry
+             * BOTH the box's rounded-corner coverage and the source pixel's
+             * own transparency, exactly what blend already expects. RGB
+             * follows (i=1..3, sft 16/8/0), same as before.
+             *
+             * Before this, `out`'s alpha stayed hardcoded at 0xFF and the
+             * loop below only ever touched i<3 -- every source pixel drew
+             * fully opaque no matter what its own alpha said. That was
+             * silently fine for art with no real transparency, but for a
+             * genuinely transparent source (psx_wa_catalog_decode's holes,
+             * and any tinted mask -- see psx_wa_catalog_tinted, the font)
+             * it painted flat: the disc-decode's "transparent" pixels are
+             * RGB (0,0,0) with alpha 0, so ignoring alpha drew them as
+             * opaque BLACK (looked plausible against the dark preview well
+             * by coincidence), and a tint mask's RGB is (255,255,255) with
+             * alpha AS the coverage, so ignoring alpha drew the WHOLE
+             * source opaque white -- see the Asset Manager's font preview,
+             * a solid white square where the glyph mask should have been.
+             * psx_drop_viewer.c's manual pre-flatten (see its own call
+             * site) is an existing, now-redundant workaround for exactly
+             * this; it stays harmless since it already forces every pixel
+             * fully opaque before handing the buffer here. */
+            for (i = 0; i < 4; i++) {
+                const int sft = 24 - i * 8;
                 float a = (float)((src[(size_t)sy0 * sw + sx0] >> sft) & 0xFFu);
                 float b = (float)((src[(size_t)sy0 * sw + sx1] >> sft) & 0xFFu);
                 float cc = (float)((src[(size_t)sy1 * sw + sx0] >> sft) & 0xFFu);
@@ -341,10 +365,12 @@ void psx_ui_blit_scaled(PsxUiCanvas *c, int x, int y, int w, int h,
                 float top = a + (b - a) * tx;
                 float bot = cc + (d - cc) * tx;
                 float v = top + (bot - top) * ty;
+                if (sft == 24) { cov *= v / 255.0f; continue; }
                 unsigned u = (unsigned)(v + 0.5f);
                 if (u > 255u) u = 255u;
                 out |= u << sft;
             }
+            if (cov <= 0.0f) continue;
             /* Blended, not stored: the rounded edge is partial coverage and
              * has to composite over whatever the box is sitting on. */
             psx_ui_blend(c, dx, dy, out, cov);
