@@ -12,7 +12,7 @@
 
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
-#include "texture_pack.h"
+#include "gpu_texpack_hooks.h"
 #include <stdio.h>
 
 static const GpuRenderBackend SW_BACKEND = {
@@ -96,7 +96,7 @@ GrBackend gr_backend(void) { return g_effective; }
 
 /* ---- Dispatch wrappers (one line each; forward to the active backend) ---- */
 void gr_init(uint16_t *vram)                         { g_b->init(vram);
-                                                       texpack_set_vram(vram); }
+                                                       gpu_texpack_set_vram(vram); }
 void gr_set_scale(int scale)                         { g_b->set_scale(scale); }
 int  gr_scale(void)                                  { return g_b->scale(); }
 void gr_set_texture_filter(int bilinear)             { g_b->set_texture_filter(bilinear); }
@@ -118,9 +118,9 @@ void gr_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
  * touches stops being valid. Same for a VRAM->VRAM copy and for a transfer:
  * all three write VRAM, so all three have to be forwarded, or a pack will
  * eventually paint stale art onto a rectangle the game has since reused. */
-void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { texpack_invalidate_rect(x, y, w, h);
+void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { gpu_texpack_invalidate_rect(x, y, w, h);
                                                             g_b->fill_rect(x, y, w, h, c); }
-void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { texpack_invalidate_rect(dx, dy, w, h);
+void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { gpu_texpack_invalidate_rect(dx, dy, w, h);
                                                                  g_b->copy_rect(sx, sy, dx, dy, w, h); }
 void gr_draw_flat_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
     g_b->draw_flat_triangle(x0, y0, x1, y1, x2, y2, c);
@@ -166,7 +166,7 @@ void gr_vram_write(int x, int y, uint16_t pixel)     { g_b->vram_write(x, y, pix
 uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, y); }
 /* The one road every piece of 2D art travels to the screen: decompressed by
  * the game, staged by gpu.c as one bulk rectangle, and handed here. */
-void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { texpack_on_upload(x, y, w, h, d);
+void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { gpu_texpack_on_upload(x, y, w, h, d);
                                                                           g_b->vram_transfer_in(x, y, w, h, d); }
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }
 void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }

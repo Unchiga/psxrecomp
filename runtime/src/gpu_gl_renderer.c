@@ -67,7 +67,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
-#include "texture_pack.h"
+#include "gpu_texpack_hooks.h"
 #include "frame_interpolation.h"
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
@@ -409,20 +409,22 @@ static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
 static GLint s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
-/* HD texture-pack replacement atlas (texture_pack.c owns matching; this file
- * owns turning its answer into GL state). One shared RGBA8 texture, unit 1
- * (VRAM keeps unit 0), sized texpack_atlas_dim() square, created lazily and
- * topped up from texpack_take_pending() right before every textured draw. */
+/* HD texture-pack replacement atlas (a title's own texture_pack.c owns
+ * matching, reached through gpu_texpack_hooks.h's hook table so this file
+ * never names it directly; this file owns turning its answer into GL
+ * state). One shared RGBA8 texture, unit 1 (VRAM keeps unit 0), sized
+ * gpu_texpack_atlas_dim() square, created lazily and topped up from
+ * gpu_texpack_take_pending() right before every textured draw. */
 static GLuint s_atlas_tex = 0;
 static int    s_atlas_dim = 0;
 static GLint  s_uAtlas = -1, s_uRepl = -1, s_uReplOrg = -1, s_uAtlasDim = -1;
 /* The replacement state the currently-OPEN textured batch was built with.
  * Per-primitive state normally rides in the vertex (see TEXV/gpu_textured_
  * triangle), but a replacement is one texture for potentially many prims and
- * texpack_on_draw() is a real (if cheap-after-first-hit) lookup, so this is a
+ * gpu_texpack_on_draw() is a real (if cheap-after-first-hit) lookup, so this is a
  * batch key -- flush-on-change, same as mask/filter/texture-window already
  * are -- rather than four more floats on every textured vertex. */
-static TexPackHit s_tb_repl;
+static GpuTexpackHit s_tb_repl;
 static int        s_tb_repl_on = 0;
 /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
@@ -1173,8 +1175,8 @@ static const char *TEX_FS =
      * smooth at the replacement's real resolution instead of inheriting the
      * source texel grid's stair-steps. mode is carried as 1+real_mode so
      * u_repl.w == 0 unambiguously means "no replacement" (mode 0 is a real,
-     * valid mode). See TexPackHit's own comment (texture_pack.h) for what
-     * each mode means; FLAT and TINTED are decoded directly, INDEXED
+     * valid mode). See GpuTexpackHit's own comment (gpu_texpack_hooks.h) for
+     * what each mode means; FLAT and TINTED are decoded directly, INDEXED
      * re-derives colour from the game's OWN live CLUT so it stays correct
      * under every palette the sheet is drawn through, the same as sampling
      * VRAM itself would, just at the replacement's resolution. The .idx
@@ -1979,14 +1981,14 @@ static int mirror_batch_center_only(int nverts) {
     return mirror_x_center_only((int)floorf(flo), (int)ceilf(fhi));
 }
 
-/* Created on first use, never resized -- texpack_atlas_dim() is fixed for
+/* Created on first use, never resized -- gpu_texpack_atlas_dim() is fixed for
  * the process's life (texture_pack.c's own header). GL_RGBA8 + GL_LINEAR:
  * replacement art is drawn at real resolution, so filtering it like any
  * other image (unlike the VRAM texture's own point/bilinear PS1 emulation
  * above) is the correct default. */
 static void ensure_atlas(void) {
     if (s_atlas_tex) return;
-    s_atlas_dim = texpack_atlas_dim();
+    s_atlas_dim = gpu_texpack_atlas_dim();
     if (s_atlas_dim <= 0) return;
     glGenTextures(1, &s_atlas_tex);
     glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
@@ -2008,7 +2010,7 @@ static void pump_atlas_uploads(void) {
     if (!s_atlas_tex) return;
     int x, y, w, h; const uint8_t *rgba;
     glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
-    while (texpack_take_pending(&x, &y, &w, &h, &rgba))
+    while (gpu_texpack_take_pending(&x, &y, &w, &h, &rgba))
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
 }
 
@@ -2016,7 +2018,7 @@ static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
     const int repl_on = s_tb_repl_on;
-    const TexPackHit repl = s_tb_repl;
+    const GpuTexpackHit repl = s_tb_repl;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
@@ -2026,12 +2028,14 @@ static void flush_tex_batch(void) {
     p_glUseProgram(s_tex_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-    p_glUniform1i(s_uVram, 0);
+    /* u_vram/u_atlas's unit numbers are set once, right after linking -- see
+     * that comment for why setting u_atlas only here (as this used to) left
+     * it sharing unit 0 with u_vram on every draw that never takes this
+     * branch. */
     if (repl_on && s_atlas_tex) {
         p_glActiveTexture(PSXGL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, s_atlas_tex);
         p_glActiveTexture(PSXGL_TEXTURE0);   /* leave unit 0 current, matching every other path here */
-        p_glUniform1i(s_uAtlas, 1);
         p_glUniform4f(s_uRepl, repl.atlas_x, repl.atlas_y, repl.scale, (float)(repl.mode + 1));
         p_glUniform2f(s_uReplOrg, repl.org_u, repl.org_v);
         p_glUniform1f(s_uAtlasDim, (float)s_atlas_dim);
@@ -2245,13 +2249,13 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
 
     /* HD texture-pack lookup. base_x/base_y/depth/clut_x/clut_y/lim are
-     * exactly texpack_on_draw()'s own parameter shape -- this prim's texpage
+     * exactly gpu_texpack_on_draw()'s own parameter shape -- this prim's texpage
      * origin, bit depth and CLUT already computed above, and lim is the
      * sampled uv bound either passed in or just derived above. twin is this
      * prim's CURRENT GP0 texture window (s_tw_* is GPU environment state,
      * already valid for this prim by submission order -- the same values
      * flush_tex_batch() later feeds to u_twin) -- diagnostic-only, see
-     * texpack_on_draw()'s own comment. dst is this prim's own screen
+     * gpu_texpack_on_draw()'s own comment. dst is this prim's own screen
      * bounding box -- previously always NULL (nothing here consumed the
      * export-reassembly feature it exists for); now also fed to
      * texpack_draw_log_json() so a screen position seen live can be matched
@@ -2264,9 +2268,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         if (ys[i] < dy0) dy0 = ys[i]; if (ys[i] > dy1) dy1 = ys[i];
     }
     const int prim_dst[4] = { dx0, dy0, dx1, dy1 };
-    TexPackHit repl_hit;
-    const int repl_on = texpack_on_draw(base_x, base_y, depth, clut_x, clut_y, lim, twin, prim_dst, &repl_hit);
-    texpack_debug_note_prim(rawtex, col);
+    GpuTexpackHit repl_hit;
+    const int repl_on = gpu_texpack_on_draw(base_x, base_y, depth, clut_x, clut_y, lim, twin, prim_dst, &repl_hit);
+    gpu_texpack_debug_note_prim(rawtex, col);
 
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
@@ -2305,15 +2309,23 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         int isolate = (semi >= 0);
         /* Replacement identity is also a batch key -- one texture (the stock
          * VRAM page, or one specific atlas placement) per batch, same reason
-         * mask/filter/texture-window are. Comparing atlas_x/atlas_y is enough
-         * to tell "the same matched asset" from "a different one" or "none":
-         * texpack_on_draw() caches per distinct asset, so a given asset's
-         * atlas placement is stable for the process's life. Not folded into
+         * mask/filter/texture-window are. atlas_x/atlas_y alone tell "the same
+         * matched ENTRY" from "a different one" or "none" (gpu_texpack_on_draw()
+         * caches per distinct asset, so a given asset's atlas placement is
+         * stable for the process's life) -- but org_u/org_v must match too:
+         * u_replorg is a per-BATCH uniform, not per-vertex, and two draws that
+         * land on the same atlas entry from different source rectangles (a
+         * retiled/anchored asset sampled from two different texture pages,
+         * say) carry different org_u/org_v despite sharing one atlas_x/y.
+         * Batching them would draw the second with the first's origin,
+         * sampling the wrong offset inside the entry. Not folded into
          * `reason`/s_batch_reason[] -- that array is a fixed-size diagnostic
          * already read elsewhere (debug_server.c) as exactly 7 slots. */
         const int repl_changed = (repl_on != s_tb_repl_on) ||
             (repl_on && (repl_hit.atlas_x != s_tb_repl.atlas_x ||
-                        repl_hit.atlas_y != s_tb_repl.atlas_y));
+                        repl_hit.atlas_y != s_tb_repl.atlas_y ||
+                        repl_hit.org_u != s_tb_repl.org_u ||
+                        repl_hit.org_v != s_tb_repl.org_v));
         int reason = -1;
         if (s_tb_n > 0) {
             if (isolate) reason = 0;
@@ -2549,36 +2561,29 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
 
-    /* This copy never goes through texpack_on_upload -- it moves raw words,
-     * not a tracked CPU->VRAM transfer, so nothing here would otherwise
-     * notice it happened (see texpack_note_copy()'s own header comment in
-     * texture_pack.h, and texpack_invalidate_rect()'s). Two distinct
-     * consequences, both real:
+    /* This copy never goes through gpu_texpack_on_upload -- it moves raw
+     * words, not a tracked CPU->VRAM transfer. Its DESTINATION is already
+     * covered: gr_copy_rect() (gpu_render.c) calls
+     * gpu_texpack_invalidate_rect() on every copy, through every backend,
+     * before dispatch -- a whole page that uploads once, matches by content
+     * hash and gets registered, then has different content (a
+     * game-composited mouth shape onto a base portrait, say) pasted into
+     * part of it by a later copy, correctly stops claiming that page rather
+     * than keep showing the replacement's original (disc-byte) pixels over
+     * what the game actually composited into VRAM. (An earlier version of
+     * this comment claimed that destination-side case was missing here --
+     * it was not; gr_copy_rect already had it, and duplicating the call at
+     * this GL-specific layer was merely redundant, not a fix. Caught
+     * reviewing the paired PR, 2026-09-14.)
      *
-     * texpack_note_copy() is the documented SOURCE-side case -- an asset
+     * gpu_texpack_note_copy() is the one real gap this GL-specific call site
+     * still needs to close: the documented SOURCE-side case -- an asset
      * whose content gets copied elsewhere and drawn from THERE instead,
      * which looks identical to "genuinely never drawn" from
-     * texpack_on_draw()'s own side (ui/menu_labels_1's confirmed case).
+     * gpu_texpack_on_draw()'s own side (ui/menu_labels_1's confirmed case).
      * Diagnostic only; declared since the HD texture-pack work landed but
-     * never actually wired to a call site until now.
-     *
-     * texpack_invalidate_rect() is the DESTINATION-side case this call site
-     * was missing entirely: a whole page uploads once, matches by content
-     * hash, and gets registered -- then THIS copy pastes different content
-     * (a game-composited mouth shape onto a base portrait, say) into part of
-     * that same page, invisibly to the region that's still claiming it.
-     * Every later draw of that page kept matching the STALE region and
-     * showing OUR replacement's original (disc-byte) pixels instead of what
-     * the game actually composited into VRAM -- campaign_characters'
-     * dialogue portraits, confirmed live 2026-09-13: the mouth-shape overlay
-     * never showed under HD replacement because the composited page's own
-     * region was never invalidated by the very copy that changed it.
-     * Dropping the region here means that spot correctly falls back to
-     * stock quality (a real primitive is still drawing what's really in
-     * VRAM) rather than confidently showing the wrong content -- the same
-     * trade-off texpack makes everywhere else in this file. */
-    texpack_note_copy(sx, sy, w, h, dx, dy);
-    texpack_invalidate_rect(dx, dy, w, h);
+     * never actually wired to a call site until now. */
+    gpu_texpack_note_copy(sx, sy, w, h, dx, dy);
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
@@ -3241,6 +3246,20 @@ static int init_gpu_raster(void) {
     p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
     p_glUseProgram(s_tex_prog);
     p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
+    /* u_vram and u_atlas's texture-unit bindings, set once here instead of
+     * every flush_tex_batch() call. u_atlas only used to get its glUniform1i
+     * on the replacement-hit branch, so any draw with no replacement left it
+     * at GLSL's default of 0 -- the same unit u_vram (a usampler2D) is bound
+     * to. Two active samplers of different base types on one texture unit is
+     * invalid per the GL spec (4.20 Samplers, "not more than one active
+     * sampler type per unit"); Mesa is permissive about it, but the spec
+     * gives a driver no obligation to be, which is exactly the kind of
+     * ostensibly-Mesa-only breakage that turns out not to be. Setting both
+     * once, right after linking, means the binding is correct for every
+     * draw from here on, including the ones that never touch the
+     * replacement branch at all. */
+    p_glUniform1i(s_uVram, 0);
+    p_glUniform1i(s_uAtlas, 1);
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
