@@ -153,6 +153,8 @@ On Windows with MSVC or plain MinGW makefiles, swap `-G Ninja` for your generato
 | `PSX_DEBUG_TOOLS` | ON for Debug/RelWithDebInfo, OFF for Release | TCP debug server + heartbeat + per-block recording |
 | `PSX_SDL_BACKEND` | `SDL3` | Host backend. Set `SDL2` explicitly for compatibility or A/B testing. |
 | `PSX_SDL3_FETCH` | ON | Fetch the pinned SDL3 release when a compatible system SDL3 package is unavailable. Set OFF for offline/system-only builds. |
+| `PSX_DEPS_OFFLINE` | OFF (env `PSX_DEPS_OFFLINE=1` flips it) | Never download a dependency. A dependency that is not vendored in `third_party/` and has no pre-extracted source tree becomes a hard error naming the missing archive, instead of a fetch that stalls behind a proxy. |
+| `PSX_THIRD_PARTY_DIR` | `<framework>/third_party` | Where vendored dependency archives are looked up (`deps.manifest` lives there). |
 | `PSX_STATIC_RUNTIME` | ON for MinGW Release | Self-contained exe (statically links SDL + libgcc/libstdc++) |
 | `PSX_RECOMP_UI` | ON | Wire a downstream game's pinned recomp-ui launcher; set OFF for headless/generated builds |
 | `PSX_ENABLE_VULKAN` | **ON** | Build the experimental Vulkan renderer when the SDK tools are present (skipped if not). Pass `OFF` to exclude it outright. |
@@ -185,6 +187,55 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target psx-runtime
 ./build/psx-runtime --game game.toml --disc tomba/tomba.cue
 ```
+
+### Split generated C
+
+The recompiler emits a game's generated C as several parallel-compilable
+translation units rather than one monolithic `<serial>_full.c`:
+
+- `<serial>_decls.h` — shared declarations: the runtime extern prologue, the
+  `static inline` unaligned load/store helpers, and forward declarations for
+  every `func_*` and `psx_alias_body_*`.
+- `<serial>_full_00.c` … `<serial>_full_NN.c` — function-body shards of roughly
+  40k lines each, each one `#include`ing the decls header.
+
+Alias-group host bodies (`psx_alias_body_*`) are externally linked rather than
+emitted into whichever shard happens to reference them, so a shard boundary can
+fall anywhere and shards carry no atomicity constraint.
+
+Measured on Tomba when this landed: a 41 MB single translation unit became 36
+shards, and an `-O3` build went from 4m35s to 51s at `-j16` (~5.4x). The
+generated function bytes are unchanged — this is purely how the same code is
+partitioned across files.
+
+**Game CMakeLists need no manual glob.** `psxrecomp_add_game_runtime()` in
+`runtime/runtime.cmake` takes `GEN_FULL_GLOB` as a multi-value argument and
+expands it itself:
+
+```cmake
+psxrecomp_add_game_runtime(psx-runtime
+  GEN_MARKER    "generated/SLUS_01234_dispatch.c"
+  GEN_FULL_GLOB "generated/SLUS_01234_full_*.c"
+  ...)
+```
+
+Each pattern is made absolute against `CMAKE_CURRENT_SOURCE_DIR` if it is not
+already, expanded with `file(GLOB)`, and the hits are concatenated into the
+`GAME_GENERATED_FULL_C` list. A pattern like `*_full_*.c` therefore picks up
+however many shards a regeneration produced, and `*_full*.c` additionally
+matches a transitional monolithic `<serial>_full.c` — so a game that has not
+been regenerated yet keeps building unchanged.
+
+If the globs match nothing, `runtime.cmake` falls back in two steps: it uses
+`GEN_FULL_FALLBACK` when the title sets it, and otherwise derives
+`<serial>_full.c` from the dispatch marker by substituting `_dispatch.c` with
+`_full.c`. So an unconfigured title still resolves to the monolith it used to
+name explicitly.
+
+One caveat: that `file(GLOB)` is a plain glob, not `CONFIGURE_DEPENDS`. Adding
+or removing shards (which is what regenerating with a different shard count
+does) changes the source list, and CMake will not notice on its own — re-run
+`cmake -S . -B build` after a regeneration that changes the shard count.
 
 ## Linking the framework
 
@@ -231,6 +282,27 @@ add `-Wa,-mbig-obj` to their compile options (recent binutils, ≥ ~2.40, handle
 these files without it). If you hit this on a framework source file, please open
 an issue with your `gcc -v` / `as --version` — the build should apply the flag
 for you.
+
+**`Build step for psx_libchdr failed: 1`, or any `FetchContent` populate
+failure.** The build could not download a pinned dependency archive — no
+network, a corporate proxy, or a TLS-inspecting firewall between you and
+github.com. libchdr is the first dependency the runtime resolves, so it is
+usually the one that reports the problem.
+
+The pinned libchdr archive is vendored at `third_party/`, so an up-to-date
+framework checkout does not download it at all. If you are on an older
+checkout, or you need SDL3/zlib offline too, stage them once from a machine
+with access and copy `third_party/` across:
+
+```sh
+psxrecomp/tools/ci/vendor_deps.sh          # stage every pinned archive
+psxrecomp/tools/ci/vendor_deps.sh --check  # verify; never downloads
+```
+
+Then configure with `-DPSX_DEPS_OFFLINE=ON` so any remaining download attempt
+fails immediately with the name of the archive to stage, rather than deep
+inside a FetchContent subbuild. An already-extracted tree works too:
+`-DFETCHCONTENT_SOURCE_DIR_PSX_LIBCHDR=<dir>`.
 
 **`SDL3 3.4+ was not found`.** The default build normally downloads the pinned
 release. Check network access, install a system SDL3 package and provide

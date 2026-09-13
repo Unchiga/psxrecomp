@@ -1,4 +1,4 @@
-﻿#ifndef PSXRECOMP_CDROM_H
+#ifndef PSXRECOMP_CDROM_H
 #define PSXRECOMP_CDROM_H
 
 #include <stdint.h>
@@ -31,6 +31,17 @@ void cdrom_notify_game_started(void);
  * ring buffer to correlate each sector transfer with its disc position. */
 int  cdrom_get_setloc_lba(void);
 
+/* Sector overrides: replace the 2048 user-data bytes delivered for a data
+ * sector (mods use this through psx_mod_cd_override_*). size < 2048 pads
+ * with zeros. Emulation thread only. */
+int      cdrom_override_set(uint32_t lba, const uint8_t* data, uint32_t size);
+int      cdrom_override_clear(uint32_t lba);
+void     cdrom_override_clear_all(void);
+uint32_t cdrom_override_count(void);
+int      cdrom_override_get(uint32_t lba, uint8_t* out2048);
+/* The mounted image's own bytes for a data sector, overrides ignored. */
+int      cdrom_read_stock_sector(uint32_t lba, uint8_t* out2048);
+
 /* 'instant' per-frame sector-IRQ budget (step 3). Clamped to [1, 4096];
  * the per-sector period additionally floors at CDROM_MIN_DELAY. Writers:
  * game.toml [runtime] instant_max_per_frame, the cdrom_instant_rate TCP
@@ -51,6 +62,25 @@ void cdrom_warm_route_stats_json(char* out, int cap);
  * Diagnostics only: recording never changes CD scheduling or delivery. */
 void cdrom_timing_reset(void);
 void cdrom_timing_stats_json(char* out, int cap);
+int cdrom_get_delivered_lba(void);
+
+/* Per-record view of the same ring, for localising a single lost/skipped
+ * sector rather than summarising thousands. */
+typedef struct CdTimingPub {
+    uint64_t seq;
+    uint64_t due_cycle;
+    uint64_t buffer_cycle;
+    uint64_t irq_arm_cycle;
+    uint64_t intc_cycle;
+    uint32_t frame;
+    int32_t  lba;
+    uint8_t  flags;      /* CDT_* bits, mirrored in the JSON as named fields */
+} CdTimingPub;
+uint64_t cdrom_timing_total(void);
+int cdrom_timing_record(uint64_t seq, CdTimingPub* out);
+/* Notify the guest that the mounted disc was reinserted. The controller stops
+ * active transfers, reports an open shell, waits two emulated seconds, then
+ * makes the mounted media readable. This call does not mount a different image. */
 void debug_force_cd_reinsert(void);
 /* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
  * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
@@ -87,6 +117,11 @@ int cdrom_load_in_progress(void);
 /* Physical non-XA data-read command state, without the logical load gap
  * bridge used by cdrom_load_in_progress(). Diagnostics only. */
 int cdrom_data_read_active(void);
+/* True while anything in the emulated controller could still deliver a CD-ROM
+ * interrupt (armed second response, queued command, un-acked or unpresented
+ * INT, pended data-ready, active read stream). False means no completion can
+ * arrive without a fresh guest command. Read-only. */
+int cdrom_completion_possible(void);
 
 /* boot_state / netplay digest — full controller FSM (sector FIFOs included). */
 uint32_t cdrom_snapshot_bytes(void);
@@ -178,7 +213,31 @@ typedef struct CDROMDebugState {
     /* One-deep pended data-ready INT1 accounting (Beetle SetAIP analog). */
     uint64_t int1_pended;
     uint64_t int1_lost;
+    /* Accelerated-read flow control: holds where a faster-than-hardware
+     * sector was deferred rather than allowed to clobber an unconsumed one.
+     * Nonzero is healthy (the guest was busy and the enhancement waited);
+     * int1_lost rising while the speed divisor != 1 is the regression. */
+    /* Sector-ring tripwires: starved = a drain found its slot exhausted
+     * while the writer had moved on (must stay 0); dropped = an unread slot
+     * was overwritten because the guest fell a full ring behind. */
+    uint64_t ring_starved;
+    uint64_t ring_dropped;
+    uint64_t accel_consumer_waits;
+    uint64_t accel_consumer_wait_cycles;
     uint8_t  int1_pending_now;
+    /* Command-response INT accounting. int1_lost above only sees the
+     * one-deep data-ready pend; these cover INT2/INT3/INT5 as well.
+     * Indexed by CD INT type 1..5, so index == type (slot 0 unused).
+     * int_lost_unseen is the one that matters: an INT destroyed by the next
+     * one before ever being presented to INTC — the guest never saw it. */
+    uint64_t int_raised[6];
+    uint64_t int_presented[6];
+    uint64_t int_clobbered[6];
+    uint64_t int_lost_unseen[6];
+    uint64_t int_acked_unpresented[6];
+    uint8_t  int_last_lost_old;
+    uint8_t  int_last_lost_new;
+    uint32_t int_last_lost_gen;
 } CDROMDebugState;
 
 typedef struct CDROMSectorDebugState {
@@ -229,6 +288,10 @@ typedef struct CDROMTraceEntry {
 
 typedef struct CDROMCommandHistoryEntry {
     uint64_t seq;
+    /* Guest cycle at which this command was issued/executed. Frame numbers
+     * cannot separate "the guest had not asked yet" from "the command was
+     * queued behind an unacked INT" -- both look like one frame. */
+    uint64_t cycle;
     uint32_t frame;
     uint32_t func;
     uint32_t pc;
@@ -276,6 +339,11 @@ typedef struct CDROMSectorHistoryEntry {
 } CDROMSectorHistoryEntry;
 
 void cdrom_debug_snapshot(CDROMDebugState* out);
+/* Live disc-speed divisor (1 authentic, >1 fast, 0 instant). During BIOS
+ * boot this is 1 regardless of configuration; the configured value is
+ * cdrom_get_game_speed_divisor() and is latched at game entry. */
+int cdrom_get_speed_divisor(void);
+int cdrom_get_game_speed_divisor(void);
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries);
 void cdrom_debug_clear_trace(void);
 uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries);

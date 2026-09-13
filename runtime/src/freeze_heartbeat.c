@@ -1,6 +1,7 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "freeze_heartbeat.h"
+#include "freeze_dump_policy.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
@@ -13,6 +14,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
+#else
+#include <sys/stat.h>   /* mkdir for the diagnostics directory */
+#include <sys/types.h>
+#include <unistd.h>     /* readlink, to anchor diagnostics beside the exe */
 #endif
 
 /* State accessors. All defined in other compilation units; declared here
@@ -82,8 +87,78 @@ static DWORD  s_main_thread_id = 0;
 static int    s_sym_initialized = 0;
 #endif
 
-#define HB_FILE        "psx_freeze_heartbeat.json"
+/* Everything this file writes goes in one subdirectory rather than beside the
+ * executable.
+ *
+ * The heartbeat is rewritten ten times a second, atomically -- .tmp, then
+ * rename over the target. A file explorer refreshing over that catches it
+ * mid-replacement, so at the top level it visibly flickers in and out and
+ * reads as the game littering its own folder. It is not litter: it is the only
+ * observability that survives a main-thread stall, and it is what identified a
+ * 42-second startup freeze from a stack trace instead of guesswork. So keep it
+ * findable and uploadable, just not underfoot -- and put the freeze dumps
+ * beside it for the same reason. */
+#define HB_DIR_NAME    "diagnostics"
+
+/* Resolved once at startup and anchored to the EXECUTABLE, not the working
+ * directory. A relative path followed the cwd, so launching through a shortcut
+ * with a different start-in folder scattered diagnostics somewhere unrelated --
+ * and the one place they are actually wanted is next to the install they came
+ * from. Falls back to the plain relative name if the executable cannot be
+ * located, which is the old behaviour and still better than not writing. */
+static char s_hb_dir[1024];
+static char s_hb_path[1100];
+static char s_hb_tmp[1120];
+
+static void hb_resolve_paths(void) {
+    char exe[1024];
+    size_t n = 0;
+    exe[0] = '\0';
+#ifdef _WIN32
+    {
+        DWORD got = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+        if (got == 0 || got >= sizeof(exe)) exe[0] = '\0';
+    }
+#else
+    {
+        ssize_t got = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (got > 0) exe[(size_t)got] = '\0'; else exe[0] = '\0';
+    }
+#endif
+    if (exe[0]) {
+        char *cut = strrchr(exe, '/');
+#ifdef _WIN32
+        char *alt = strrchr(exe, '\\');
+        if (alt && (!cut || alt > cut)) cut = alt;
+#endif
+        if (cut) { *cut = '\0'; n = strlen(exe); }
+    }
+    if (n && n + sizeof(HB_DIR_NAME) + 2 < sizeof(s_hb_dir))
+        snprintf(s_hb_dir, sizeof(s_hb_dir), "%s/%s", exe, HB_DIR_NAME);
+    else
+        snprintf(s_hb_dir, sizeof(s_hb_dir), "%s", HB_DIR_NAME);
+
+    snprintf(s_hb_path, sizeof(s_hb_path), "%s/psx_freeze_heartbeat.json",
+             s_hb_dir);
+    snprintf(s_hb_tmp, sizeof(s_hb_tmp), "%s.tmp", s_hb_path);
+}
 #define HB_INTERVAL_MS 100u
+
+/* Ticks between FILE writes while nothing is wrong. Sampling and wedge
+ * detection still run every tick; see the note at the write site. 50 ticks at
+ * 100 ms = one write every 5 seconds. */
+#define HB_WRITE_EVERY_TICKS 50u
+
+/* Best-effort; a failure just means the writes below fail too, which is
+ * already handled everywhere they happen. Called before each write rather
+ * than once at startup so a deleted directory heals on its own. */
+static void hb_ensure_dir(void) {
+#ifdef _WIN32
+    CreateDirectoryA(s_hb_dir, NULL);
+#else
+    mkdir(s_hb_dir, 0755);
+#endif
+}
 
 /* Wedge detection.
  *
@@ -164,11 +239,15 @@ static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
 static uint32_t    s_ring_count = 0;
 
-/* Wedge detection state.
- *   s_dump_armed - 1 if a wedge dump is allowed to fire; cleared after
- *                  firing, re-armed when the wedge clears (healthy tick). */
-static int      s_dump_armed = 1;
+/* Automatic full dumps are bounded independently from deliberate fatal dumps.
+ * The heartbeat JSON reports both written and suppressed event counts. */
+static FreezeDumpPolicy s_dump_policy = {0};
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
+static volatile int s_wedge_classification_paused = 0;
+
+void freeze_heartbeat_set_paused(int paused) {
+    s_wedge_classification_paused = paused ? 1 : 0;
+}
 
 #ifdef _WIN32
 /* Capture the main thread's call stack at the moment of a hard freeze.
@@ -314,6 +393,7 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
  * main thread mid-dump (2026-06-10 chest-freeze postmortem). First dump
  * in wins; the loser skips (same rings either way). */
 static volatile long s_dump_in_progress = 0;
+static uint32_t s_dump_sequence = 0;  /* protected by s_dump_in_progress */
 
 static void freeze_dump_unlock(void) {
 #ifdef _WIN32
@@ -458,14 +538,14 @@ static int hb_format_cpu_scratchpad(char *out, size_t cap) {
     return n;
 }
 
-static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
-                              uint64_t exc_reentry, uint32_t cur_fn,
-                              uint32_t last_store, uint32_t i_stat_v,
-                              uint32_t i_mask_v, int in_exc,
-                              uint64_t total_checks, uint32_t dispatch_count,
-                              uint64_t exc_entries,
-                              uint16_t sio_stat_v, uint16_t sio_ctrl_v,
-                              int sio_card_active, int mc_max, int tx_writes)
+static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
+                             uint64_t exc_reentry, uint32_t cur_fn,
+                             uint32_t last_store, uint32_t i_stat_v,
+                             uint32_t i_mask_v, int in_exc,
+                             uint64_t total_checks, uint32_t dispatch_count,
+                             uint64_t exc_entries,
+                             uint16_t sio_stat_v, uint16_t sio_ctrl_v,
+                             int sio_card_active, int mc_max, int tx_writes)
 {
     /* Snapshot the kind at entry — the global can be flipped mid-write by
      * the other thread, which is what sent the fatal (kind 4) path into
@@ -474,18 +554,24 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
 #ifdef _WIN32
     if (InterlockedCompareExchange((volatile LONG *)&s_dump_in_progress, 1, 0) != 0)
-        return;
+        return 0;
 #else
     if (__sync_lock_test_and_set(&s_dump_in_progress, 1) != 0)
-        return;
+        return 0;
 #endif
 
-    char path[128];
-    snprintf(path, sizeof(path),
-             "psx_freeze_dump_%s_%lld.json", s_backend, wall);
+    char path[1200];
+    char leaf[128];
+    hb_ensure_dir();
+    uint32_t sequence = s_dump_sequence++;
+    if (!freeze_dump_format_path(leaf, sizeof(leaf), s_backend, wall, sequence)) {
+        freeze_dump_unlock();
+        return 0;
+    }
+    snprintf(path, sizeof(path), "%s/%s", s_hb_dir, leaf);
 
     FILE *f = fopen(path, "wb");
-    if (!f) { freeze_dump_unlock(); return; }
+    if (!f) { freeze_dump_unlock(); return 0; }
 
     /* Large stdio buffer so multi-MB JSON arrays write efficiently. */
     static char io_buf[1 << 16];
@@ -657,8 +743,11 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     }
 
     fputs("}\n", f);
-    fclose(f);
+    int written = !ferror(f);
+    if (fclose(f) != 0) written = 0;
+    if (!written) (void)remove(path);
     freeze_dump_unlock();
+    return written;
 }
 
 /* Full ring dump for deliberate fatal sites (psx_fatal_halt). Runs ON the
@@ -694,14 +783,13 @@ void freeze_heartbeat_fatal_dump(const char *reason) {
                         &sio_stat, &sio_ctrl, &card_active);
 
     s_last_wedge_kind = 4;
-    s_dump_armed = 0;  /* the watchdog must not overwrite the fatal dump */
-    freeze_dump_write((long long)time(NULL), s_frame_count,
-                      psx_get_cycle_count(), exc_reentry,
-                      g_debug_current_func_addr, g_debug_last_store_pc,
-                      i_stat, i_mask, in_exc, total_checks,
-                      dispatch_count, exc_entries,
-                      sio_stat, sio_ctrl, card_active,
-                      sio_get_mc_max_state(), sio_get_tx_writes());
+    (void)freeze_dump_write((long long)time(NULL), s_frame_count,
+                            psx_get_cycle_count(), exc_reentry,
+                            g_debug_current_func_addr, g_debug_last_store_pc,
+                            i_stat, i_mask, in_exc, total_checks,
+                            dispatch_count, exc_entries,
+                            sio_stat, sio_ctrl, card_active,
+                            sio_get_mc_max_state(), sio_get_tx_writes());
 }
 
 static void heartbeat_write(void) {
@@ -757,17 +845,21 @@ static void heartbeat_write(void) {
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
-    /* ---- Wedge detection: arm-once auto-dump ----
+    /* ---- Wedge detection: bounded automatic dump ----
      * Walk back WEDGE_WINDOW_TICKS in the heartbeat ring (just pushed
      * above) and compute deltas. Trigger if any of:
      *   A. frame_count delta == 0                  (hard freeze)
      *   B. exc_reentry delta PER FRAME > threshold (reentry storm)
      *   C. frame_count delta < slow-frames floor   (host-side stall)
      *
-     * Only fires once the ring has enough history. When the wedge clears
-     * (a healthy tick), re-arm. */
+     * Only fires once the ring has enough history. The dump policy requires
+     * a sustained healthy interval before it accepts a new event, and bounds
+     * automatic full dumps for the process. Deliberate fatal dumps bypass it. */
     uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames */
-    if (s_ring_count >= WEDGE_WINDOW_TICKS) {
+    if (s_wedge_classification_paused) {
+        s_ring_count = 0;
+        s_last_wedge_kind = 0;
+    } else if (s_ring_count >= WEDGE_WINDOW_TICKS) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
          * our window is WEDGE_WINDOW_TICKS - 1 ticks before it. */
         uint32_t newest_idx = (s_ring_head + RING_CAP - 1u) % RING_CAP;
@@ -803,19 +895,16 @@ static void heartbeat_write(void) {
             wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
     }
 
-    if (wedge_kind != 0) {
-        if (s_dump_armed) {
-            s_dump_armed = 0;
-            s_last_wedge_kind = wedge_kind;
-            freeze_dump_write(wall, frame, cyc, exc_reentry, cur_fn, last_store,
-                              i_stat, i_mask, in_exc, total_checks,
-                              dispatch_count, exc_entries,
-                              sio_stat, sio_ctrl, card_active,
-                              mc_max, tx_writes);
-        }
-    } else {
-        /* Healthy tick: re-arm for the next wedge. */
-        s_dump_armed = 1;
+    if (!s_wedge_classification_paused &&
+        freeze_dump_policy_observe(&s_dump_policy, wedge_kind,
+                                   g_psx_fatal_reason != NULL)) {
+        s_last_wedge_kind = wedge_kind;
+        int written = freeze_dump_write(
+            wall, frame, cyc, exc_reentry, cur_fn, last_store,
+            i_stat, i_mask, in_exc, total_checks,
+            dispatch_count, exc_entries,
+            sio_stat, sio_ctrl, card_active, mc_max, tx_writes);
+        freeze_dump_policy_record_result(&s_dump_policy, written);
     }
 
     /* Timer1/RootCounter1 decode (Tomba 2 RCnt-wait diagnosis): if the game
@@ -915,6 +1004,10 @@ static void heartbeat_write(void) {
         "  \"bail_resolved\":%llu,\n"
         "  \"bail_flattened\":%llu,\n"
         "  \"bail_anomaly\":%llu,\n"
+        "  \"automatic_freeze_dumps\":%u,\n"
+        "  \"failed_freeze_dumps\":%u,\n"
+        "  \"suppressed_freeze_events\":%u,\n"
+        "  \"automatic_freeze_dump_limit\":%u,\n"
         "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
@@ -974,6 +1067,10 @@ static void heartbeat_write(void) {
         (unsigned long long)g_psx_bail_resolved,
         (unsigned long long)g_psx_bail_flattened,
         (unsigned long long)g_psx_bail_anomaly,
+        s_dump_policy.automatic_dumps,
+        s_dump_policy.failed_dumps,
+        s_dump_policy.suppressed_events,
+        (unsigned)FREEZE_DUMP_AUTO_LIMIT,
         g_psx_fatal_reason ? "\"" : "",
         g_psx_fatal_reason ? fatal_esc : "null",
         g_psx_fatal_reason ? "\"" : "");
@@ -1030,22 +1127,46 @@ static void heartbeat_write(void) {
     m = snprintf(buf + n, sizeof(buf) - (size_t)n, "\n}\n");
     if (m > 0) n += m;
 
+    /* Everything above is sampling and detection and stays at the full tick
+     * rate. Only the FILE WRITE is throttled, and only while nothing is wrong.
+     *
+     * The snapshot is ~21 KB. Written every tick that was ~221 KB/s, about
+     * 19.5 GB across a day of play, on every player's disk forever. The
+     * rationale above this function still claimed "~1 KB/sec" -- true when it
+     * was written, before the snapshot grew CPU registers, the scratchpad and
+     * RAM peeks.
+     *
+     * What the continuous write actually buys is one thing: state on disk if
+     * the process is force-closed while healthy, since a kill runs no handler.
+     * Five seconds of resolution is ample for that. The moment any detector
+     * trips, this drops back to writing every tick, so an actual freeze is
+     * still captured at full rate -- which is the case the file exists for.
+     *
+     * Cost of the trade: a force-close during a healthy run can lose up to
+     * five seconds of context. Cost avoided: ~50x the disk churn. */
+    {
+        static unsigned s_write_tick = 0;
+        const int urgent = (s_last_wedge_kind != 0) || g_psx_fatal_reason != 0;
+        const int due = (s_write_tick % HB_WRITE_EVERY_TICKS) == 0;
+        s_write_tick++;
+        if (!urgent && !due) return;
+    }
+
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
      * mid-write file and parsing partial JSON. Cheap on Windows
      * (MoveFileEx with REPLACE_EXISTING). */
-    char tmp_path[64];
-    snprintf(tmp_path, sizeof(tmp_path), HB_FILE ".tmp");
+    hb_ensure_dir();
 
-    FILE *f = fopen(tmp_path, "wb");
+    FILE *f = fopen(s_hb_tmp, "wb");
     if (!f) return;
     fwrite(buf, 1, (size_t)n, f);
     fclose(f);
 
 #ifdef _WIN32
-    MoveFileExA(tmp_path, HB_FILE,
+    MoveFileExA(s_hb_tmp, s_hb_path,
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 #else
-    rename(tmp_path, HB_FILE);
+    rename(s_hb_tmp, s_hb_path);
 #endif
 }
 
@@ -1067,6 +1188,8 @@ void freeze_heartbeat_start(const char *backend_label) {
      * one extra thread — small enough to keep in production builds for
      * crash forensics. */
     if (s_started) return;
+    /* Before the thread exists, so it never races a half-built path. */
+    hb_resolve_paths();
     if (backend_label && backend_label[0]) {
         size_t n = strlen(backend_label);
         if (n >= sizeof(s_backend)) n = sizeof(s_backend) - 1;

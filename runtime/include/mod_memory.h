@@ -44,6 +44,18 @@ static inline uint32_t psx_mod_gpu_dma_resolve_address_for(
 uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t size, uint32_t alignment);
 uint32_t psx_mod_gpu_dma_resolve_address(uint32_t address);
 
+/* Savestate accessors. Allocation ownership remains process-local and
+ * deterministic; a restore replaces the bytes in the already-allocated
+ * prefix and rejects snapshots from an incompatible larger layout. */
+uint32_t psx_mod_memory_snapshot_bytes(void);
+void psx_mod_memory_snapshot_write(uint8_t *out);
+int psx_mod_memory_snapshot_read(const uint8_t *in, uint32_t len);
+void psx_mod_memory_snapshot_reset(void);
+uint32_t psx_mod_gpu_dma_memory_snapshot_bytes(void);
+void psx_mod_gpu_dma_memory_snapshot_write(uint8_t *out);
+int psx_mod_gpu_dma_memory_snapshot_read(const uint8_t *in, uint32_t len);
+void psx_mod_gpu_dma_memory_snapshot_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

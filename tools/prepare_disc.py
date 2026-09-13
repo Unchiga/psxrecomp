@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from disc_companion import CompanionError, check_destination, inspect_companion, stage_companion
 
 DST_SEC = 2352
 SRC_2448 = 2448
@@ -252,6 +255,43 @@ def load_config(project_root: Path, config_path: Path | None, out_dir_cli: str |
     )
 
 
+_RAW_IMAGE_EXTS = (".bin", ".img", ".iso", ".car")
+
+
+def _find_cue_file(cue_path: Path, name: str, allow_stem: bool) -> Path | None:
+    """The file a cue's FILE line names, found beside the cue.
+
+    Players rename dumps, and a cue renamed alongside its bin still names the
+    old bin. The runtime already tolerates that (disc_path.cpp mounts the
+    sibling image); this is the same rule, so a cue the wizard just accepted
+    cannot then fail here with "missing bin":
+
+      exact name -> same name ignoring case -> (data track only) the file
+      with the cue's own stem and a raw-image extension, ignoring case.
+    """
+    cand = Path(name)
+    if not cand.is_absolute():
+        cand = cue_path.parent / cand
+    if cand.is_file():
+        return cand
+    try:
+        entries = list(cue_path.parent.iterdir())
+    except OSError:
+        return None
+    base = cand.name.lower()
+    for e in entries:
+        if e.is_file() and e.name.lower() == base:
+            return e
+    if allow_stem:
+        stem = cue_path.stem.lower()
+        for ext in _RAW_IMAGE_EXTS:
+            for e in entries:
+                if (e.is_file() and e.stem.lower() == stem
+                        and e.suffix.lower() == ext):
+                    return e
+    return None
+
+
 def list_cue_bins(cue_path: Path) -> list[Path]:
     """Return every BINARY FILE referenced by a cue, in order."""
     text = cue_path.read_text(encoding="utf-8", errors="replace")
@@ -259,15 +299,22 @@ def list_cue_bins(cue_path: Path) -> list[Path]:
     if not names:
         names = re.findall(r"FILE\s+(\S+)\s+BINARY", text, flags=re.I)
     if not names:
-        raise SystemExit(f"no BINARY FILE in cue: {cue_path}")
+        raise SystemExit(
+            f"{cue_path} names no BINARY file, so it is not a usable cue "
+            "sheet. Point the setup at the disc's .bin instead."
+        )
     out: list[Path] = []
-    for name in names:
-        cand = Path(name)
-        if not cand.is_absolute():
-            cand = cue_path.parent / cand
-        if not cand.is_file():
-            raise SystemExit(f"cue references missing bin: {cand}")
-        out.append(cand.resolve())
+    for i, name in enumerate(names):
+        found = _find_cue_file(cue_path, name, allow_stem=(i == 0))
+        if found is None:
+            raise SystemExit(
+                f'{cue_path.name} refers to "{name}", which is not next to '
+                "it. Put the .bin beside the .cue without renaming either, "
+                "or point the setup at the .bin itself."
+            )
+        if found.name != Path(name).name:
+            print(f'cue names "{name}"; using {found.name} beside it')
+        out.append(found.resolve())
     return out
 
 
@@ -292,13 +339,22 @@ def stage_multitrack_cue(
     if cue_dest.resolve() != cue_src.resolve():
         # Rewrite FILE lines to basenames so the cue stays portable if the
         # source used absolute/relative paths with directories.
+        # ... and to the names actually resolved, in case the cue named a
+        # file that only exists beside it under another name.
         text = cue_src.read_text(encoding="utf-8", errors="replace")
+        resolved = iter(bins)
         def _basename_file(m: re.Match[str]) -> str:
-            return f'FILE "{Path(m.group(1)).name}" BINARY'
+            real = next(resolved, None)
+            name = real.name if real is not None else Path(m.group(1)).name
+            return f'FILE "{name}" BINARY'
         text = re.sub(
             r'FILE\s+"([^"]+)"\s+BINARY', _basename_file, text, flags=re.I
         )
-        cue_dest.write_text(text, encoding="utf-8", newline="\n")
+        # NB: Path.write_text(newline=) is Python 3.10+. Use open() so the
+        # tools keep working on 3.9, which RHEL/Rocky 9, Debian 11 and Ubuntu
+        # 20.04 still ship as the system python3.
+        with open(cue_dest, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
         print(f"wrote {cue_dest}")
     else:
         print(f"source cue already at {cue_dest}")
@@ -400,7 +456,23 @@ def extract_via(
     root = bytes(root[:root_size])
     entries = parse_root_entries(root)
     files: dict[str, bytes] = {}
-    for need in ("SYSTEM.CNF", boot_exe):
+    # Very early titles (e.g. King's Field, Dec 1994) ship no SYSTEM.CNF; the
+    # BIOS falls back to booting PSX.EXE from the root directory. probe_disc.py
+    # already accepts these discs (5ab7a053); staging has to accept the same
+    # ones or a clean worktree can never prepare them.
+    needed = ["SYSTEM.CNF", boot_exe]
+    if "SYSTEM.CNF" not in entries:
+        if boot_exe not in entries:
+            raise SystemExit(
+                f"SYSTEM.CNF missing on disc and no {boot_exe} fallback "
+                f"(found {sorted(entries)[:20]})"
+            )
+        print(
+            "  SYSTEM.CNF missing; using the BIOS "
+            f"{boot_exe} fallback boot path"
+        )
+        needed = [boot_exe]
+    for need in needed:
         if need not in entries:
             raise SystemExit(f"missing {need} on disc (found {sorted(entries)[:20]})")
         extent, size = entries[need]
@@ -529,8 +601,7 @@ def main() -> int:
         print(f"source not found: {src}", file=sys.stderr)
         return 1
 
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-
+    selected_image = src
     cue_src: Path | None = None
     cue_bins: list[Path] = []
     if src.suffix.lower() == ".cue":
@@ -550,6 +621,14 @@ def main() -> int:
 
     kind = detect_kind(src, src_size)
 
+    # Bind the selected CUE basename, not its first track's basename.
+    try:
+        companion, companion_data = inspect_companion(selected_image, src_size, src_sha1)
+        check_destination(cfg.out_dir / cfg.cue_name, companion_data)
+    except CompanionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     known_hit = matches_known(cfg, src_size, src_md5, src_sha1)
     if cfg.known and not cfg.skip_hash_check:
         if known_hit:
@@ -568,6 +647,22 @@ def main() -> int:
             )
     elif not cfg.known and not cfg.skip_hash_check and kind == "bin2352":
         print("  no prepare_disc.known_* configured - verifying boot EXE only")
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def finish(cue_path: Path) -> None:
+        report = stage_companion(cue_path, companion, companion_data)
+        receipt = {
+            "schema": "psxrecomp-disc-preparation-v1",
+            "source_image": str(selected_image),
+            "source_data_track": {"path": str(src), "size": src_size, "sha1": src_sha1, "md5": src_md5},
+            "output_cue": str(cue_path.resolve()),
+            "subchannel": report,
+        }
+        cue_path.with_suffix(".disc-receipt.json").write_text(
+            json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(f"subchannel: {report['status']}")
+        print(f"RESULT_CUE={cue_path.resolve()}")
 
     # Multi-track Redump: keep the cue + every track bin so CDDA works.
     if cue_src is not None and len(cue_bins) > 1 and kind == "bin2352":
@@ -589,7 +684,7 @@ def main() -> int:
         print(f"  size  {out_size}")
         print(f"  md5   {out_md5}")
         print(f"  sha1  {out_sha1}")
-        print(f"RESULT_CUE={cue_path}")
+        finish(cue_path)
         return 0
 
     if kind == "bin2352":
@@ -626,13 +721,12 @@ def main() -> int:
         bin_path.write_bytes(bin_data)
 
     cue_path = cfg.out_dir / cfg.cue_name
-    cue_path.write_text(
-        f'FILE "{cfg.bin_name}" BINARY\n'
-        f"  TRACK 01 MODE2/2352\n"
-        f"    INDEX 01 00:00:00\n",
-        encoding="ascii",
-        newline="\n",
-    )
+    with open(cue_path, "w", encoding="ascii", newline="\n") as fh:
+        fh.write(
+            f'FILE "{cfg.bin_name}" BINARY\n'
+            f"  TRACK 01 MODE2/2352\n"
+            f"    INDEX 01 00:00:00\n"
+        )
     print(f"wrote {cue_path}")
 
     out_md5, out_sha1, out_size = file_hashes(bin_path)
@@ -645,7 +739,7 @@ def main() -> int:
     elif kind == "raw2448":
         print("  trimmed from 2448-byte/sector dump")
 
-    print(f"RESULT_CUE={cue_path.resolve()}")
+    finish(cue_path)
     return 0
 
 

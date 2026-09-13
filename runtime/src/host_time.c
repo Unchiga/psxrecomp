@@ -22,8 +22,28 @@
 
 static LARGE_INTEGER s_qpc_freq;
 static int s_qpc_freq_init;
-static HANDLE s_sleep_timer;
-static int s_sleep_timer_init;
+
+/* THREAD-LOCAL, and it must stay that way.
+ *
+ * This was one process-wide handle. A waitable timer created without
+ * CREATE_WAITABLE_TIMER_MANUAL_RESET is an AUTO-RESET timer: SetWaitableTimer
+ * re-arms it (cancelling any deadline already pending on it) and a signal
+ * releases exactly ONE waiter. So two threads sharing it is a race with no
+ * recovery — each arms over the other, and the loser parks in
+ * WaitForSingleObject(INFINITE) forever.
+ *
+ * That is not hypothetical: 2026-08-16, frame interpolation added a second
+ * sleeping thread (the 240 Hz presenter) alongside the frame pacer. At GAME >
+ * SPEED 4x the pacer sleeps four times as often, contention rose, and the
+ * presenter parked permanently — the window froze for 92 seconds while the
+ * guest ran on at 240 fps and kept capturing frames nobody would ever present.
+ * Before interpolation only one thread ever slept here, which is why a
+ * process-wide handle survived this long.
+ *
+ * The init flag has to be thread-local for the same reason: as a shared
+ * check-then-set it also let two threads both run the create path. */
+static _Thread_local HANDLE s_sleep_timer;
+static _Thread_local int s_sleep_timer_init;
 
 static void sleep_timer_ensure(void)
 {

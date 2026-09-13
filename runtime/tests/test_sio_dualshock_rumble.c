@@ -15,6 +15,7 @@ uint32_t i_stat = 0;
 uint32_t i_mask = 0;
 uint32_t g_debug_current_func_addr = 0;
 uint32_t g_debug_last_store_pc = 0;
+uint32_t g_psx_cpu_overclock = 1u;
 int psx_get_in_exception(void) { return 0; }
 uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
 uint32_t psx_read_word(uint32_t addr) { (void)addr; return 0; }

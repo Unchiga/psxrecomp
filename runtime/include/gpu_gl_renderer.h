@@ -15,6 +15,13 @@ struct SDL_Window;
 extern "C" {
 #endif
 
+/* Capture the COMPOSITED backbuffer -- the frame with every host overlay
+ * already drawn on it, which is the only capture that can see them.
+ * Queues a request serviced on the render thread just before the swap;
+ * poll gr_present_capture_status for 1 (written), -1 (failed), 0 (pending). */
+int gr_request_present_capture(const char *path);
+int gr_present_capture_status(int *w, int *h);
+
 /* Create the GL context on a window made with SDL_WINDOW_OPENGL.
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
@@ -23,15 +30,44 @@ int  gl_renderer_init_context(struct SDL_Window *win);
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
 
-/* Presentation-only frame interpolation. High-refresh sub-presents blend the
- * two most recent stable display images; guest simulation timing is unchanged. */
+/* Presentation-only temporal blending. High-refresh sub-presents blend the two
+ * most recent stable display images on the owning render thread/context; this
+ * does not generate motion vectors or true intermediate object positions. */
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
-                                   int blend_mode);
+                                   double source_hz, int blend_mode);
 void gl_renderer_set_interpolation_suspended(int suspended);
+int gl_renderer_interpolation_owns_cadence(void);
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames,
                                     double *host_hz, double *target_hz,
                                     uint64_t *swaps);
+
+/* Interpolation internals, for the `gl_interp` / `interp_dump` debug commands.
+ * draw_blend / draw_blend_src / draw_blend_dst are the GL blend state observed
+ * in the PRESENTATION context at the last interpolated draw, sampled before
+ * state_fix normalises it: the OSD compositor shares that context and leaves
+ * GL_BLEND armed, which would multiply the presented frame by the PSX mask bit
+ * rather than by any coverage value. */
+typedef struct {
+    int enabled, suspended, valid;
+    int w, h, scale;                       /* history texture size, in hr px */
+    int src_x, src_y, src_w, src_h;        /* VRAM rect of the last capture */
+    int source_path, force_4_3, linear, blend_mode;
+    int prev_idx, cur_idx;
+    int draw_blend, draw_blend_src, draw_blend_dst;
+    int state_fix;
+    float alpha_override;                  /* <0 = follow the frame clock */
+    uint64_t captures, swaps;
+} GlInterpDebug;
+
+void gl_renderer_interp_debug(GlInterpDebug *out);
+/* state_fix < 0 leaves the guard as-is; alpha_override < 0 restores the clock. */
+void gl_renderer_interp_set_debug(int state_fix, double alpha_override);
+/* which: 0 = prev history texture, 1 = current, 2 = the hr FBO re-read live at
+ * the last capture rect. Writes 0xAARRGGBB (alpha = PSX mask bit), `pitch` in
+ * BYTES, row 0 = first VRAM row of the band. Returns pixels written, 0 if
+ * unavailable. Emu thread only. */
+int  gl_renderer_interp_readback(int which, uint32_t *out, int pitch);
 /* Cumulative CPU-upload diagnostics: calls, rects, pixels, conversion ticks,
  * texture-upload ticks, FBO-draw ticks. Active only with PSX_RUNTIME_PERF_DIAG. */
 void gl_renderer_runtime_diag(uint64_t out[6]);
@@ -45,6 +81,24 @@ void gl_renderer_runtime_diag(uint64_t out[6]);
  * a trailing depth24 margin without changing CRTC width / stretching. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w);
+
+/* Bezel art shown in the letterbox/pillarbox margins. Takes RGBA8 pixels; the
+ * caller owns them and may free them on return. Passing NULL clears it.
+ * Returns 0 only if a texture could not be created. */
+int  gl_renderer_set_bezel(const void *rgba, int w, int h);
+int  gl_renderer_has_bezel(void);
+/* Integer scaling: snap the present rect to a whole multiple of the guest's
+ * native display size (set via gl_renderer_set_present_native_size) instead of
+ * filling the drawable continuously. Off by default. */
+void gl_renderer_set_integer_scale(int on);
+
+/* Current guest display size in native PS1 pixels, BEFORE the internal
+ * supersampling factor. Set once per present; only used by integer scaling. */
+void gl_renderer_set_present_native_size(int w, int h);
+/* Reads it back, for sizing the window to a whole multiple of the picture.
+ * Both outputs are left UNTOUCHED when nothing has been presented yet, so
+ * the caller's own fallback stands instead of being overwritten with 0. */
+void gl_renderer_get_present_native_size(int *w, int *h);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
@@ -81,6 +135,11 @@ void gl_renderer_restage_vram_after_savestate(void);
  * digests / GPUREAD authority) while the OpenGL hr FBO keeps settings-scale
  * SSAA for present-only. Never enables glReadPixels; CPU stays current. */
 void gl_renderer_set_cpu_auth_dual(int on);
+
+/* FMV present reconstruction, settings.toml [video] fmv_filter. Takes the
+ * config enum VIDEO_FMV_FILTER_* (0 nearest, 1 bilinear, 2 sharp, 3 bicubic).
+ * Only consulted while video antialiasing is on; AA off is always nearest. */
+void gl_renderer_set_fmv_filter(int cfg_value);
 int  gl_renderer_cpu_auth_dual(void);
 
 /* Post-savestate freeze probe: skip/swap/dirty-mark counters (GL present path).
@@ -108,6 +167,14 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
+
+/* Scanline post-process (host display setting). on toggles the effect; strength
+ * (0..1) is the depth of the dark gap between PS1 scanlines. Applied at the
+ * native display-line pitch in the present/interpolation shaders, and faded in
+ * with output scale so it never shimmers on a sub-2x window. gl_renderer_get_
+ * scanlines returns the on flag and (via out-param) the current strength. */
+void gl_renderer_set_scanlines(int on, float strength);
+int  gl_renderer_get_scanlines(float *strength);
 
 /* Select full native-wide mirror rendering instead of the centre-splice fast
  * path. Textured edge expansion needs the complete mirror surface. */

@@ -43,6 +43,9 @@ void mod_runtime_on_dispatch(uint32_t target);
  * application. Reapply the already-validated main-EXE plan so the current
  * enabled mod selection remains authoritative after the restore. */
 void mod_runtime_on_savestate_loaded(void);
+/* Common snapshot hooks, including rollback snapshots. */
+void mod_runtime_before_savestate_save(void);
+void mod_runtime_after_savestate_load(void);
 /* Invokes activation callbacks for the committed plan. Call after the final
  * launcher commit and before renderer/window initialization. */
 void mod_runtime_activate_plugins(void);

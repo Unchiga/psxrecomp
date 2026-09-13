@@ -10,10 +10,16 @@
  * Keyboard: F8 (config.ini [KeyMap] Rewind). Controller: View/Back or L3.
  * While open: D-pad / left-stick Left/Right, Cross load, Circle/Back close.
  *
- * Env: PSX_REWIND=0 disables; PSX_REWIND_INTERVAL (1/4/8/12/15, default 15);
+ * OFF by default. The ring holds up to 200 whole-machine snapshots (2 MB RAM +
+ * 1 MB VRAM + 512 KB SPU RAM each) and captures one every rewind_interval
+ * frames, which is not a cost to hand a low-end host for a feature a session
+ * may never open. Turn it on in settings.toml or the launcher's Display card.
+ *
+ * Env: PSX_REWIND=1 enables, PSX_REWIND=0 disables; either outranks the UI.
+ *      PSX_REWIND_INTERVAL (1/4/8/12/15, default 15);
  *      PSX_REWIND_FMV_INTERVAL (frames while depth24/MDEC/XA, default 4);
  *      PSX_REWIND_DEPTH (50/100/150/200, default 50, max 200).
- * settings.toml [video] rewind_depth / rewind_interval (env still wins).
+ * settings.toml [video] rewind / rewind_depth / rewind_interval (env still wins).
  */
 
 #include <stdint.h>
@@ -26,6 +32,9 @@ extern "C" {
 /* Snap count kept in the local rewind ring. UI values: 25 / 50 / 75 / 100. */
 void psx_rewind_set_depth(uint32_t depth);
 void psx_rewind_set_interval(uint32_t interval);
+/* Settings/launcher preference. Call before psx_rewind_configure(); to change
+ * it mid-session, call this then configure() (on) or shutdown() (off). */
+void psx_rewind_set_enabled(int enabled);
 
 void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc);
 void psx_rewind_shutdown(void);
@@ -45,6 +54,32 @@ int  psx_rewind_toggle(void);          /* open/close; 1 if state changed */
 int  psx_rewind_cancel(void);          /* close without load */
 int  psx_rewind_accept(void);          /* stage load of selected snap */
 void psx_rewind_move(int delta);       /* -1 / +1 selection */
+void psx_rewind_select(int index);     /* absolute selection; ignores out-of-range */
+
+/* Mouse support for the filmstrip.
+ *
+ * Coordinates are DRAWABLE pixels, and surface_w/surface_h the drawable size.
+ * The panel is authored against a fixed 640x176 canvas that the renderer
+ * stretches across the full window width and slides up from the bottom edge,
+ * so the window -> canvas mapping lives here, next to the geometry it has to
+ * agree with, and accounts for the slide animation. Everything reports "no
+ * hit" while the panel is off screen or mid-slide.
+ *
+ * _hit_thumb returns the snap index under the cursor, or -1. Clicking a
+ * thumbnail only SELECTS it; loading is the footer's job, deliberately, since
+ * a load discards live progress and a stray click should not cost that.
+ * _hit_action covers the footer legends, which were already drawn as buttons.
+ * _hover updates the highlight and marks the panel dirty only on a real
+ * change, so a moving cursor does not force a redraw every frame. */
+enum { PSX_RW_ACTION_NONE = 0, PSX_RW_ACTION_LOAD, PSX_RW_ACTION_CLOSE };
+int  psx_rewind_hit_thumb(int x, int y, int surface_w, int surface_h);
+int  psx_rewind_hit_action(int x, int y, int surface_w, int surface_h);
+void psx_rewind_hover(int x, int y, int surface_w, int surface_h);
+
+/* Debug-server surface (rewind_state). The filmstrip is driven by real input
+ * and drawn as a host overlay, so it is invisible to the VRAM screenshot and
+ * had no readback at all. */
+void psx_rewind_debug(int *open, int *sel, int *count, int *hover);
 
 /* Edge-triggered nav with repeat. *_down is 1 while held. */
 void psx_rewind_nav_held(int left_down, int right_down, int accept_down,

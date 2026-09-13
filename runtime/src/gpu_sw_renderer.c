@@ -281,20 +281,8 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
-static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
-                                int mod_r, int mod_g, int mod_b,
-                                int raw_texture) {
-    if (x < 0 || x >= t->w || y < 0 || y >= t->h) return;
-    if (x < t->cx1 || x > t->cx2 || y < t->cy1 || y > t->cy2) return;
-
-    /* Transparent texel (0x0000) is always skipped */
-    if (texel == 0x0000) return;
-
-    int idx = y * t->w + x;
-
-    /* Mask bit check */
-    if (g_mask_check_bit && (t->buf[idx] & 0x8000)) return;
-
+static inline uint16_t modulate_texel(uint16_t texel, int mod_r, int mod_g,
+                                      int mod_b, int raw_texture) {
     /* Color modulation: multiply texel by vertex color unless raw texture */
     uint16_t color;
     if (!raw_texture) {
@@ -310,6 +298,16 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     } else {
         color = texel & 0x7FFF;
     }
+    return color;
+}
+
+static inline void put_textured_color(const RTarget *t, int x, int y,
+                                      uint16_t texel, uint16_t color) {
+    if (x < 0 || x >= t->w || y < 0 || y >= t->h) return;
+    if (x < t->cx1 || x > t->cx2 || y < t->cy1 || y > t->cy2) return;
+    if (texel == 0) return;
+    int idx = y * t->w + x;
+    if (g_mask_check_bit && (t->buf[idx] & 0x8000)) return;
 
     /* Semi-transparency: for textured primitives, only blend if texel has bit 15 */
     if (g_semi_trans_enabled && (texel & 0x8000)) {
@@ -322,6 +320,12 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     t->buf[idx] = color;
     if (t->buf == g_vram)
         gpu_vram_dirty_mark_row((uint32_t)y);
+}
+
+static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
+                                int mod_r, int mod_g, int mod_b, int raw_texture) {
+    put_textured_color(t, x, y, texel,
+                      modulate_texel(texel, mod_r, mod_g, mod_b, raw_texture));
 }
 
 /* ------------------------------------------------------------------ */
@@ -617,9 +621,14 @@ static void hr_fill_block(int x, int y, int w, int h, uint16_t color) {
     for (int row = 0; row < H; row++) {
         int py = (y0 + row) % g_hr_h;
         uint16_t *dst = g_hr + (size_t)py * g_hr_w;
-        for (int col = 0; col < W; col++) {
-            int px = (x0 + col) % g_hr_w;
-            dst[px] = color;
+        /* Clear contiguous spans between wraps. Per-pixel integer remainder
+         * made framebuffer clears expensive at supersampled resolutions. */
+        int px = x0, remaining = W;
+        while (remaining > 0) {
+            const int count = min_i(remaining, g_hr_w - px);
+            for (int col = 0; col < count; col++) dst[px + col] = color;
+            remaining -= count;
+            px = 0;
         }
     }
 }
@@ -1246,6 +1255,20 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
 
 static void raster_flat_rect(const RTarget *t, int x, int y, int w, int h,
                              uint16_t color) {
+    if (!g_mask_check_bit && !g_semi_trans_enabled) {
+        const int x0 = max_i(max_i(x, t->cx1), 0);
+        const int x1 = min_i(min_i(x + w, t->cx2 + 1), t->w);
+        const int y0 = max_i(max_i(y, t->cy1), 0);
+        const int y1 = min_i(min_i(y + h, t->cy2 + 1), t->h);
+        if (x0 >= x1) return;
+        if (g_mask_set_bit) color |= 0x8000;
+        for (int py = y0; py < y1; py++) {
+            uint16_t *dst = t->buf + py * t->w;
+            for (int px = x0; px < x1; px++) dst[px] = color;
+            if (t->buf == g_vram) gpu_vram_dirty_mark_row((uint32_t)py);
+        }
+        return;
+    }
     for (int row = 0; row < h; row++) {
         int py = y + row;
         if (py < t->cy1 || py > t->cy2) continue;
@@ -1299,10 +1322,60 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
 /* the rectangle's footprint is rendered at the higher resolution.    */
 /* ------------------------------------------------------------------ */
 
+/* Mirrors sample immutable canonical VRAM. Cache a nearest-filtered source
+ * row across repeated supersampled rows, including modulation, rather than
+ * fetching/shading the same texel S*S times. Canonical draws must stay ordered:
+ * render-to-texture can read pixels that an earlier destination write changed.
+ * Bilinear and unusually wide targets retain the general pixel path. */
+static int raster_nearest_mirror_rect(const RTarget *t, int x, int y, int w, int h,
+                                      int u, int v, int du, int dv, int scaled,
+                                      uint16_t clut_x, uint16_t clut_y, uint16_t texpage) {
+    enum { MAX_COLUMNS = VRAM_WIDTH * SW_MAX_INTERNAL_SCALE };
+    uint16_t source_u[MAX_COLUMNS], texels[MAX_COLUMNS], colors[MAX_COLUMNS];
+    if (t->buf == g_vram || g_texture_filter || w <= 0 || h <= 0) return 0;
+    const int x0 = max_i(max_i(x, t->cx1), 0);
+    const int x1 = min_i(min_i(x + w, t->cx2 + 1), t->w);
+    const int y0 = max_i(max_i(y, t->cy1), 0);
+    const int y1 = min_i(min_i(y + h, t->cy2 + 1), t->h);
+    const int cols = x1 - x0;
+    if (cols <= 0 || y0 >= y1) return 1;
+    if (cols > MAX_COLUMNS) return 0;
+    for (int i = 0; i < cols; i++) {
+        const int col = x0 + i - x;
+        source_u[i] = (uint16_t)((u + (scaled ? ((int64_t)du * col) / w
+                                                    : col / t->s)) & 0xFF);
+    }
+    int last_v = -1;
+    for (int py = y0; py < y1; py++) {
+        const int row = py - y;
+        const int tv = (int)(v + (scaled ? ((int64_t)dv * row) / h
+                                            : row / t->s)) & 0xFF;
+        if (tv != last_v) {
+            int last_u = -1;
+            uint16_t texel = 0, color = 0;
+            for (int i = 0; i < cols; i++) {
+                if (source_u[i] != last_u) {
+                    last_u = source_u[i];
+                    texel = texel_fetch(last_u, tv, texpage, clut_x, clut_y);
+                    color = modulate_texel(texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+                }
+                texels[i] = texel;
+                colors[i] = color;
+            }
+            last_v = tv;
+        }
+        for (int i = 0; i < cols; i++)
+            put_textured_color(t, x0 + i, py, texels[i], colors[i]);
+    }
+    return 1;
+}
+
 static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
                                  int u, int v,
                                  uint16_t clut_x, uint16_t clut_y,
                                  uint16_t texpage) {
+    if (raster_nearest_mirror_rect(t, x, y, w, h, u, v, 0, 0, 0,
+                                   clut_x, clut_y, texpage)) return;
     int s = t->s;
     for (int row = 0; row < h; row++) {
         int py = y + row;
@@ -1395,6 +1468,8 @@ static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
 
     int du = u1 - u0;
     int dv = v1 - v0;
+    if (raster_nearest_mirror_rect(t, x, y, w, h, u0, v0, du, dv, 1,
+                                   clut_x, clut_y, texpage)) return;
 
     for (int row = 0; row < h; row++) {
         int py = y + row;

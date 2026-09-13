@@ -25,6 +25,22 @@ uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;
 uint32_t *g_psx_cyc_local_acc = NULL;
+
+/* CPU overclock (see psx_cycles.h). Stock is 1: the hot path costs one
+ * predictable branch and nothing else changes. */
+uint32_t g_psx_cpu_overclock = 1u;
+uint32_t g_psx_cpu_overclock_rem = 0u;
+
+void psx_cpu_overclock_set(uint32_t mult) {
+    if (mult < 1u) mult = 1u;
+    if (mult > 16u) mult = 16u;
+    /* Drop the carry rather than letting a stale remainder from the previous
+     * ratio leak a few cycles into the new one. */
+    g_psx_cpu_overclock_rem = 0u;
+    g_psx_cpu_overclock = mult;
+}
+
+uint32_t psx_cpu_overclock_get(void) { return g_psx_cpu_overclock; }
 static int      s_cycle_replay_active = 0;
 static uint64_t s_cycle_replay_live = 0;
 
@@ -80,6 +96,7 @@ static void advance_devices(uint32_t c) {
     dma_advance(c);
     timers_advance(c);
     interrupts_advance_cycles(c);
+    psx_spu_sample_event_service();
 }
 
 /* ===== Event-deadline device servicing (production fast path) =================
@@ -139,6 +156,7 @@ static uint32_t devices_cycles_to_next_internal_event(void) {
     uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_internal_event();     if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
+    uint32_t a = psx_spu_sample_event_cycles_to_next(); if (a < best) best = a;
     if (best == 0) best = 1;    /* due/overdue: process within one cycle */
     return best;
 }
@@ -156,8 +174,20 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
     uint32_t c = cdrom_cycles_to_irq(i_mask);   if (c < best) best = c;
     uint32_t d = dma_cycles_to_deliverable_irq(i_mask); if (d < best) best = d;
     uint32_t s = sio_cycles_to_irq(i_mask);     if (s < best) best = s;
+    /* SPU IRQ9 is raised by the guest-clock sample scheduler, not by a device
+     * *_advance(); a poll loop waiting on it must not be skipped across several
+     * 768-cycle sample boundaries before it can acknowledge and re-arm. Only an
+     * unmasked IRQ9 is observable, like the other sources above. */
+    if (i_mask & (1u << IRQ_SPU)) {
+        uint32_t a = psx_spu_sample_event_cycles_to_next(); if (a < best) best = a;
+    }
     if (best == 0) best = 1;
     return best;
+}
+
+/* Test/diagnostic accessor for the idle-skip observation boundary above. */
+uint32_t psx_idle_cycles_to_next_observable_event(void) {
+    return devices_cycles_to_next_idle_event();
 }
 
 static void psx_devices_recompute_deadline(void) {

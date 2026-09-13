@@ -72,6 +72,7 @@ int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
 
 /* Export / import a full 128KB card image (present cards only for export).
  * import marks dirty and flushes to the bound filepath. Returns 0 on success. */
+int memcard_mirror_to(int card, const char *path);
 int memcard_export_raw(int card, uint8_t *dst);
 int memcard_import_raw(int card, const uint8_t *src);
 
@@ -81,6 +82,11 @@ int memcard_rebind_dir(const char *dir);
 
 /* Restore explicit per-slot filepaths (from a prior snapshot). NULL path skips. */
 int memcard_rebind_paths(const char *path0, const char *path1);
+
+/* Rebind ONE slot's on-disk path without touching RAM. An empty/NULL path
+ * unbinds the slot (no file, not present) — the way to put back a slot the
+ * player had disabled after a sandbox bound it. Returns 0, -1 on bad slot. */
+int memcard_rebind_path(int card, const char *path);
 
 /* Reload in-memory images from the currently bound filepaths (0 = ok). */
 int memcard_reload_bound(void);

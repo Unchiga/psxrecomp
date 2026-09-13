@@ -245,6 +245,15 @@ branch_keep_sites = ["0x80012340"]
               std::vector<uint32_t>{0x80012340u},
           "parser preserves branch keep sites");
 
+    const auto nclip_exact = write_config(root, "nclip-exact", R"toml(
+[widescreen.cull]
+nclip_exact_sites = ["0x80012340"]
+)toml");
+    const auto nclip_exact_config = PSXRecompV4::load_game_config(nclip_exact);
+    check(nclip_exact_config.ws_cull_nclip_exact_sites ==
+              std::vector<uint32_t>{0x80012340u},
+          "parser preserves exact NCLIP branch sites");
+
     const auto vxrange = write_config(root, "vxrange", R"toml(
 [widescreen.cull]
 vxrange_sites = ["0x80012340"]
@@ -301,6 +310,28 @@ result = 0
               keep_config.ws_cull_keep_sites[1].expected == 0x0082202Au &&
               keep_config.ws_cull_keep_sites[1].result == 0u,
           "parser preserves full-word-guarded maximal-participation sites");
+
+    const auto signed_bound = write_config(root, "signed-x-bound", R"toml(
+[[widescreen.signed_x_bound]]
+address = "0x8002D290"
+expected = "0x2402FF00"
+
+[[widescreen.signed_x_bound]]
+address = "0x8002D298"
+expected = "0x3C02FFF0"
+)toml");
+    const auto signed_bound_config =
+        PSXRecompV4::load_game_config(signed_bound);
+    check(signed_bound_config.ws_signed_x_bound_sites.size() == 2 &&
+              signed_bound_config.ws_signed_x_bound_sites[0].address ==
+                  0x8002D290u &&
+              signed_bound_config.ws_signed_x_bound_sites[0].expected ==
+                  0x2402FF00u &&
+              signed_bound_config.ws_signed_x_bound_sites[1].address ==
+                  0x8002D298u &&
+              signed_bound_config.ws_signed_x_bound_sites[1].expected ==
+                  0x3C02FFF0u,
+          "parser preserves guarded signed pixel and Q16 X bounds");
 
     const auto bad_keep = write_config(root, "cull-keep-bad", R"toml(
 [[widescreen.cull.keep]]
@@ -613,6 +644,16 @@ void codegen_tests() {
           applied.find("cpu->gpr[2] = 1;") != std::string::npos,
           "codegen applies exact patch through physical alias");
 
+    PSXRecomp::CodeGenConfig mod_entry_config;
+    mod_entry_config.mod_function_entry_funcs.insert(0x80010000u);
+    const std::string replaceable_entry = generate_first_instruction(
+        original, {}, false, mod_entry_config);
+    check(replaceable_entry.find(
+              "if (psx_mod_function_entry(cpu, 0x80010000u)) { "
+              "cpu->pc = cpu->gpr[31]; return; }") !=
+              std::string::npos,
+          "codegen lets an opted-in mod callback replace a guest function");
+
     check_throws(
         [&] { (void)generate_first_instruction(0x24020003u,
                                                {physical_alias}, false); },
@@ -691,6 +732,30 @@ void codegen_tests() {
     check(depth_overlay_mismatch.find("ws cull depth") == std::string::npos,
           "overlay nonmatching depth variant remains unchanged");
 
+    PSXRecomp::CodeGenConfig signed_bound_config;
+    signed_bound_config.ws_signed_x_bound_sites.push_back(
+        {0x80010000u, 0x2402FF00u}); // addiu v0,zero,-256
+    const std::string signed_pixel_bound = generate_first_instruction(
+        0x2402FF00u, {}, false, signed_bound_config);
+    check(signed_pixel_bound.find("psx_ws_screen_x_bound(-256)") !=
+              std::string::npos,
+          "codegen emits guarded signed screen-pixel X bound");
+
+    signed_bound_config.ws_signed_x_bound_sites[0] =
+        {0x80010000u, 0x3C02FFF0u}; // lui v0,0xfff0
+    const std::string signed_q16_bound = generate_first_instruction(
+        0x3C02FFF0u, {}, false, signed_bound_config);
+    check(signed_q16_bound.find(
+              "psx_ws_player_x_bound((int32_t)0xFFF00000)") !=
+              std::string::npos,
+          "codegen keeps guarded LUI X bounds on the Q16 helper");
+
+    const std::string signed_bound_overlay_mismatch = generate_first_instruction(
+        0x24020078u, {}, true, signed_bound_config);
+    check(signed_bound_overlay_mismatch.find("typed native-wide signed") ==
+              std::string::npos,
+          "overlay nonmatching signed-bound variant remains unchanged");
+
     PSXRecomp::CodeGenConfig range_config;
     range_config.ws_cull_range_sites.insert(0x80010000u);
     const std::string range = generate_first_instruction(
@@ -728,6 +793,16 @@ void codegen_tests() {
               std::string::npos &&
               branch_keep.find("ws branch keep") != std::string::npos,
           "codegen emits guarded branch keep predicate");
+
+    PSXRecomp::CodeGenConfig nclip_exact_config;
+    nclip_exact_config.ws_cull_nclip_exact_sites.insert(0x80010000u);
+    const std::string nclip_exact = generate_first_instruction(
+        0x04400002u, {}, false, nclip_exact_config); // bltz v0,+2
+    check(nclip_exact.find(
+              "gte_nclip_precise_bltz((int32_t)cpu->gpr[2])") !=
+              std::string::npos &&
+              nclip_exact.find("ws exact nclip") != std::string::npos,
+          "codegen emits title-scoped exact NCLIP predicate");
 
     PSXRecomp::CodeGenConfig plane_nx_config;
     plane_nx_config.ws_cull_plane_nx_sites.insert(0x80010000u);

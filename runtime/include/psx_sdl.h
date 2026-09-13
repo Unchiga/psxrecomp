@@ -56,7 +56,13 @@ static inline SDL_Renderer *psx_sdl_create_renderer(
     SDL_Window *window, int driver_index, Uint32 flags)
 {
     (void)driver_index;
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
+    /* SDL_RENDERER_SOFTWARE is honoured: a tool window that asks for it gets
+     * the software driver, which creates no GL context. The default driver
+     * on a GL host makes a new context current on this thread and the game's
+     * own GL renderer then draws into the wrong one (seen: black game window
+     * then a SIGSEGV inside the driver at present). */
+    SDL_Renderer *renderer = SDL_CreateRenderer(
+        window, (flags & SDL_RENDERER_SOFTWARE) ? "software" : NULL);
     if (renderer && (flags & SDL_RENDERER_PRESENTVSYNC)) {
         (void)SDL_SetRenderVSync(renderer, 1);
     }

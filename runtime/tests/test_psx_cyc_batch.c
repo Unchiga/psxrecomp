@@ -16,6 +16,8 @@ int g_ls_mode = 0;
 volatile int g_ds_recording = 0;
 uint8_t *g_psx_ram = 0;
 int g_psx_load_delay = 1;
+uint32_t g_psx_cpu_overclock = 1u;
+uint32_t g_psx_cpu_overclock_rem = 0u;
 
 static int service_count;
 
@@ -35,6 +37,8 @@ static void reset_clock(uint64_t deadline) {
     g_psx_cyc_batch_limit = 0;
     g_psx_cyc_bb_defer = 0;
     g_psx_cyc_local_acc = 0;
+    g_psx_cpu_overclock = 1u;
+    g_psx_cpu_overclock_rem = 0u;
     service_count = 0;
 }
 

@@ -80,6 +80,12 @@ void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_p
 void interrupts_advance_cycles(uint32_t cycles);
 void interrupts_service_scheduled_events(void);
 uint32_t interrupts_cycles_to_vblank(void);
+/* While IRQ9 is enabled, expose the next 44.1-kHz sample as a first-class
+ * device deadline so the CPU can observe and acknowledge an IRQ before the
+ * following sample. UINT32_MAX means inactive. PSX_SPU_SAMPLE_EVENTS=0 is a
+ * diagnostic opt-out. */
+uint32_t psx_spu_sample_event_cycles_to_next(void);
+void psx_spu_sample_event_service(void);
 /* VBlank phase within the current frame (0 .. VBLANK_CYCLES-1). Persisted in
  * BS_SEC_IRQ (and selfcheck's out-of-band latch) so resim keeps the snap's
  * phase. Legacy 8-byte IRQ sections still rebase to 0 on load. */
@@ -99,6 +105,13 @@ int psx_get_in_exception(void);
  * Used by the post-savestate freeze probe (vblank-time "where was the game"). */
 uint32_t psx_last_irq_check_pc(void);
 uint32_t psx_compiled_irq_resume_pc(void);
+/* True when the current IRQ poll has a materialized CPUState/register context
+ * matching its resume PC. Dirty-RAM synthetic pump sites may expose a committed
+ * resume PC for IRQ timing before the live CPUState is safe to serialize. */
+int psx_irq_resume_context_snapshot_safe(void);
+int psx_irq_resume_context_snapshot_safe_at(uint32_t resume_pc);
+int psx_irq_resume_context_snapshot_site(void);
+uint32_t psx_irq_resume_context_snapshot_pc(void);
 /* Soft-return / netplay BYE: drop sticky resume latches so rematch dig0 snaps
  * cannot inherit a prior-match game PC (see pick_snap_resume_pc). */
 void psx_irq_clear_resume_latches(void);
@@ -136,6 +149,17 @@ void psx_exception_longjmp(void);
  * exception context.  The redirected code (e.g., VSync callback loop)
  * will eventually call ReturnFromException (longjmp code 1) to exit. */
 void psx_restore_state_escape(void);
+
+/* Guest frame-gate acceleration. Adds `extra` increments per real vblank to a
+ * guest word at `addr` — the counter a title's own VSync wait polls — so a
+ * self-imposed N-vblank frame cap is satisfied sooner and the game's main loop
+ * runs faster, WITHOUT speeding host pacing (which would drag the sound driver
+ * and so the music tempo along with it). `extra`=0 disables; the address is a
+ * game symbol and is always supplied by the caller. See the comment at the
+ * definition for why this lives on the vblank edge. */
+void psx_frame_gate_set(uint32_t addr, int extra);
+void psx_frame_gate_get(uint32_t *addr, int *extra, uint64_t *ticks,
+                        uint32_t *counter_now);
 
 #ifdef __cplusplus
 }

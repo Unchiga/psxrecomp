@@ -42,6 +42,12 @@ disc.cfg
 rom.cfg
 settings.toml
 
+# Local analysis scratch — GPU frame captures / parity dumps (the default
+# --out for tools/gpu_frame_*.py and gpu_parity.py) and asset rips pulled off
+# the disc. Multi-hundred-MB binaries land here and are rejected by GitHub's
+# 100 MB blob limit, and ripped disc content must never be committed at all.
+/analysis/
+
 # Ghidra / local analysis
 /ghidra/projects/
 *.gpr
@@ -65,6 +71,8 @@ psx_crash.txt
 psx_last_run_report.json
 psx_screenshot.bmp
 psx_freeze_heartbeat.json
+.psxrecomp_last_generate
+.psxrecomp_write_probe
 starvation_dump.jsonl
 
 # Diagnostic dumps (root-level) — keep catalog / probe trackable

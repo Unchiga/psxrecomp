@@ -81,6 +81,11 @@ typedef struct SpuGlobalState {
 
 void spu_get_voice_state(int voice, SpuVoiceState* out);
 void spu_get_global_state(SpuGlobalState* out);
+/* SPUCNT (0x1F801DAA) alone. The sample-event scheduler gates on one ctrl bit
+ * per device-service call; building the full SpuGlobalState there (register
+ * sweep + three 24-voice loops) was ~40% of emu-thread time during the Capcom
+ * FMV's MMIO-polling loop (gdb-sampled 2026-09-01). */
+uint16_t spu_ctrl_read(void);
 /* Debug peek into SPU sample RAM (spu_ram TCP command). */
 uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len);
 
@@ -178,6 +183,21 @@ typedef struct SpuSnapPartDigests {
     uint32_t tail;
 } SpuSnapPartDigests;
 void spu_snapshot_part_digests(SpuSnapPartDigests *out);
+
+/* ---- Music / SFX separation --------------------------------------------
+ *
+ * Hardware sums all 24 voices into one mix with no notion of what a voice is
+ * for, so this classifies voices at KEYON (latched for the voice's lifetime)
+ * and applies a per-bus gain. CD/XA rides the MUSIC bus. All three are
+ * percentages, 0..100; at 100 the mix is bit-for-bit unchanged.
+ *
+ * Classification is an explicit per-game voice mask OR'd with an ADSR == 0
+ * heuristic (an instant-attack, instant-release one-shot is a sound effect).
+ * The heuristic is content-derived, not a hardware fact — hence the mask. */
+void     spu_set_bus_gains(int master_pct, int music_pct, int sfx_pct);
+void     spu_set_sfx_voice_mask(uint32_t mask);
+/* Which currently-ACTIVE voices landed on the SFX bus (for verification). */
+uint32_t spu_get_sfx_bus_mask(void);
 
 #ifdef __cplusplus
 }

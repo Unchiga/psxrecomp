@@ -64,7 +64,7 @@ static fs::path write_game_toml(const std::string& name,
  * vertices and splits shared edges) and has no launcher control at all.
  * perspective_texturing is off because it is a deliberate departure from hardware
  * output validated on only one title and renderer; it is structurally safe and
- * players opt in from the launcher. See ENHANCEMENTS.md G1.8/G1.9. */
+ * players opt in from the launcher. See docs/ENHANCEMENTS.md G1.8/G1.9. */
 static void test_defaults_off() {
     fs::path p = write_game_toml("psxrecomp_pgxp_default.toml", "");
     auto gc = PSXRecompV4::load_game_config(p);
@@ -78,13 +78,30 @@ static void test_defaults_off() {
 static void test_game_toml_opt_in() {
     fs::path p = write_game_toml("psxrecomp_pgxp_on.toml",
         "[video]\n"
+        "window_width = 1920\n"
         "geometry_correction = true\n"
         "perspective_texturing = true\n");
     auto gc = PSXRecompV4::load_game_config(p);
+    check(gc.runtime.video_window_width == 1920,
+          "[video] window_width is honoured");
     check(gc.runtime.video_geometry_correction,
           "[video] geometry_correction = true is honoured");
     check(gc.runtime.video_perspective_texturing,
           "[video] perspective_texturing = true is honoured");
+    fs::remove(p);
+}
+
+static void test_game_window_width_validation() {
+    fs::path p = write_game_toml("psxrecomp_window_too_small.toml",
+        "[video]\n"
+        "window_width = 639\n");
+    bool rejected = false;
+    try {
+        (void)PSXRecompV4::load_game_config(p);
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check(rejected, "[video] window_width rejects values below 640");
     fs::remove(p);
 }
 
@@ -173,6 +190,7 @@ static void test_user_settings_round_trip() {
 int main() {
     test_defaults_off();
     test_game_toml_opt_in();
+    test_game_window_width_validation();
     test_knobs_independent();
     test_user_settings_read();
     test_user_settings_absent_key();
