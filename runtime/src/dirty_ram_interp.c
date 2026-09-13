@@ -402,7 +402,15 @@ uint32_t g_ra_load_snap_gpr[32] = {0};
  * interp blocks across the call). This is the piece the s3 tripwire lacks:
  * the tripwire names the callee that came back smeared; this ring names the
  * RETURN PATH that let it come back. Zero-cost when disarmed. */
+/* Armed iff the window is NON-EMPTY (hi > lo). It used to be `lo != 0`, which
+ * made lo=0 a silent off switch: `callret_watch lo=0 hi=0x200000` looked like
+ * "record the whole address space", replied ok, and then recorded nothing —
+ * so an empty ring read as "these events never happened" rather than "the
+ * ring was never on". A window is a window; 0 is a legal floor. Default 0/0
+ * is still an empty window, so the ring stays disarmed (and zero-cost) until
+ * someone sets one. */
 uint32_t g_callret_lo = 0, g_callret_hi = 0;
+int callret_armed(void) { return g_callret_hi > g_callret_lo; }
 /* MUST stay field-for-field identical to the local mirror `E` in
  * debug_server.c handle_callret_watch() (which dumps this ring through an
  * opaque extern; a divergence is silent garbage, not a compile error). */
@@ -429,7 +437,8 @@ enum { CRES_PLAIN = 1,
 extern uint64_t g_dispatch_static_hits;   /* debug_server.c; bumped by generated dispatch */
 extern uint64_t psx_cycle_count;
 static uint32_t callret_begin(CPUState *cpu, uint32_t pc, uint32_t target) {
-    if (!g_callret_lo || pc < g_callret_lo || pc >= g_callret_hi)
+    if (g_callret_hi <= g_callret_lo || pc < g_callret_lo ||
+        pc >= g_callret_hi)
         return 0xFFFFFFFFu;
     uint32_t idx = (uint32_t)(g_callret_seq++ & (CALLRET_CAP - 1u));
     CallRetEnt *e = &g_callret_ring[idx];
@@ -469,11 +478,17 @@ static void callret_end(uint32_t idx, CPUState *cpu, uint32_t path) {
  * load. See dirty_ram_interp.h for the per-game rationale. */
 uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
 
+/* Text-image base (phys) = the loaded game's main-EXE load address. Defaults to
+ * the kernel-window end so the below-text overlay clause is empty until a
+ * high-loading game pins it; main.cpp sets it at game load. See the header. */
+uint32_t g_text_image_lo = DIRTY_RAM_KERNEL_WINDOW_END;
+
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 extern int psx_game_address_in_text(uint32_t addr);
 extern int psx_game_is_function_entry(uint32_t addr);  /* non-destructive entry test */
 extern int psx_game_text_native_ok(uint32_t addr);
+extern int psx_game_text_native_ok_full(uint32_t addr);
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
@@ -1114,13 +1129,77 @@ static void xprobe_flush_frame(void) {
 /* Record one boundary crossing. want_detail=1 for interp-site guest transfers
  * (rich context), 0 for the dd-site (count + depth only). Runs the per-frame
  * flush on frame change (leak-proof reset of g_mixed_depth) and the early trip. */
-static int g_xprobe_watch(uint32_t t) {
-    return t == 0x8001A954u || t == 0x80046264u || t == 0x8004630Cu || t == 0x8004DFA0u
-        /* MMX6 card-load firstfile flow (mmx6_card_load_regression_state):
-         * the mount 0x8001C1AC (works) vs firstfile flow 0x8001C4C0 (its body
-         * never runs) — record every call event + resolution for both. */
-        || t == 0x8001C1ACu || t == 0x8001C4C0u;
+/* Watched call targets — CONFIGURED, never compiled in.
+ *
+ * This used to be a hardcoded list of six guest addresses from two specific
+ * titles (an MMX6 card-load investigation and a Tomba flow). Baking one
+ * game's addresses into the shared runtime makes the JAL-site resolution ring
+ * record for those titles and SILENTLY NOTHING for every other one: an
+ * investigation on any other game reads an empty `watched` dump and cannot
+ * tell "this target is never called" from "this build was never able to watch
+ * it". That is the same defect class as beads-eio.3.21, and it is why the JAL
+ * call site was unusable while measuring beads-eio.3.59 — only the JALR
+ * callret ring could be used.
+ *
+ * Default is EMPTY: no title is privileged, and a game that wants targets
+ * watched says so at runtime. Set via the `xprobe_watch` TCP command or the
+ * PSX_XPROBE_WATCH environment variable (comma/semicolon/space separated,
+ * 0x-prefixed or decimal) so a watch can be in place from instruction zero
+ * without a rebuild — the ring is always-on, the filter is what you choose.
+ * Compared on the normalised address so a KSEG or physical form both match. */
+#define XPROBE_WATCH_MAX 32
+static uint32_t s_xprobe_watch[XPROBE_WATCH_MAX];
+static int      s_xprobe_watch_n = 0;
+static int      s_xprobe_watch_env_done = 0;
+
+static void xprobe_watch_parse(const char *spec)
+{
+    s_xprobe_watch_n = 0;
+    if (!spec) return;
+    const char *p = spec;
+    while (*p && s_xprobe_watch_n < XPROBE_WATCH_MAX) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *end = NULL;
+        unsigned long v = strtoul(p, &end, 0);
+        if (end == p) break;
+        p = end;
+        s_xprobe_watch[s_xprobe_watch_n++] = (uint32_t)v & 0x1FFFFFFFu;
+    }
 }
+
+/* Env seeding is lazy so it works no matter which subsystem touches the ring
+ * first, and costs one branch after the first call. */
+static int g_xprobe_watch(uint32_t t) {
+    if (!s_xprobe_watch_env_done) {
+        s_xprobe_watch_env_done = 1;
+        const char *env = getenv("PSX_XPROBE_WATCH");
+        if (env && *env) xprobe_watch_parse(env);
+    }
+    if (s_xprobe_watch_n == 0) return 0;   /* nothing watched: zero-cost */
+    const uint32_t phys = t & 0x1FFFFFFFu;
+    for (int i = 0; i < s_xprobe_watch_n; i++)
+        if (s_xprobe_watch[i] == phys) return 1;
+    return 0;
+}
+
+/* Control plane for the `xprobe_watch` TCP command. set() replaces the list
+ * (NULL or empty clears it); get() reports it so a caller can never mistake
+ * "nothing watched" for "watched but never called". */
+void dirty_ram_xprobe_watch_set(const char *spec)
+{
+    s_xprobe_watch_env_done = 1;   /* explicit set wins over the env */
+    xprobe_watch_parse(spec);
+}
+
+int dirty_ram_xprobe_watch_get(int index, uint32_t *phys_out)
+{
+    if (index < 0 || index >= s_xprobe_watch_n) return 0;
+    if (phys_out) *phys_out = s_xprobe_watch[index];
+    return 1;
+}
+
+int dirty_ram_xprobe_watch_count(void) { return s_xprobe_watch_n; }
 static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
                          uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail);
 /* Watched-target call note for NON-interp call sites (overlay shard call-outs
@@ -1904,6 +1983,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         uint32_t a = cpu->gpr[rs];
         if (psx_ws_angle_site(pc, insn, &widened))
             cpu->gpr[rt] = widened;
+        else if (rs == 0 && rt != 0 && psx_ws_is_signed_x_bound_site(pc, insn))
+            cpu->gpr[rt] = (uint32_t)psx_ws_screen_x_bound(simm);
         else
             cpu->gpr[rt] = a + (uint32_t)simm
                          + (psx_ws_is_cull_bias_site(pc)
@@ -1971,7 +2052,10 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         return 0;
     case 0x0D: { /* ORI */
         uint32_t a = cpu->gpr[rs];
-        cpu->gpr[rt] = a | imm;
+        if (rs == 0 && rt != 0 && psx_ws_is_signed_x_bound_site(pc, insn))
+            cpu->gpr[rt] = (uint32_t)psx_ws_screen_x_bound((int32_t)imm);
+        else
+            cpu->gpr[rt] = a | imm;
         psx_pgxp_alu(cpu, insn, cpu->gpr[rt], a, imm);
         cpu->gpr[0] = 0;
         return 0;
@@ -2714,7 +2798,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifdef PSX_HAS_OVERLAY_DISPATCH
     {
         extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
-        if (psx_overlay_dispatch(cpu, addr)) return 1;
+        int previous_phase = g_exec_phase;
+        g_exec_phase = 3;
+        int handled = psx_overlay_dispatch(cpu, addr);
+        g_exec_phase = previous_phase;
+        if (handled) return 1;
     }
 #endif
 
@@ -2757,11 +2845,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) {
         /* Bulk host transfers can populate post-EXE executable RAM without
          * passing through the write hooks that mark dirty pages. A real
-         * control transfer to a decodable word above the configured boot-EXE
-         * text end is enough evidence to admit that word to the interpreter.
-         * Data and invalid targets still fail closed. */
+         * control transfer to a decodable word OUTSIDE the configured boot-EXE
+         * text image is enough evidence to admit that word to the interpreter.
+         * "Outside" is both sides of the text: a boot EXE that loads high
+         * streams its gameplay overlays into the RAM below itself (Klonoa's
+         * text is 0x180000-0x18B000, its overlays run from 0x10000+), and
+         * gating on the floor alone rejected every one of those targets —
+         * a JALR into a CD-DMA'd overlay page then fell through to
+         * psx_unknown_dispatch and fail-fast exit(1). Data and invalid targets
+         * still fail closed via the decodability check. */
         if (phys < (2u * 1024u * 1024u) &&
-            phys >= g_overlay_region_floor &&
+            phys_is_overlay_region(phys) &&
             dirty_ram_word_looks_decodable(fetch_word(phys))) {
             dirty_ram_mark_executable_range(phys, 4u);
         } else {
@@ -2782,6 +2876,16 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * pages overwritten by a runtime overlay (Tomba 2), not just [FLOOR, RAM). */
     int allow_local_dirty_flow = phys_is_overlay_flow_region(phys);
 
+    /* Backend-invariant mod_function_entry hooks: generated code fires
+     * psx_mod_function_entry at listed function entries, but a mod-patched
+     * page runs here instead and would silently skip them. Fire the same hook
+     * on interp dispatch so the contract does not depend on which backend
+     * executes the page. */
+    {
+        extern void psx_mod_function_entry(CPUState *cpu, uint32_t address);
+        psx_mod_function_entry(cpu, addr);
+    }
+
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
     if (pc_entry) pc_entry->hits++;
@@ -2796,7 +2900,19 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * not a new entry. Anything else arrived from native code (a call or
      * a fresh dispatch) and is real interior-entry evidence for alias
      * seeding. */
-    if (pc_entry && addr != g_dirty_interp_chain_target) pc_entry->entry_hits++;
+    if (pc_entry && addr != g_dirty_interp_chain_target) {
+        pc_entry->entry_hits++;
+        /* Enrichment, external entries only (this is a real native/dispatch
+         * arrival, not interp block chaining). occ_crc names which overlay is
+         * resident in this band; last_ext_ra names the caller that reached
+         * this interior. Both durable in the per_pc snapshot — no ring window,
+         * no offline join. See DirtyRamPcEntry. */
+        extern uint32_t psx_overlay_resident_crc_at(uint32_t phys, int *valid);
+        int occ_ok = 0;
+        pc_entry->occ_crc = psx_overlay_resident_crc_at(phys, &occ_ok);
+        pc_entry->occ_ok = (uint8_t)occ_ok;
+        pc_entry->last_ext_ra = cpu->gpr[31];
+    }
     g_dirty_interp_chain_target = 0;
 
     /* Block-entry ring buffer — answers "who tried to JALR into this RAM
@@ -2867,7 +2983,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (deliverable || (++s_interp_entry_poll & 0x3Fu) == 0) {
                 cpu->pc = pc;
                 s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
-                psx_check_interrupts(cpu);
+                psx_check_interrupts_at(cpu, pc);
                 if (cpu->pc != 0u && !dirty_ram_same_pc(cpu->pc, pc)) {
                     /* Handler resumed elsewhere — surface to dispatch. */
                     g_dirty_ram_blocks_run++;
@@ -2911,7 +3027,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         cosim_exec_one_begin();
         int transferred = exec_one_fetched(cpu, pc, insn, &next_pc);
 #ifndef PSX_NO_DEBUG_TOOLS
-        if (g_s3_smear_lo && !g_s3_smear_valid &&
+        /* Armed iff the window is NON-EMPTY, same as the callret ring: a `lo`
+         * test made address 0 a silent off switch, so lo=0 with a real hi
+         * recorded nothing while the command answered ok. Since this watch
+         * clears `hi` whenever it is omitted, {"lo":"0"} still disarms. */
+        if (g_s3_smear_hi > g_s3_smear_lo && !g_s3_smear_valid &&
             pc >= g_s3_smear_lo && pc < g_s3_smear_hi &&
             cpu->gpr[19] != before_s3 &&
             (g_s3_smear_excl == 0u || insn != g_s3_smear_excl)) {
@@ -3086,6 +3206,19 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 target != stop_addr &&
                 phys_is_overlay_flow_region(target_phys) &&
                 dirty_ram_is_dirty(target_phys)) {
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+                /* A save restore or an uncompiled continuation can enter the
+                 * interpreter in an otherwise static overlay. Surface an exact
+                 * resident match to the outer dispatcher, never nest tail flow. */
+                extern int psx_overlay_static_can_dispatch(uint32_t addr);
+                if (psx_overlay_static_can_dispatch(target)) {
+                    g_dirty_ram_native_handoffs++;
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    g_dirty_interp_chain_target = target;
+                    OV_FPLOG_RET1();
+                }
+#endif
                 /* A runtime overlay may start executing while its final code
                  * bytes are still being installed. Entry-time native validation
                  * must reject that partial image, but local dirty flow used to
@@ -3136,6 +3269,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                     e->frame = (uint32_t)s_frame_count;
                 }
 #endif
+                /* Local transfers bypass dispatch, but must retain the same
+                 * function-entry hooks as a surfaced interpreter entry. */
+                {
+                    extern void psx_mod_function_entry(CPUState *, uint32_t);
+                    psx_mod_function_entry(cpu, target);
+                }
                 pc = target;
                 current_page = target_phys >> 12;
                 current_page_dirty = 1; /* is_local_dirty_target proved it */
@@ -3152,10 +3291,14 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         }
         pc = next_pc;
 #ifdef PSX_HAS_GAME_DISPATCH
-        /* Guest call returns advance without transferred set. Re-check the
-         * resume PC so a patched entry can hand its unchanged tail back to
-         * compiled code without adding probes to ordinary dirty overlay runs. */
-        if (clean_game_text_miss && interp_enter_compiled(cpu, pc)) {
+        /* Guest call returns advance without transferred set. A suffix-only
+         * continuation check is insufficient here: a split compiled piece can
+         * fall through by a direct host call into another piece without a new
+         * RAM-byte check. Require the continuation's complete emitted range to
+         * match before this straight-line handoff. Control-transfer handoffs
+         * retain suffix validation because they are explicit guest entries. */
+        if (clean_game_text_miss && psx_game_text_native_ok_full(pc) &&
+            interp_enter_compiled(cpu, pc)) {
             g_dirty_ram_native_handoffs++;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -3179,9 +3322,27 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             g_dirty_interp_chain_target = pc;
             OV_FPLOG_RET1();
         }
+        uint32_t next_phys = pc & 0x1FFFFFFFu;
+        /* A declared kernel patch range ends here (Rule 18 + the profile's
+         * [[recompiler.install_slots]]). The emitted body dispatched us in at
+         * the range's lo to run the guest's patched words; the emitter
+         * registered this PC as a continuation key and the bless verifier
+         * skips the patched words, so the rest of the body runs native.
+         * Without this hand-back the kernel page stays dirty and straight-
+         * line flow would interpret the whole function — which is why
+         * declaring the slot alone never paid off. */
+        if (!s_ld_pend_armed && next_phys < DIRTY_RAM_KERNEL_WINDOW_END &&
+            psx_kernel_patch_range_ends_at(next_phys) &&
+            psx_kernel_bless_dispatchable(next_phys)) {
+            cpu->pc = pc;
+            g_dirty_ram_native_handoffs++;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = pc;
+            OV_FPLOG_RET1();
+        }
         /* Straight-line code that left the dirty page — hand back to
          * static dispatch by setting cpu->pc and returning. */
-        uint32_t next_phys = pc & 0x1FFFFFFFu;
         uint32_t next_page = next_phys >> 12;
         if ((!current_page_dirty || next_page != current_page) &&
             !dirty_ram_is_dirty(next_phys)) {

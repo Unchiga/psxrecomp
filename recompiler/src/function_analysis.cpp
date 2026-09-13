@@ -11,7 +11,7 @@ FunctionAnalyzer::FunctionAnalyzer(const PS1Executable& exe) : exe_(exe) {}
 
 void FunctionAnalyzer::add_forced_entry(uint32_t addr) {
     // Validate address is within the EXE range
-    if (addr >= exe_.header.load_address && addr < exe_.end_address()) {
+    if (addr >= exe_.header.load_address && addr < exe_.analysis_end_address()) {
         forced_entry_points_.push_back(addr);
     }
 }
@@ -782,7 +782,7 @@ bool resolve_exact_bounded_jump_table(
     };
     if (producer_lo == 0u && producer_hi == 0u) {
         producer_lo = exe.header.load_address;
-        producer_hi = exe.end_address();
+        producer_hi = exe.analysis_end_address();
     }
     if (producer_lo >= producer_hi || (producer_lo & 3u) != 0u ||
         (producer_hi & 3u) != 0u) {
@@ -894,16 +894,36 @@ bool resolve_exact_bounded_jump_table(
         return false;
     }
 
-    // Exact canonical guard: sltiu; beq; nop; sll. This is the same accepted
-    // suffix as the Python capture verifier and excludes unrelated bounds.
+    // Exact guards: sltiu; beq; nop; sll, or sltiu; beq; lui; addiu; sll.
+    // The latter schedules the table's LUI in the bounds branch's delay slot.
+    // Keep both forms in parity with the Python capture verifier.
     if (sll_pc < entry + 12u) return false;
     uint32_t guard_pc = sll_pc - 8u;
     uint32_t bound_pc = sll_pc - 12u;
+    auto before_scale = read(sll_pc - 4u);
+    if (!before_scale.has_value()) return false;
+    bool scheduled_base = *before_scale != 0u;
+    if (scheduled_base) {
+        // R3000 JR would see the old target register without this load delay.
+        if (lw_pc != jr_pc - 8u) return false;
+        if (sll_pc < entry + 16u) return false;
+        guard_pc -= 4u;
+        bound_pc -= 4u;
+        auto upper_word = read(sll_pc - 8u);
+        if (!upper_word.has_value()) return false;
+        uint32_t upper_reg = (*upper_word >> 16) & 0x1Fu;
+        if ((*upper_word >> 26) != 0x0Fu ||
+            ((*upper_word >> 21) & 0x1Fu) != 0u || upper_reg == 0u ||
+            (*before_scale >> 26) != 0x09u ||
+            ((*before_scale >> 21) & 0x1Fu) != upper_reg ||
+            ((*before_scale >> 16) & 0x1Fu) != base_reg ||
+            upper_reg == index_reg || base_reg == index_reg) {
+            return false;
+        }
+    }
     auto guard_word_opt = read(guard_pc);
     auto bound_word = read(bound_pc);
-    auto guard_delay = read(sll_pc - 4u);
-    if (!guard_word_opt.has_value() || !bound_word.has_value() ||
-        !guard_delay.has_value() || *guard_delay != 0u) {
+    if (!guard_word_opt.has_value() || !bound_word.has_value()) {
         return false;
     }
     uint32_t guard_word = *guard_word_opt;
@@ -920,20 +940,23 @@ bool resolve_exact_bounded_jump_table(
     uint32_t bound_rt = (*bound_word >> 16) & 0x1Fu;
     uint32_t count = *bound_word & 0xFFFFu;
     if (bound_op != 0x0Bu || bound_rs != index_reg ||
-        bound_rt != bound_reg || count == 0u || count >= 512u ||
+        bound_rt != bound_reg || bound_reg == index_reg ||
+        count == 0u || count >= 512u ||
         in_delay_slot(bound_pc)) {
         return false;
     }
     uint32_t guard_target = exact_branch_target(guard_pc, guard_word);
     if ((guard_target & 3u) != 0u || guard_target < entry ||
         guard_target >= hard_cap ||
-        (guard_target >= sll_pc && guard_target < jr_pc + 8u)) {
+        (guard_target >= sll_pc && guard_target < jr_pc + 8u) ||
+        (scheduled_base && guard_target > bound_pc && guard_target < jr_pc + 8u)) {
         return false;
     }
 
     // Resolve the table-base reaching definition. Cross-register constants
     // (`lui rA; addiu rB,rA,lo`) are valid, but both definitions must be local,
-    // unskippable, outside delay slots, and unclobbered before use.
+    // unskippable and unclobbered before use. Only the validated scheduled
+    // form permits LUI in a delay slot, exactly that of the bounds BEQ.
     uint32_t low_pc = 0, source_reg = base_reg;
     int16_t low = 0;
     uint32_t lui_pc = 0, upper = 0;
@@ -974,7 +997,9 @@ bool resolve_exact_bounded_jump_table(
             break;
         }
     }
-    if (lui_pc == 0u || in_delay_slot(lui_pc) ||
+    if (scheduled_base && (lui_pc != guard_pc + 4u || low_pc != sll_pc - 4u))
+        return false;
+    if (lui_pc == 0u || (in_delay_slot(lui_pc) && !scheduled_base) ||
         (low_pc != 0u && in_delay_slot(low_pc)) ||
         inbound_skips(lui_pc, addu_pc) ||
         (low_pc != 0u && inbound_skips(low_pc, addu_pc)) ||
@@ -1026,6 +1051,7 @@ bool resolve_exact_bounded_jump_table(
         uint32_t runtime_target = *target_word;
         uint32_t image_target = mapped(runtime_target);
         if (image_target < entry || image_target >= hard_cap ||
+            (scheduled_base && image_target > bound_pc && image_target < jr_pc + 8u) ||
             image_target < producer_lo || image_target >= producer_hi ||
             (image_target & 3u) != 0u) {
             return false;
@@ -1089,6 +1115,7 @@ bool resolve_exact_bounded_jump_table(
             break;
         }
     }
+    uint32_t protected_pc = scheduled_base ? bound_pc : lui_pc;
     for (uint32_t source = entry; source < hard_cap; source += 4u) {
         auto word = read(source);
         if (!word.has_value()) return false;
@@ -1096,9 +1123,9 @@ bool resolve_exact_bounded_jump_table(
         bool direct = cf.kind == ExactCfKind::Branch ||
                       cf.kind == ExactCfKind::Jump ||
                       cf.kind == ExactCfKind::Jal;
-        if (direct && cf.target > lui_pc && cf.target <= jr_pc &&
-            (source < lui_pc || source > jr_pc) &&
-            !case_reachable.count(source)) {
+        if (direct && cf.target > protected_pc && cf.target <= jr_pc &&
+            (source < protected_pc || source > jr_pc) &&
+            (scheduled_base || !case_reachable.count(source))) {
             return false;
         }
     }
@@ -1119,8 +1146,13 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
 
     fmt::print("\n=== Exact-Entry Function Analysis ===\n\n");
 
+    // Discovery bound, NOT the read bound. An overlay capture deliberately
+    // carries trailing delay-slot guard words (ps1_exe_parser.h exe_tag):
+    // readable so a branch at the last analysable word can emit its slot, but
+    // never admissible as code themselves, because the word after a guard
+    // word does not exist in the image.
     auto in_exe = [&](uint32_t addr) {
-        return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;
+        return addr >= exe_.header.load_address && addr < exe_.analysis_end_address() && (addr & 3u) == 0;
     };
 
     auto producer_for = [&](uint32_t addr) -> int {
@@ -1265,7 +1297,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
                     } else {
                         ExactJumpTable table;
                         uint32_t producer_lo = exe_.header.load_address;
-                        uint32_t producer_hi = exe_.end_address();
+                        uint32_t producer_hi = exe_.analysis_end_address();
                         if (entry_producer >= 0) {
                             producer_lo = producer_ranges[entry_producer].first;
                             producer_hi = producer_ranges[entry_producer].second;
@@ -1337,7 +1369,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
         std::map<uint32_t, std::set<std::pair<uint32_t, bool>>> candidate_evidence;
         for (size_t i = 0; i < round_entries.size(); i++) {
             uint32_t hard_cap = (i + 1 < round_entries.size())
-                ? round_entries[i + 1] : exe_.end_address();
+                ? round_entries[i + 1] : exe_.analysis_end_address();
             ExactWalkResult wr = walk(round_entries[i], hard_cap);
             candidate_targets.insert(wr.direct_jal_targets.begin(),
                                      wr.direct_jal_targets.end());
@@ -1372,7 +1404,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
             auto owner_it = std::prev(target_it);
             auto next_it = std::next(target_it);
             uint32_t hard_cap = next_it != known_entries.end()
-                ? *next_it : exe_.end_address();
+                ? *next_it : exe_.analysis_end_address();
             ExactWalkResult owner_walk = walk(*owner_it, hard_cap);
             if (owner_walk.visited.count(target)) {
                 known_entries.erase(target_it);
@@ -1392,7 +1424,11 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
 
     for (size_t i = 0; i < starts_vec.size(); i++) {
         uint32_t entry = starts_vec[i];
-        uint32_t hard_cap = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : exe_.end_address();
+        // The final entry's cap is the ANALYSIS end, not the image end, so a
+        // walk that falls through the last real word of an overlay capture
+        // stops there instead of absorbing the trailing guard word into
+        // func.end_addr (which made the guard word the last block's leader).
+        uint32_t hard_cap = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : exe_.analysis_end_address();
         ExactWalkResult wr = walk(entry, hard_cap);
         if (wr.visited.empty()) continue;
 
@@ -1437,7 +1473,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(
     for (size_t i = 0; i < starts_vec.size(); i++) {
         uint32_t host_start = starts_vec[i];
         uint32_t hard_cap = (i + 1 < starts_vec.size())
-            ? starts_vec[i + 1] : exe_.end_address();
+            ? starts_vec[i + 1] : exe_.analysis_end_address();
         ExactWalkResult wr = walk(host_start, hard_cap);
         if (wr.visited.empty()) continue;
         uint32_t host_end = *wr.visited.rbegin() + 4u;
@@ -1483,7 +1519,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     std::vector<uint32_t> return_addresses;
 
     uint32_t current_addr = exe_.header.load_address;
-    uint32_t end_addr = exe_.end_address();
+    uint32_t end_addr = exe_.analysis_end_address();
 
     fmt::print("Scanning {} KB of code for function returns...\n",
                (end_addr - current_addr) / 1024);
@@ -1537,7 +1573,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     fmt::print("Following JAL call targets to discover additional functions...\n");
 
     uint32_t exe_start = exe_.header.load_address;
-    uint32_t exe_end   = exe_.end_address();
+    uint32_t exe_end   = exe_.analysis_end_address();
 
     for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
         auto word_opt = exe_.read_word(addr);
@@ -1832,7 +1868,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     // tables minted as function starts (those never walk as clean code:
     // ~44% of random data words carry an invalid primary opcode).
     auto in_exe_p3 = [&](uint32_t a) {
-        return a >= exe_.header.load_address && a < exe_.end_address() && (a & 3u) == 0;
+        return a >= exe_.header.load_address && a < exe_.analysis_end_address() && (a & 3u) == 0;
     };
     // Same primary-opcode validity table as is_likely_data_section so the two
     // agree on what "clean code" means (COP2/GTE, LWC2/SWC2 are valid PS1 ops).

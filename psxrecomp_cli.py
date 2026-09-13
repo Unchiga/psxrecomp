@@ -19,6 +19,7 @@ import hashlib
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "tools"))
 from sdk_progress import ProgressReporter  # noqa: E402
+from disc_companion import CompanionError, inspect_companion  # noqa: E402
 from toolchain_pack import (  # noqa: E402
     ensure_toolchain as _ensure_toolchain_pack,
     resolve_toolchain_bin,
@@ -309,6 +311,12 @@ def _find_recompiler_tool(project_root: Path, basename: str, env_name: str) -> P
             return p.resolve()
     names = [basename, f"{basename}.exe"]
     search_dirs = [
+        # The dedicated analyzer tree comes FIRST. ensure_analyzer() builds and
+        # source-stamps that one, and an older psxrecomp-analyze left behind in
+        # the shared emitters tree would otherwise shadow every rebuild — the
+        # tool would be rebuilt correctly and then never used.
+        project_root / "psxrecomp" / "recompiler" / "build-analyze",
+        ROOT / "recompiler" / "build-analyze",
         project_root / "psxrecomp" / "recompiler" / "build",
         project_root / "psxrecomp" / "recompiler" / "build" / "Release",
         project_root / "build-recompiler",
@@ -337,6 +345,10 @@ def find_psxrecomp_game(project_root: Path) -> Path:
 
 def find_psxrecomp_bios(project_root: Path) -> Path:
     return _find_recompiler_tool(project_root, "psxrecomp-bios", "PSXRECOMP_BIOS")
+
+
+def find_psxrecomp_analyze(project_root: Path) -> Path:
+    return _find_recompiler_tool(project_root, "psxrecomp-analyze", "PSXRECOMP_ANALYZE")
 
 
 def find_emitters(project_root: Path) -> tuple[Path, Path]:
@@ -380,6 +392,191 @@ def ensure_emitters(
         pct=0.12,
         message="Building psxrecomp-game + psxrecomp-bios…",
     )
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        # psxrecomp-analyze is deliberately NOT built here. It has its own
+        # ensure_analyzer()/build tree, and requesting it from the shared
+        # emitters build breaks `ensure-emitters` outright on any checkout whose
+        # recompiler/CMakeLists.txt predates the target ("ninja: error: unknown
+        # target"). The emitters path must keep working on old framework pins.
+        ("psxrecomp-game", "psxrecomp-bios"),
+        download_toolchain=download_toolchain,
+        clean=force,
+    )
+
+    try:
+        game, bios = find_emitters(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"emitters build finished but binaries not found: {exc}"
+        ) from exc
+    progress.log(f"Emitters built: {game} , {bios}")
+    return game, bios
+
+
+# Source files that make up psxrecomp-analyze. Kept in step with the target's
+# source list in recompiler/CMakeLists.txt.
+ANALYZER_SOURCES = (
+    "recompiler/src/ps1_exe_parser.cpp",
+    "recompiler/src/mips_decoder.cpp",
+    "recompiler/src/function_analysis.cpp",
+    "recompiler/src/analysis_db.cpp",
+    "recompiler/src/bios_call_names.cpp",
+    "recompiler/src/analysis_export.cpp",
+    "recompiler/src/widescreen_scan.cpp",
+    "recompiler/src/main_analyze.cpp",
+    "recompiler/include/analysis_db.h",
+    "recompiler/src/analysis_export.h",
+    "recompiler/include/widescreen_scan.h",
+    "runtime/include/ws_cull_detect.h",
+)
+
+
+def _analyzer_source_hash(project_root: Path) -> str:
+    """Digest of the analyzer's sources, or "" if they cannot be read.
+
+    The toolchain stamp notices a changed COMPILER; nothing noticed changed
+    CODE, so a psxrecomp-analyze built before a feature landed kept being reused
+    and rejected the very options the caller had just learned to pass. This is
+    the same guard `psxrecomp-game --codegen-hash` provides for the emitters,
+    computed here rather than baked in so it needs no CMake support.
+    """
+    import hashlib
+
+    fw = framework_root(project_root)
+    h = hashlib.sha256()
+    for rel in ANALYZER_SOURCES:
+        p = fw / rel
+        if not p.is_file():
+            return ""
+        h.update(rel.encode("utf-8"))
+        h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def _analyzer_stamp_path(tool: Path) -> Path:
+    return tool.parent / (tool.name + ".srcstamp")
+
+
+def ensure_analyzer(
+    project_root: Path,
+    progress: ProgressReporter,
+    *,
+    download_toolchain: bool = True,
+) -> Path:
+    """Return psxrecomp-analyze, building ONLY that target when it is missing.
+
+    Every build tree created before this target existed has game+bios but no
+    analyzer, so `analyze` has to be able to add one. It must not do that by
+    rebuilding the emitters: they already work, a relink is slow, and on a repo
+    whose tree was configured with the portable cmake-clang toolchain against a
+    newer system glibc the psxrecomp-game link fails outright on
+    ``__isoc23_strtoul`` — a pre-existing toolchain mismatch that has nothing to
+    do with analysis. Building the one target that is actually missing avoids
+    dragging that failure into an unrelated command.
+    """
+    src = recompiler_source_dir(project_root)
+    dedicated = src / "build-analyze"
+
+    # If this project already has the dedicated tree, always run the build step
+    # rather than trusting the binary's presence. Ninja is a no-op when nothing
+    # changed (tens of milliseconds), and it is the only thing that notices an
+    # analyzer SOURCE edit — the toolchain stamp catches a changed compiler, not
+    # changed code, so a stale binary would otherwise keep producing old-format
+    # reports indefinitely.
+    want = _analyzer_source_hash(project_root)
+    try:
+        existing = find_psxrecomp_analyze(project_root)
+        stamp = _analyzer_stamp_path(existing)
+        have = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+        if want and have == want:
+            return existing
+        progress.log(
+            "psxrecomp-analyze is stale for the current sources — rebuilding"
+            if have
+            else "psxrecomp-analyze has no source stamp — rebuilding once"
+        )
+    except FileNotFoundError:
+        pass
+
+    progress.phase("emitters", pct=0.12, message="Building psxrecomp-analyze…")
+    _build_recompiler_targets(
+        project_root,
+        progress,
+        ("psxrecomp-analyze",),
+        download_toolchain=download_toolchain,
+        build_dir_override=dedicated,
+        # The analyzer needs fmt and nothing else. Configuring its own tree with
+        # libchdr and the test suite off keeps `analyze` independent of whatever
+        # state the emitters' build directory is in — a half-configured cache, a
+        # cold FetchContent needing the network, or a project path containing a
+        # colon, all of which fail the shared configure for reasons that have
+        # nothing to do with static analysis.
+        extra_cmake_args=("-DPSXRECOMP_ENABLE_CHD=OFF", "-DBUILD_TESTING=OFF"),
+    )
+    try:
+        tool = find_psxrecomp_analyze(project_root)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"psxrecomp-analyze build finished but the binary was not found: {exc}"
+        ) from exc
+    if want:
+        try:
+            _analyzer_stamp_path(tool).write_text(want, encoding="utf-8")
+        except OSError:
+            pass
+    progress.log(f"Analyzer built: {tool}")
+    return tool
+
+
+def _toolchain_stamp(clang_cxx: Optional[str], cmake_tool: Optional[str]) -> str:
+    """Identity of the toolchain that a build directory's objects were made with.
+
+    The portable toolchain is addressed through a stable ``latest`` symlink, so
+    an upgrade behind it leaves CMAKE_CXX_COMPILER unchanged and CMake's
+    compiler-change detection never fires. Ninja then relinks object files
+    built by the previous toolchain.
+
+    That is not theoretical: cmake-clang-v1 v1.0.10 shipped no sysroot and
+    compiled against the host's glibc, so `strtoul` became `__isoc23_strtoul`
+    (glibc >= 2.38). v1.0.14 added a bundled older sysroot that exports no such
+    symbol, and every build tree from before the upgrade failed to link with
+    "undefined symbol: __isoc23_strtoul" while nothing looked out of date.
+
+    Resolving the symlink puts the concrete version in the stamp, so the
+    upgrade becomes visible and the tree can be wiped.
+    """
+    parts: list[str] = []
+    for tool in (clang_cxx, cmake_tool):
+        if not tool:
+            continue
+        real = Path(tool).resolve()
+        parts.append(str(real))
+        try:
+            parts.append(str(real.stat().st_size))
+        except OSError:
+            pass
+        manifest = real.parent.parent / "retcomm-toolchain.json"
+        if manifest.is_file():
+            try:
+                parts.append(manifest.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return "\n".join(parts)
+
+
+def _build_recompiler_targets(
+    project_root: Path,
+    progress: ProgressReporter,
+    targets: tuple[str, ...],
+    *,
+    download_toolchain: bool = True,
+    build_dir_override: Path | None = None,
+    extra_cmake_args: tuple[str, ...] = (),
+    clean: bool = False,
+) -> Path:
+    """Configure recompiler/ and build `targets`. Returns the build directory."""
     if not activate_embedded_toolchain(project_root, progress):
         if not download_toolchain or not ensure_toolchain_for_rebuild(
             project_root, progress, download=True
@@ -397,7 +594,7 @@ def ensure_emitters(
             )
 
     src = recompiler_source_dir(project_root)
-    # Prefer recompiler/build (packaging / RetComM harvest layout); also keep
+    # Prefer recompiler/build (packaging / Retro harvest layout); also keep
     # project-root build-recompiler if that is where prior binaries lived.
     build_dir = src / "build"
     try:
@@ -410,13 +607,48 @@ def ensure_emitters(
     except FileNotFoundError:
         pass
 
+    if build_dir_override is not None:
+        build_dir = build_dir_override
+
     build_dir.mkdir(parents=True, exist_ok=True)
-    ninja = _which_tool("ninja")
-    clang_c = _which_tool("clang")
-    clang_cxx = _which_tool("clang++")
-    cmake = _which_tool("cmake")
+    toolchain_bin = resolve_embedded_toolchain_bin(project_root)
+    ninja = _tool_in_dir(toolchain_bin, "ninja") or _which_tool("ninja")
+    clang_c = _tool_in_dir(toolchain_bin, "clang") or _which_tool("clang")
+    clang_cxx = _tool_in_dir(toolchain_bin, "clang++") or _which_tool("clang++")
+    cmake = _tool_in_dir(toolchain_bin, "cmake") or _which_tool("cmake")
     if cmake is None:
         raise RuntimeError("cmake not found on PATH after toolchain activate")
+
+    # Wipe when the caller asked for a clean build, or when the toolchain that
+    # produced this tree's objects is not the one about to link them.
+    stamp_file = build_dir / ".retcomm-toolchain-stamp"
+    stamp = _toolchain_stamp(clang_cxx, cmake)
+    if clean:
+        progress.log(f"Clean rebuild requested — removing {build_dir}")
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and stamp_file.is_file():
+        try:
+            previous = stamp_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            previous = ""
+        if previous and previous != stamp:
+            progress.log(
+                "Toolchain changed since this build directory was configured — "
+                f"removing {build_dir} so objects are rebuilt against it"
+            )
+            shutil.rmtree(build_dir, ignore_errors=True)
+            build_dir.mkdir(parents=True, exist_ok=True)
+    elif stamp and not stamp_file.is_file() and (build_dir / "CMakeCache.txt").is_file():
+        # A tree configured before stamping existed. Its objects may predate the
+        # current toolchain with no way to tell, and a mismatch surfaces only as
+        # an undefined symbol at link time. Rebuild once, then stamp.
+        progress.log(
+            f"Unstamped build directory {build_dir} — rebuilding once so its "
+            "objects are known to match the active toolchain"
+        )
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
 
     cache_file = build_dir / "CMakeCache.txt"
     gen: list[str] = []
@@ -449,10 +681,14 @@ def ensure_emitters(
     # no MSYS2 GCC DLLs (same as tools/ci/build_emitters.sh).
     if clang_c is not None or clang_cxx is not None:
         cmake_args.append("-DPSXRECOMP_STATIC_CLI=ON")
+    cmake_args.extend(
+        _pack_sysroot_cmake_args(clang_c, (*cmake_args, *extra_cmake_args))
+    )
+    cmake_args.extend(extra_cmake_args)
 
     progress.log(" ".join(cmake_args))
     proc = subprocess.run(
-        cmake_args, cwd=str(project_root), capture_output=True, text=True
+        cmake_args, cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     for stream in (proc.stdout, proc.stderr):
         if stream:
@@ -465,35 +701,27 @@ def ensure_emitters(
         )
 
     jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or str(os.cpu_count() or 4)
-    build_cmd = [
-        str(cmake),
-        "--build",
-        str(build_dir),
-        "--parallel",
-        jobs,
-        "--target",
-        "psxrecomp-game",
-        "--target",
-        "psxrecomp-bios",
-    ]
+    build_cmd = [str(cmake), "--build", str(build_dir), "--parallel", jobs]
+    for target in targets:
+        build_cmd += ["--target", target]
     progress.log(" ".join(build_cmd))
-    proc = subprocess.run(build_cmd, capture_output=True, text=True)
+    proc = subprocess.run(build_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
                 if line.strip():
                     progress.log(line)
     if proc.returncode != 0:
-        raise RuntimeError(f"emitters cmake build failed (exit {proc.returncode})")
-
-    try:
-        game, bios = find_emitters(project_root)
-    except FileNotFoundError as exc:
         raise RuntimeError(
-            f"emitters build finished but binaries not found under {build_dir}: {exc}"
-        ) from exc
-    progress.log(f"Emitters built: {game} , {bios}")
-    return game, bios
+            f"recompiler cmake build failed (exit {proc.returncode}) for "
+            + ", ".join(targets)
+        )
+    if stamp:
+        try:
+            stamp_file.write_text(stamp, encoding="utf-8")
+        except OSError:
+            pass
+    return build_dir
 
 
 def framework_root(project_root: Path) -> Path:
@@ -528,7 +756,7 @@ def ensure_framework(
 ) -> Path:
     """Ensure project_root/psxrecomp has BIOS profiles + seeds for local generate.
 
-    GitHub zipballs omit git submodules, so RetComM source trees often lack
+    GitHub zipballs omit git submodules, so Retro source trees often lack
     psxrecomp/bios. Seed from the SDK pack that ships this CLI (ROOT).
     """
     fw = project_root / "psxrecomp"
@@ -553,7 +781,7 @@ def ensure_framework(
         marker = fw / ".gitignore"
         if not marker.is_file():
             marker.write_text(
-                "# RetComM SDK seed marker (project-root for psxrecomp-bios)\n",
+                "# Retro SDK seed marker (project-root for psxrecomp-bios)\n",
                 encoding="utf-8",
             )
     return framework_root(project_root)
@@ -590,7 +818,7 @@ def regen_bios_profile(
         [str(bios_tool), "--config", profile_rel],
         cwd=str(fw),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     for stream in (proc.stdout, proc.stderr):
         if not stream:
@@ -619,12 +847,17 @@ def verify_disc_path(
     if path.suffix.lower() == ".cue":
         path = resolve_cue_bin(path)
     md5, sha1, size = file_hashes(path)
+    try:
+        subchannel, _ = inspect_companion(disc, size, sha1)
+    except CompanionError as exc:
+        raise DiscVerifyError(str(exc)) from exc
     identity = {
         "path": str(path),
         "md5": md5,
         "sha1": sha1,
         "size": size,
         "verified": False,
+        "subchannel": subchannel,
     }
     progress.event("disc", **identity)
     sizes = [int(s) for s in (prep.get("known_sizes") or [])]
@@ -680,7 +913,8 @@ def cmd_verify_disc(args: argparse.Namespace, progress: ProgressReporter) -> int
     except DiscVerifyError as exc:
         progress.error(str(exc), code=EXIT_VERIFY, verify_failed=True)
         return EXIT_VERIFY
-    progress.phase("done", pct=1.0, message="Disc OK")
+    progress.phase("done", pct=1.0,
+                   message=f"Main track accepted; subchannel status: {identity['subchannel']['status']}")
     progress.result(ok=True, **identity)
     return EXIT_OK
 
@@ -704,7 +938,7 @@ def run_prepare_disc(
         str(project_root),
         str(source),
     ]
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
     out = (proc.stdout or "") + (proc.stderr or "")
     for line in out.splitlines():
         if line.strip():
@@ -907,7 +1141,7 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
         cmd,
         cwd=str(project_root),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
     )
     ri_warn = 0
     for stream in (proc.stdout, proc.stderr):
@@ -939,12 +1173,24 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
     marker_name = args.gen_marker or f"{boot}_dispatch.c"
     marker = out_dir / marker_name
     if not marker.is_file():
-        # Accept any *_dispatch.c
+        # The build (CMakeLists GEN_MARKER) and the setup host
+        # (codegen_setup.c gen_marker_relpath) both gate on this exact
+        # filename. Accepting a differently named dispatch here used to
+        # report success while the next rebuild silently produced another
+        # setup host — an endless generate+build loop. Fail loudly instead.
         hits = list(out_dir.glob("*_dispatch.c"))
         if not hits:
             progress.error(f"generate produced no dispatch under {out_dir}", code=EXIT_ERROR)
             return EXIT_ERROR
-        marker = hits[0]
+        progress.error(
+            f"generate produced {', '.join(h.name for h in hits)} under "
+            f"{out_dir}, but the project expects {marker_name}. The boot-exe "
+            "name in game.toml disagrees with GEN_MARKER in CMakeLists.txt / "
+            "codegen_setup.c — the rebuild would link no game code. Fix the "
+            "project so all three name the same boot EXE.",
+            code=EXIT_ERROR,
+        )
+        return EXIT_ERROR
 
     progress.phase("done", pct=1.0, message="Generate complete")
     progress.result(
@@ -964,6 +1210,40 @@ def _which_tool(name: str) -> Optional[Path]:
         if found:
             return Path(found)
     return None
+
+
+def _tool_in_dir(bin_dir: Optional[Path], name: str) -> Optional[Path]:
+    if bin_dir is None:
+        return None
+    for cand in (name, f"{name}.exe"):
+        p = bin_dir / cand
+        if p.is_file():
+            return p
+    return None
+
+
+def _pack_sysroot_cmake_args(
+    clang_path: Optional[Path], existing: list[str] | tuple[str, ...] = ()
+) -> list[str]:
+    """CMake args that wire the portable pack's bundled sysroot (Linux only).
+
+    clang.cfg already gives the *compiler* ``--sysroot``, but CMake's find_*
+    still searches the host, so on a headerless host (stock SteamOS) recomp-ui's
+    ``find_package(OpenGL REQUIRED)`` fails at configure with "Could NOT find
+    OpenGL (missing: OPENGL_INCLUDE_DIR)". CMAKE_SYSROOT re-roots find_* into
+    the pack. OpenGL_GL_PREFERENCE=LEGACY is required with it: the sysroot
+    ships legacy ``libGL.so`` + ``GL/gl.h`` but no GLVND dev files
+    (``glx.h`` / ``libOpenGL.so`` / ``libGLX.so``), so the GLVND path cannot
+    complete inside the sysroot and ``OpenGL::GL`` would never be created.
+    """
+    if not sys.platform.startswith("linux") or clang_path is None:
+        return []
+    if any("CMAKE_SYSROOT" in str(a) for a in existing):
+        return []
+    sysroot = Path(clang_path).resolve().parent.parent / "sysroot"
+    if not (sysroot / "usr" / "include").is_dir():
+        return []
+    return [f"-DCMAKE_SYSROOT={sysroot}", "-DOpenGL_GL_PREFERENCE=LEGACY"]
 
 
 def _read_cmake_cache_generator(cache_file: Path) -> str:
@@ -989,9 +1269,13 @@ def _cmake_configure(
 ) -> None:
     build_dir.mkdir(parents=True, exist_ok=True)
     cache_file = build_dir / "CMakeCache.txt"
-    ninja = _which_tool("ninja")
-    clang_c = _which_tool("clang")
-    clang_cxx = _which_tool("clang++")
+    toolchain_bin = resolve_embedded_toolchain_bin(project_root)
+    ninja = _tool_in_dir(toolchain_bin, "ninja") or _which_tool("ninja")
+    clang_c = _tool_in_dir(toolchain_bin, "clang") or _which_tool("clang")
+    clang_cxx = _tool_in_dir(toolchain_bin, "clang++") or _which_tool("clang++")
+    cmake = _tool_in_dir(toolchain_bin, "cmake") or _which_tool("cmake")
+    if cmake is None:
+        raise RuntimeError("cmake not found on PATH after toolchain activate")
 
     # Prefer Ninja + pack clang when the portable toolchain is on PATH.
     # On Windows, a prior failed configure often leaves CMakeCache stuck on
@@ -1015,9 +1299,10 @@ def _cmake_configure(
         compiler_args.append(f"-DCMAKE_C_COMPILER={clang_c}")
     if clang_cxx is not None:
         compiler_args.append(f"-DCMAKE_CXX_COMPILER={clang_cxx}")
+    compiler_args.extend(_pack_sysroot_cmake_args(clang_c, extra))
 
     cmd = [
-        "cmake",
+        str(cmake),
         "-S",
         str(project_root),
         "-B",
@@ -1029,7 +1314,7 @@ def _cmake_configure(
         *extra,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1039,6 +1324,59 @@ def _cmake_configure(
         raise RuntimeError(f"cmake configure failed (exit {proc.returncode})")
 
 
+
+
+def _runtime_exe_candidates(build_dir: Path, target: str, exe_basename: str):
+    """Names to try for the built runtime, best evidence first.
+
+    runtime.cmake writes the OUTPUT_NAME it actually set to
+    psxrecomp_exe_name-<target>.txt at configure time. That file is the answer;
+    exe_basename is only a guess re-derived from a second copy of the window
+    title, and the two drift the moment a game is renamed.
+    """
+    published = build_dir / f"psxrecomp_exe_name-{target}.txt"
+    names, seen = [], set()
+    try:
+        name = published.read_text(encoding="utf-8").strip()
+    except OSError:
+        name = ""
+    for candidate in (name, exe_basename):
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            names.append(candidate)
+    return names, name
+
+
+def _resolve_runtime_exe(build_dir: Path, target: str, exe_basename: str):
+    """(path, None) once found, or (None, message) explaining what went wrong."""
+    names, published = _runtime_exe_candidates(build_dir, target, exe_basename)
+    for name in names:
+        for path in (build_dir / name, build_dir / f"{name}.exe"):
+            if path.is_file():
+                return path, None
+
+    # Nothing matched. Distinguish the two very different reasons, because
+    # "binary missing" after a clean build reads as a build failure and is not
+    # one: a name disagreement means the executable is sitting right there.
+    built = sorted(
+        p.name
+        for p in build_dir.glob("*")
+        if p.is_file() and (p.suffix.lower() == ".exe" or os.access(p, os.X_OK))
+    )
+    if published and published != exe_basename:
+        return None, (
+            f"the runtime was built as '{published}' but this project expects "
+            f"'{exe_basename}'. The build itself succeeded — nothing is wrong "
+            f"with the code. CMake derives the name from WINDOW_TITLE in "
+            f"CMakeLists.txt; --exe-name / codegen_setup.exe_basename carries a "
+            f"second copy of that title which has drifted. Make them agree, or "
+            f"pin it by passing EXE_NAME to psxrecomp_add_game_runtime()."
+        )
+    hint = f" Executables present: {', '.join(built)}." if built else ""
+    return None, (
+        f"build reported success but no runtime binary was found in "
+        f"{build_dir} (looked for {', '.join(names)}).{hint}"
+    )
 
 
 def _cmake_build(
@@ -1059,7 +1397,7 @@ def _cmake_build(
         target,
     ]
     progress.log(" ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     for stream in (proc.stdout, proc.stderr):
         if stream:
             for line in stream.splitlines():
@@ -1079,21 +1417,45 @@ def _cmake_build(
         raise RuntimeError(err)
 
 
+PGO_DEBUG_PORT = 45231
+
+
 def _soft_stop(pid: int, timeout: int = 30) -> None:
     try:
         os.kill(pid, 15)  # SIGTERM
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return
     for _ in range(timeout):
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
         time.sleep(1)
     try:
         os.kill(pid, 9)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
+
+
+def _debug_quit(pid: int, port: int, *, exit_timeout: int = 15) -> bool:
+    """Request a clean exit and confirm the training process has stopped."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(b'{"id":1,"cmd":"quit"}\n')
+            try:
+                sock.settimeout(2)
+                sock.recv(256)
+            except OSError:
+                pass
+    except OSError:
+        return False
+    for _ in range(exit_timeout):
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        time.sleep(1)
+    return False
 
 
 def _pgo_train_warning(*, hide_video: bool) -> str:
@@ -1115,6 +1477,7 @@ def run_pgo_train(
     build_dir: Path,
     *,
     exe_basename: str,
+    target: str,
     disc: Path,
     config: Path,
     train_secs: int,
@@ -1123,11 +1486,9 @@ def run_pgo_train(
     hide_video: bool,
     progress: ProgressReporter,
 ) -> None:
-    exe = build_dir / exe_basename
-    if not exe.is_file():
-        exe = build_dir / f"{exe_basename}.exe"
-    if not exe.is_file():
-        raise RuntimeError(f"train binary missing: {exe_basename} under {build_dir}")
+    exe, exe_err = _resolve_runtime_exe(build_dir, target, exe_basename)
+    if exe is None:
+        raise RuntimeError(f"PGO training cannot start: {exe_err}")
 
     pgo_dir = build_dir / "pgo"
     if pgo_dir.exists():
@@ -1189,6 +1550,7 @@ def run_pgo_train(
         ]
         if hide_video:
             cmd.append("--headless")
+        cmd.extend(["--debug-port", str(PGO_DEBUG_PORT)])
         proc = subprocess.Popen(
             cmd,
             cwd=str(project_root),
@@ -1198,11 +1560,17 @@ def run_pgo_train(
         )
         time.sleep(train_secs)
         if proc.poll() is None:
-            _soft_stop(proc.pid)
+            if not _debug_quit(proc.pid, PGO_DEBUG_PORT):
+                progress.log("PGO train debug quit unavailable; using forced stop.")
+                _soft_stop(proc.pid)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _soft_stop(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     n_gcda = len(list(build_dir.rglob("*.gcda")))
     n_raw = len(list(pgo_dir.glob("*.profraw")))
@@ -1215,7 +1583,7 @@ def run_pgo_train(
                 r = subprocess.run(
                     ["xcrun", "--find", "llvm-profdata"],
                     capture_output=True,
-                    text=True,
+                    text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -1308,12 +1676,20 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
                 return EXIT_ERROR
             progress.log("Using system cmake on PATH")
 
-    cmake_extra = []
+    # Full playable link after local generate (not the CI setup-host shape).
+    # The legacy BPE_ alias in runtime.cmake only maps ON, so clear the
+    # canonical name too; REQUIRE_GAME_C turns a marker-name skew into a
+    # loud configure failure instead of a silently rebuilt setup host that
+    # reopens the wizard forever. --cmake-extra comes last so a deliberate
+    # override (e.g. -DPSXRECOMP_REQUIRE_GAME_C=OFF) still wins.
+    cmake_extra = [
+        "-DBPE_FORCE_SETUP_HOST=OFF",
+        "-DPSXRECOMP_FORCE_SETUP_HOST=OFF",
+        "-DPSXRECOMP_ALLOW_NO_BIOS=OFF",
+        "-DPSXRECOMP_REQUIRE_GAME_C=ON",
+    ]
     if args.cmake_extra:
         cmake_extra.extend(args.cmake_extra)
-    # Full playable link after local generate (not the CI setup-host shape).
-    cmake_extra.append("-DBPE_FORCE_SETUP_HOST=OFF")
-    cmake_extra.append("-DPSXRECOMP_ALLOW_NO_BIOS=OFF")
 
     clamped = clamp_future_mtimes(project_root, skip=build_dir)
     if clamped:
@@ -1343,7 +1719,7 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
         if not pgo_enabled:
             progress.phase("build", pct=0.2, message="cmake Release build...")
             _cmake_configure(
-                project_root, build_dir, pgo="", extra=cmake_extra, progress=progress
+                project_root, build_dir, pgo="", extra=cmake_extra + ["-DPSX_DEBUG_TOOLS=OFF"], progress=progress
             )
             _cmake_build(build_dir, target, progress)
         else:
@@ -1363,7 +1739,7 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
                 project_root,
                 build_dir,
                 pgo="generate",
-                extra=cmake_extra,
+                extra=cmake_extra + ["-DPSX_DEBUG_TOOLS=ON"],
                 progress=progress,
             )
             _cmake_build(build_dir, target, progress)
@@ -1376,6 +1752,7 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
                 project_root,
                 build_dir,
                 exe_basename=exe_basename,
+                target=target,
                 disc=Path(disc),
                 config=config,
                 train_secs=train_secs,
@@ -1389,7 +1766,7 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
                 project_root,
                 build_dir,
                 pgo="use",
-                extra=cmake_extra,
+                extra=cmake_extra + ["-DPSX_DEBUG_TOOLS=OFF"],
                 progress=progress,
             )
             _cmake_build(build_dir, target, progress)
@@ -1397,11 +1774,9 @@ def cmd_rebuild(args: argparse.Namespace, progress: ProgressReporter) -> int:
         progress.error(str(exc), code=EXIT_ERROR)
         return EXIT_ERROR
 
-    exe = build_dir / exe_basename
-    if not exe.is_file():
-        exe = build_dir / f"{exe_basename}.exe"
-    if not exe.is_file():
-        progress.error(f"build succeeded but binary missing: {exe}", code=EXIT_ERROR)
+    exe, exe_err = _resolve_runtime_exe(build_dir, target, exe_basename)
+    if exe is None:
+        progress.error(exe_err, code=EXIT_ERROR)
         return EXIT_ERROR
 
     prune_raw = (getattr(args, "prune_after", None) or "").strip()
@@ -1422,7 +1797,7 @@ def cmd_pgo_train(args: argparse.Namespace, progress: ProgressReporter) -> int:
 
 
 def cmd_ensure_toolchain(args: argparse.Namespace, progress: ProgressReporter) -> int:
-    """Resolve / download / unpack cmake-clang-v1 into the shared RetComM cache."""
+    """Resolve / download / unpack cmake-clang-v1 into the shared Retro cache."""
     project_root = (
         Path(args.project_root).expanduser().resolve()
         if args.project_root
@@ -1470,6 +1845,139 @@ def cmd_ensure_emitters(args: argparse.Namespace, progress: ProgressReporter) ->
         return EXIT_ERROR
     progress.phase("done", pct=1.0, message="Emitters ready")
     progress.result(ok=True, game=str(game), bios=str(bios))
+    return EXIT_OK
+
+
+def cmd_analyze(args: argparse.Namespace, progress: ProgressReporter) -> int:
+    """Static function discovery over the project's boot EXE.
+
+    Distinct from `generate`: this produces knowledge *about* the executable
+    (function boundaries, call graph, recovered jump tables, inferred
+    signatures) rather than C for the runtime, and it never consults the
+    runtime or any capture set to do it.
+    """
+    project_root = (
+        Path(args.project_root).expanduser().resolve()
+        if args.project_root
+        else Path.cwd().resolve()
+    )
+    config = Path(args.config).expanduser()
+    if not config.is_absolute():
+        config = (project_root / config).resolve()
+
+    exe = str(getattr(args, "exe", "") or "").strip()
+    seeds = ""
+    if not exe:
+        if not config.is_file():
+            progress.error(
+                f"no --exe given and config not found: {config}", code=EXIT_USAGE
+            )
+            return EXIT_USAGE
+        secs = load_sections(config)
+        exe = str((secs.get("game") or {}).get("exe") or "").strip()
+        seeds = str((secs.get("recompiler") or {}).get("seeds") or "").strip()
+        if not exe:
+            progress.error(f"[game].exe not set in {config}", code=EXIT_USAGE)
+            return EXIT_USAGE
+
+    exe_path = Path(exe).expanduser()
+    if not exe_path.is_absolute():
+        exe_path = (project_root / exe_path).resolve()
+    if not exe_path.is_file():
+        progress.error(
+            f"boot EXE not found: {exe_path} (run `prepare-disc` first?)",
+            code=EXIT_USAGE,
+        )
+        return EXIT_USAGE
+
+    activate_embedded_toolchain(project_root, progress)
+    # Always go through ensure_analyzer: it owns both the "is it there" and the
+    # "is it current" questions. Calling find_psxrecomp_analyze() here first
+    # made the source-stamp check unreachable whenever a binary already existed,
+    # which is exactly the case it was written for.
+    try:
+        tool = ensure_analyzer(project_root, progress)
+    except Exception as exc:  # noqa: BLE001
+        progress.error(str(exc), code=EXIT_ERROR)
+        return EXIT_ERROR
+
+    out_dir = Path(args.out).expanduser() if args.out else (project_root / "analysis")
+    if not out_dir.is_absolute():
+        out_dir = (project_root / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    symbols = Path(args.symbols).expanduser() if args.symbols else (
+        project_root / "symbols.toml"
+    )
+    if not symbols.is_absolute():
+        symbols = (project_root / symbols).resolve()
+
+    cmd = [
+        str(tool),
+        str(exe_path),
+        "--out",
+        str(out_dir),
+        "--emit-tsv",
+        str(out_dir / "functions.tsv"),
+        "--top",
+        str(int(getattr(args, "top", 15) or 15)),
+    ]
+    if symbols.is_file():
+        cmd += ["--symbols", str(symbols)]
+    if getattr(args, "no_refs", False):
+        cmd.append("--no-refs")
+    if getattr(args, "exact", False):
+        cmd.append("--exact")
+    seeds_arg = str(getattr(args, "seeds", "") or "").strip() or seeds
+    if seeds_arg:
+        seeds_path = Path(seeds_arg).expanduser()
+        if not seeds_path.is_absolute():
+            seeds_path = (project_root / seeds_path).resolve()
+        if seeds_path.is_file():
+            cmd += ["--seeds", str(seeds_path)]
+    if getattr(args, "emit_symbols", False):
+        cmd += ["--symbols", str(symbols)] if not symbols.is_file() else []
+        cmd += [
+            "--emit-symbols",
+            "--min-confidence",
+            str(getattr(args, "min_confidence", "high") or "high"),
+        ]
+    if getattr(args, "emit_ghidra", False):
+        cmd += ["--emit-ghidra", str(out_dir / "psxrecomp_import.py")]
+    if getattr(args, "emit_symbol_addrs", False):
+        cmd += ["--emit-symbol-addrs", str(out_dir / "symbol_addrs.txt")]
+    if getattr(args, "scan_widescreen", False):
+        cmd += [
+            "--scan-widescreen",
+            "--emit-ws-sites",
+            str(out_dir / "widescreen_sites.toml"),
+        ]
+    prev = out_dir / "functions.prev.tsv"
+    if getattr(args, "diff", False) and prev.is_file():
+        cmd += ["--diff", str(prev)]
+
+    # Keep the last run so the next one can diff against it without the caller
+    # having to manage snapshots.
+    cur = out_dir / "functions.tsv"
+    if cur.is_file():
+        shutil.copy2(cur, prev)
+
+    progress.phase("analyze", pct=0.3, message=f"Analyzing {exe_path.name}…")
+    progress.log(" ".join(cmd))
+    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for stream in (proc.stdout, proc.stderr):
+        if stream:
+            for line in stream.splitlines():
+                if line.strip():
+                    progress.log(line)
+    if proc.returncode != 0:
+        progress.error(
+            f"psxrecomp-analyze failed (exit {proc.returncode})", code=EXIT_ERROR
+        )
+        return EXIT_ERROR
+
+    progress.phase("done", pct=1.0, message=f"Analysis written to {out_dir}")
+    progress.result(ok=True, out_dir=str(out_dir), exe=str(exe_path))
     return EXIT_OK
 
 
@@ -1632,6 +2140,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not fetch cmake-clang-v1 when no local pack is found",
     )
     em.set_defaults(handler=cmd_ensure_emitters)
+
+    an = sub.add_parser(
+        "analyze",
+        help="static function discovery over the boot EXE (no runtime involved)",
+    )
+    an.add_argument("--project-root", default="", help="game project root")
+    an.add_argument("--config", default="game.toml", help="game.toml path")
+    an.add_argument("--exe", default="", help="override the boot EXE path")
+    an.add_argument("--out", default="", help="output dir (default: <root>/analysis)")
+    an.add_argument("--symbols", default="", help="symbols.toml (default: <root>/symbols.toml)")
+    an.add_argument("--seeds", default="", help="seed address file (default: [recompiler].seeds)")
+    an.add_argument("--top", default="15", help="rows in the stdout top lists")
+    an.add_argument("--exact", action="store_true", help="reachability-only partition")
+    an.add_argument("--no-refs", action="store_true", help="skip refs.json")
+    an.add_argument("--diff", action="store_true", help="diff against the previous run")
+    an.add_argument(
+        "--emit-symbols",
+        action="store_true",
+        help="merge discovered functions into symbols.toml (existing names win)",
+    )
+    an.add_argument("--min-confidence", default="high", help="gate for --emit-symbols")
+    an.add_argument("--emit-ghidra", action="store_true", help="write a Ghidra import script")
+    an.add_argument(
+        "--emit-symbol-addrs", action="store_true", help="write a decomp symbol map"
+    )
+    an.add_argument(
+        "--scan-widescreen",
+        action="store_true",
+        help="also scan for [widescreen.cull] site candidates",
+    )
+    an.add_argument("--json-progress", action="store_true")
+    an.set_defaults(handler=cmd_analyze)
 
     p = sub.add_parser("pgo-train", help="force PGO rebuild+train+use")
     add_common(p)

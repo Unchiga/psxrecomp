@@ -193,8 +193,14 @@ static inline void dirty_ram_mark_page(uint32_t phys) {
  * through the extern each time. A BIOS with no bless window exports all
  * zeros: the span-0 range test then rejects every address. */
 #include "psx_bios_image.h"
+#include "kernel_patch_ranges.h"
 
 static uint32_t s_kb_lo = 0, s_kb_span = 0, s_kb_rom_off = 0;
+
+static const PsxKernelPatchRange* s_kb_pr = 0;
+static uint32_t                   s_kb_pr_n = 0;
+static uint64_t kbless_patch_skips = 0;   /* segments skipped, TCP counter */
+
 
 #define KBLESS_UNKNOWN  0u
 #define KBLESS_CLEAN    1u
@@ -216,6 +222,19 @@ static int kbless_on(void) {
         s_kb_lo      = psx_bios_image.kbless_ram_lo;
         s_kb_span    = psx_bios_image.kbless_ram_hi - psx_bios_image.kbless_ram_lo;
         s_kb_rom_off = psx_bios_image.kbless_rom_off;
+        s_kb_pr      = psx_bios_kernel_patch_ranges;
+        s_kb_pr_n    = psx_bios_kernel_patch_ranges ?
+                       psx_bios_kernel_patch_range_count : 0u;
+        /* PSX_KERNEL_PATCH_RANGES=0 drops the declared ranges, restoring the
+         * whole-body memcmp. Same purpose as PSX_KERNEL_BLESS=0 one level up:
+         * an A/B instrument. With the ranges dropped a patched body mismatches
+         * forever and its emitted hook is unreachable, which is exactly the
+         * behaviour before the ranges existed — so one binary measures both
+         * sides. */
+        {
+            const char* pe = getenv("PSX_KERNEL_PATCH_RANGES");
+            if (pe && pe[0] == '0') s_kb_pr_n = 0;
+        }
         if (s_kb_span == 0) kbless_enabled = 0;   /* BIOS with no bless window */
         /* The emitted constants must agree with each other and the ROM
          * array: a window whose ROM source exceeds the image is a build
@@ -229,6 +248,29 @@ static int kbless_on(void) {
         }
     }
     return kbless_enabled;
+}
+
+/* Declared patch ranges (psx_bios_kernel_patch_ranges, emitted from the
+ * profile's [[recompiler.install_slots]]): kernel-RAM words the guest is
+ * EXPECTED to overwrite at boot. They sit inside compiled bodies, so the
+ * whole-body memcmp below used to fail forever on the first install — the
+ * reason Breath of Fire III's BIOS exception handler interpreted 1.22 billion
+ * instructions with its card stub sitting in the profile's declared slot.
+ * The body is verified in segments that skip them instead: CLEAN now means
+ * every byte OUTSIDE every declared range still matches the ROM source, which
+ * is exactly the claim the native code depends on. The patched words
+ * themselves still execute on the dirty-RAM interpreter (Rule 18), entered
+ * through the emitted patch-range hook.
+ *
+ * Snapshotted on the same latch as the window constants. The decision itself
+ * lives in kernel_patch_ranges.c so it can be unit-tested without the
+ * runtime's globals. */
+/* Does a declared patch range END at this RAM address? The emitter registered
+ * that PC as a continuation key, so the dirty-RAM interpreter hands straight-
+ * line flow back to static dispatch there and only the patched words
+ * interpret (dirty_ram_interp.c). */
+int psx_kernel_patch_range_ends_at(uint32_t phys) {
+    return psx_kernel_patch_ends_at(s_kb_pr, s_kb_pr_n, phys);
 }
 
 /* Binary search the (key-sorted) body table. -1 if absent. */
@@ -255,9 +297,10 @@ int psx_kernel_bless_dispatchable(uint32_t phys) {
     if (st == KBLESS_MISMATCH) return 0;
     const PsxKernelBody* b = &psx_bios_kernel_bodies[i];
     kbless_verifies++;
-    if (memcmp(ram + b->body_lo,
-               bios_rom + s_kb_rom_off + (b->body_lo - s_kb_lo),
-               b->body_hi - b->body_lo) == 0) {
+    if (psx_kernel_patch_cmp(s_kb_pr, s_kb_pr_n, ram, bios_rom,
+                             s_kb_lo, s_kb_rom_off,
+                             b->body_lo, b->body_hi,
+                             &kbless_patch_skips) == 0) {
         kbless_state[i] = KBLESS_CLEAN;
         kbless_native_hits++;
         return 1;
@@ -308,7 +351,7 @@ void psx_kernel_bless_note_range(uint32_t phys, uint32_t len) {
     }
 }
 
-void psx_kernel_bless_stats(uint64_t out[6]) {
+void psx_kernel_bless_stats(uint64_t out[8]) {
     uint32_t n = psx_bios_kernel_body_count;
     uint32_t clean = 0, mism = 0;
     if (n > KBLESS_MAX_ENTRIES) n = KBLESS_MAX_ENTRIES;
@@ -322,6 +365,11 @@ void psx_kernel_bless_stats(uint64_t out[6]) {
     out[3] = kbless_native_hits;
     out[4] = kbless_verifies;
     out[5] = kbless_invalidations;
+    /* Declared patch ranges, and how many segments the verifier skipped
+     * because of them: the proof that a body with a live install stub is
+     * being blessed rather than failing forever. */
+    out[6] = s_kb_pr_n;
+    out[7] = kbless_patch_skips;
 }
 
 void psx_kernel_bless_resync_after_restore(void) {
@@ -341,6 +389,8 @@ void psx_kernel_bless_reset_for_boot(void) {
     s_kb_lo = 0;
     s_kb_span = 0;
     s_kb_rom_off = 0;
+    s_kb_pr = NULL;
+    s_kb_pr_n = 0;
     memset(kbless_state, KBLESS_UNKNOWN, sizeof(kbless_state));
 }
 
@@ -362,13 +412,19 @@ int dirty_ram_is_dirty(uint32_t phys);
  * trust a clean text page to run its compiled function and divert only truly-
  * overlaid pages to the interpreter (Tomba 2 loads a loader overlay over
  * 0x8001Dxxx). The kernel window [0,0x10000) (BIOS install stubs) and the overlay
- * region [FLOOR, RAM) are left untouched. */
+ * region OUTSIDE [BASE, FLOOR) are left untouched — including the RAM BELOW the
+ * text image, which is overlay space for a high-loading boot EXE (Klonoa loads
+ * at 0x180000). Baselining from the kernel-window end instead of the real text
+ * base wiped that whole region's dirty bits. See dirty_ram_interp.h. */
 extern uint32_t g_overlay_region_floor;
 void dirty_ram_clear_image_baseline(void) {
     uint32_t floor = g_overlay_region_floor;
     if (floor <= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
     if (floor > RAM_SIZE) floor = RAM_SIZE;
-    uint32_t first_page = DIRTY_RAM_KERNEL_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t base = g_text_image_lo;
+    if (base < DIRTY_RAM_KERNEL_TRACK_BYTES) base = DIRTY_RAM_KERNEL_TRACK_BYTES;
+    if (base >= floor) return;
+    uint32_t first_page = base >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t page = first_page; page <= last_page; page++)
         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
@@ -476,15 +532,19 @@ int dirty_ram_text_native_ok(uint32_t phys) {
  * a mismatch never poisons an unrelated 4 KB page forever: every decision is
  * made from the live bytes the native body will actually execute.
  *
- * exec_pc is the dispatch/resume address. Ranges that end at or before that PC
- * are skipped, and a range that straddles it is clipped to [exec_pc, end). A
- * runtime patch of a function prologue must not block a compiled continuation
- * that never fetches the patched bytes. */
+ * exec_pc is the dispatch/resume address, kept for observability and future
+ * use; ranges are validated IN FULL regardless of it. The former
+ * [exec_pc, end) clip assumed a continuation "never fetches the patched
+ * bytes" behind its resume PC — false for any entry with a backward edge:
+ * a post-call continuation re-enters mid-function and loops back into the
+ * clipped-away region, executing stale static code (CMR2 overlay
+ * corruption, second locus 0x80016B34). A genuinely patched prologue now
+ * blocks the whole entry to the interpreter — correct, merely slower. */
 int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                          uint32_t count,
                                          uint32_t exec_pc) {
     if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
-    uint32_t at = exec_pc & 0x1FFFFFFFu;
+    (void)exec_pc;
     int any = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
@@ -494,12 +554,26 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             g_text_native_blocked++;
             return 0;
         }
-        if (phys + len <= at) continue;
-        if (phys < at) {
-            len -= at - phys;
-            phys = at;
-        }
         any = 1;
+        /* Page-clean fast path: every page this range touches is neither
+         * guard-modified nor runtime-dirty, so its bytes still equal the
+         * reference image — skip the memcmp. This keeps the emitted
+         * stale-static guards on inter-piece host transfers near-free on
+         * the (overwhelmingly common) pristine pages. */
+        {
+            uint32_t p0 = phys >> DIRTY_RAM_PAGE_SHIFT;
+            uint32_t p1 = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+            uint32_t p;
+            int clean = 1;
+            for (p = p0; p <= p1; p++) {
+                if ((text_modified_bitmap[p >> 5] & (1u << (p & 31u))) ||
+                    dirty_ram_is_dirty(p << DIRTY_RAM_PAGE_SHIFT)) {
+                    clean = 0;
+                    break;
+                }
+            }
+            if (clean) continue;
+        }
         if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
             uint32_t off = 0;
             const uint8_t *live = ram + phys;
@@ -633,9 +707,13 @@ int dirty_ram_is_dirty(uint32_t phys) {
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
     if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
     /* Experimental fallback for overlays copied into their final location by
-     * ordinary guest CPU stores rather than CD DMA. Dispatch above the static
-     * image floor is treated as dynamic and validated by the interpreter. */
-    if (phys >= g_overlay_region_floor) return 1;
+     * ordinary guest CPU stores rather than CD DMA. Dispatch OUTSIDE the static
+     * image (either side of it) is treated as dynamic and validated by the
+     * interpreter. Below-text RAM counts too: a high-loading boot EXE streams
+     * its gameplay code into the RAM beneath itself (Klonoa loads at 0x180000
+     * and runs overlays from 0x10000+), and gating on the floor alone left
+     * those pages unreachable by the interpreter. See dirty_ram_interp.h. */
+    if (phys_is_overlay_region(phys)) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
@@ -1573,7 +1651,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
     /* (pgxp) plain-store shadow invalidation retired: the PGXP engine
      * validates tracked words against the actual packet word on read, so an
-     * overwritten word can never be believed (ENHANCEMENTS.md G1). */
+     * overwritten word can never be believed (docs/ENHANCEMENTS.md G1). */
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
     /* KSEG2 guard — see psx_read_word_raw. */

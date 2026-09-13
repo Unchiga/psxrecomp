@@ -101,6 +101,33 @@ CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& conf
     { const char* e = std::getenv("PSX_CPS"); cps_enabled_ = (e == nullptr || e[0] != '0'); }
 }
 
+/* Inter-piece host transfers (fallthrough into a split piece / the next
+ * function, and the legacy non-CPS split-target transfers) hand execution to
+ * another compiled dispatch entry WITHOUT passing the dispatcher's
+ * stale-static validation. A game that overlays its own text at runtime
+ * (CMR2 streams transform-loop variants over its boot EXE) keeps executing
+ * the stale static translation of the target piece through such an edge.
+ * The guard revalidates the target entry's emitted ranges; on mismatch it
+ * publishes the PC and unwinds to the trampoline, whose dispatch takes the
+ * sanctioned dirty-RAM-interpreter fallback over the live bytes. */
+static std::string emit_stale_static_guard(uint32_t target, const std::string& indent) {
+    return fmt::format(
+        "{0}if (!psx_game_text_native_ok(0x{1:08X}u)) {{ cpu->pc = 0x{1:08X}u; return; }}  /* stale-static guard */\n",
+        indent, target);
+}
+
+/* Same guard when only the emitted function NAME is at hand (the
+ * fallthrough-to-next-function edges). Game functions are named func_%08X;
+ * anything else gets no guard (identical to the pre-guard emission). */
+static std::string emit_stale_static_guard_named(const std::string& name,
+                                                 const std::string& indent) {
+    if (name.rfind("func_", 0) != 0) return "";
+    char* end = nullptr;
+    unsigned long v = strtoul(name.c_str() + 5, &end, 16);
+    if (!end || *end != '\0' || v == 0) return "";
+    return emit_stale_static_guard((uint32_t)v, indent);
+}
+
 uint32_t CodeGenerator::partial_block_cycle_count(uint32_t addr,
                                                   const ControlFlowGraph& cfg) const {
     if (cfg.blocks.count(addr)) {
@@ -432,7 +459,7 @@ std::string CodeGenerator::translate_lwl(uint32_t instr) {
         return fmt::format("(void)psx_lwl(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwl(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_lwr(uint32_t instr) {
@@ -452,7 +479,7 @@ std::string CodeGenerator::translate_lwr(uint32_t instr) {
         return fmt::format("(void)psx_lwr(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
     return fmt::format("{} = psx_lwr(cpu, {}, {}, {}, 0x{:X}u);",
-                       reg_name(rt), addr, reg_name(rt), rt, mask);
+                       reg_name(rt), addr, lwlr_merge_operand(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_swl(uint32_t instr) {
@@ -768,6 +795,9 @@ std::string CodeGenerator::generate_branch_condition(uint32_t instr, uint32_t ad
             if (regimm_op == 0x00 && config_.ws_cull_nclip_keep_sites.count(addr))
                 return fmt::format("psx_ws_x_margin() > 0 ? 0 : ((int32_t){} < 0) /* ws nclip keep */",
                                    reg_name(rs));
+            if (regimm_op == 0x00 && config_.ws_cull_nclip_exact_sites.count(addr))
+                return fmt::format("psx_ws_x_margin() > 0 ? gte_nclip_precise_bltz((int32_t){}) : ((int32_t){} < 0) /* ws exact nclip */",
+                                   reg_name(rs), reg_name(rs));
             return keep_branch_if_wide(
                 fmt::format("(int32_t){} < 0", reg_name(rs)));
         } else {                            // bgez family (incl. bgezal + undefined mirrors)
@@ -853,10 +883,28 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                        site.expected, addr, instr);
             std::exit(1);
         }
-        const int32_t vanilla = (int32_t)((instr & 0xFFFFu) << 16);
-        return fmt::format("{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
-                           "  /* typed native-wide signed X bound */{}",
-                           reg_name(get_rt(instr)), (uint32_t)vanilla, comment);
+        const uint32_t bound_opcode = instr >> 26;
+        if (bound_opcode == 0x0Fu) { // LUI rt,imm: signed Q16 gameplay bound
+            const int32_t vanilla = (int32_t)((instr & 0xFFFFu) << 16);
+            return fmt::format("{} = (uint32_t)psx_ws_player_x_bound((int32_t)0x{:08X});"
+                               "  /* typed native-wide signed X bound */{}",
+                               reg_name(get_rt(instr)), (uint32_t)vanilla, comment);
+        }
+        if ((bound_opcode == 0x09u || bound_opcode == 0x0Du) &&
+            get_rs(instr) == 0u && get_rt(instr) != 0u) {
+            // ADDIU sign-extends, ORI zero-extends its screen-pixel constant.
+            const int32_t vanilla = bound_opcode == 0x09u
+                ? (int16_t)(instr & 0xFFFFu) : (int32_t)(instr & 0xFFFFu);
+            return fmt::format("{} = (uint32_t)psx_ws_screen_x_bound({});"
+                               "  /* typed native-wide signed screen-X bound */{}",
+                               reg_name(get_rt(instr)), vanilla, comment);
+        }
+        if (!config_.overlay_mode) {
+            fmt::print(stderr,
+                       "ERROR: signed_x_bound site 0x{:08X} is not LUI or ADDIU/ORI rt,zero,nonzero-imm (0x{:08X})\n",
+                       addr, instr);
+            std::exit(1);
+        }
     }
 
     // Full-word-guarded, camera-horizontal model-participation cones. The
@@ -1633,6 +1681,16 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     PSXRecomp::append_pgxp_hooks(instr, code);
+    /* The trailing disassembly comment must not land ON a preprocessor
+     * directive line -- it would be swallowed as extra tokens and dropped,
+     * costing the annotation and emitting -Wendif-labels noise. Reachable
+     * whenever the PGXP hook did NOT get appended after a block-cycles stall
+     * block, e.g. `mfhi $zero` / `mflo $zero` (append_pgxp_hooks returns early
+     * for rd==0, leaving the emission ending on a bare #endif). Same hazard
+     * class as PR #171. */
+    if (!comment.empty() &&
+        PSXRecomp::emission_ends_on_preprocessor_directive(code))
+        return config_.indent + code + "\n" + config_.indent + comment;
     return config_.indent + code + comment;
 }
 
@@ -1894,7 +1952,22 @@ std::string CodeGenerator::translate_basic_block(
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            // If this is the successor half of a deferred load pair AND it is an
+            // LWL/LWR merging into that same register, hardware forwards the
+            // pending load into the merge (see set_lwlr_merge_forward). Point
+            // the merge operand at the deferred temporary before translating.
+            const uint32_t succ_op = instr >> 26;
+            const bool succ_is_lwlr = (succ_op == 0x22u || succ_op == 0x26u);
+            const bool forward_to_lwlr =
+                delayed_load_active && addr == delayed_load_addr + 4u &&
+                succ_is_lwlr && get_rt(instr) == delayed_load_dest;
+            if (forward_to_lwlr) {
+                set_lwlr_merge_forward(
+                    delayed_load_dest,
+                    fmt::format("psx_ldd_{:08X}", delayed_load_addr));
+            }
             std::string emitted = translate_instruction(addr, instr);
+            if (forward_to_lwlr) clear_lwlr_merge_forward();
             int load_dest = simple_load_dest(instr);
             bool defer_load = false;
             if (!delayed_load_active && load_dest > 0 && addr + 4u <= block.end_addr &&
@@ -1909,8 +1982,23 @@ std::string CodeGenerator::translate_basic_block(
                 const size_t pos = emitted.find(lhs);
                 if (pos != std::string::npos) {
                     const std::string temp = fmt::format("psx_ldd_{:08X}", addr);
-                    emitted.replace(pos, lhs.size(), "uint32_t " + temp + " =");
+                    // Declare the temp in the pair block, not inline at the
+                    // load: with PGXP the load already sits in its own
+                    // `{ uint32_t _pgxa = ...; <load> PGXP_LOAD(...); }`
+                    // wrapper, so an inline declaration would go out of
+                    // scope before the writeback below.
+                    emitted.replace(pos, lhs.size(), temp + " =");
+                    // Point the PGXP hook at the temp: the writeback is
+                    // deferred, so the GPR still holds the pre-load value.
+                    const std::string pgxp_tail =
+                        fmt::format(", _pgxa, cpu->gpr[{}]);", load_dest);
+                    const size_t hook = emitted.rfind(pgxp_tail);
+                    if (hook != std::string::npos)
+                        emitted.replace(hook, pgxp_tail.size(),
+                                        fmt::format(", _pgxa, {});", temp));
                     ss << config_.indent << "{ /* MIPS-I load-delay pair */\n";
+                    ss << config_.indent
+                       << fmt::format("    uint32_t {} = 0;\n", temp);
                     delayed_load_addr = addr;
                     delayed_load_dest = static_cast<uint32_t>(load_dest);
                     delayed_load_active = true;
@@ -1918,7 +2006,11 @@ std::string CodeGenerator::translate_basic_block(
             }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
-                if (writes_gpr(instr, delayed_load_dest)) {
+                if (forward_to_lwlr) {
+                    ss << config_.indent << fmt::format(
+                        "/* psx_ldd_{:08X} forwarded into the LWL/LWR merge above */\n",
+                        delayed_load_addr);
+                } else if (writes_gpr(instr, delayed_load_dest)) {
                     ss << config_.indent << fmt::format(
                         "(void)psx_ldd_{:08X};  /* successor write wins */\n",
                         delayed_load_addr);
@@ -2107,6 +2199,7 @@ std::string CodeGenerator::translate_basic_block(
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS taken: split */\n", branch_target);
                         } else if (known_functions_.count(branch_target)) {
                             ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
+                            ss << emit_stale_static_guard(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* taken: split piece */\n", branch_target);
                         } else {
@@ -2125,6 +2218,7 @@ std::string CodeGenerator::translate_basic_block(
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS not taken: split */\n", fall_through_addr);
                         } else if (known_functions_.count(fall_through_addr)) {
                             ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
+                            ss << emit_stale_static_guard(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* not taken: split piece */\n", fall_through_addr);
                         } else {
@@ -2150,6 +2244,7 @@ std::string CodeGenerator::translate_basic_block(
                     } else if (block.exit_instr.target != 0 && known_functions_.count(block.exit_instr.target)) {
                         // Jump target is out-of-function and is a known function start
                         ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
+                        ss << emit_stale_static_guard(block.exit_instr.target, config_.indent);
                         ss << config_.indent
                            << fmt::format("func_{:08X}(cpu); return;  /* j to split piece */\n",
                                           block.exit_instr.target);
@@ -2321,8 +2416,13 @@ std::string CodeGenerator::translate_basic_block(
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << emit_interrupt_check(target, config_.indent);
                     if (known_functions_.count(target) > 0) {
-                        ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
-                        ss << config_.indent << fmt::format("if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n", addr + 8);
+                        ss << config_.indent << fmt::format(
+                            "if (psx_game_text_native_ok(0x{0:08X}u)) {{ func_{0:08X}(cpu);  /* jal */\n", target);
+                        ss << config_.indent << fmt::format(
+                            "if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return;\n", addr + 8);
+                        ss << config_.indent << fmt::format(
+                            "}} else {{ call_by_address(cpu, 0x{:08X}u);  /* jal: stale-static guard */\n", target);
+                        ss << config_.indent << "if (g_psx_call_bail) return; (void)_csp; } }\n";
                     } else {
                         ss << config_.indent << fmt::format("call_by_address(cpu, 0x{:08X}u);  /* external jal */\n", target);
                         /* psx_dispatch_call validated the (ra, sp) contract;
@@ -2336,6 +2436,7 @@ std::string CodeGenerator::translate_basic_block(
                         // Split-function: JAL continuation is outside this function piece.
                         // Tail-call to the continuation piece (at exit_addr + 8, past delay slot).
                         if (known_functions_.count(cont_addr)) {
+                            ss << emit_stale_static_guard(cont_addr, config_.indent);
                             ss << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* jal cont: split piece */\n", cont_addr);
                         } else {
@@ -2377,6 +2478,7 @@ std::string CodeGenerator::translate_basic_block(
                     } else {
                         // Split-function: JALR continuation is outside this function piece.
                         if (known_functions_.count(cont_addr)) {
+                            ss << emit_stale_static_guard(cont_addr, config_.indent);
                             ss << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* jalr cont: split piece */\n", cont_addr);
                         } else {
@@ -2402,8 +2504,19 @@ std::string CodeGenerator::translate_basic_block(
     } else if (block.exit_instr.type == ControlFlowType::None) {
         uint32_t next_addr = block.end_addr + 4;
         if (known_functions_.count(next_addr) > 0) {
+            ss << emit_stale_static_guard(next_addr, config_.indent);
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
+                              next_addr);
+        } else if (cps_enabled_) {
+            // Unit-edge fall-through with no known successor function (e.g. a
+            // partial overlay capture). Falling off the body would leave
+            // cpu->pc == 0 (the continuation-entry prologue cleared it), which
+            // the trampoline reads as a normal guest exit — a silent shutdown.
+            // Publish the PC so dispatch can route it instead.
+            ss << emit_interrupt_check(next_addr, config_.indent);
+            ss << config_.indent
+               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS fallthrough past unit edge */\n",
                               next_addr);
         } else {
             ss << emit_interrupt_check(next_addr, config_.indent);
@@ -2730,9 +2843,28 @@ GeneratedFunction CodeGenerator::generate_function(
             const BasicBlock& last = cfg.blocks.at(cfg.block_order.back());
             bool is_reachable = last.is_entry || !last.predecessors.empty();
             if (is_reachable) {
+                body_ss << emit_stale_static_guard_named(fallthrough_name, "    ");
                 body_ss << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
                                        fallthrough_name);
             }
+        }
+    } else if (!cfg.block_order.empty()) {
+        // No in-image fallthrough function exists (region/image boundary): a
+        // reachable final block that runs off the end must publish its
+        // continuation PC. Falling off the C body would return with the
+        // entry-switch's consumed cpu->pc == 0, which the top-level trampoline
+        // reads as "program ended".
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            last_block.exit_instr.type == ControlFlowType::None ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        bool is_reachable = last_block.is_entry || !last_block.predecessors.empty();
+        if (runs_off_end && is_reachable) {
+            body_ss << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                last_block.end_addr + 4u);
         }
     }
     body_ss << "    ;  /* label compatibility: C requires a statement after the last label */\n";
@@ -2960,8 +3092,26 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
               last_block.exit_instr.type == ControlFlowType::Jump) &&
              last_block.successors.empty());
         if (needs_fallthrough) {
+            body << emit_stale_static_guard_named(fallthrough_name, "    ");
             body << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
                                 fallthrough_name);
+        }
+    } else if (!cfg.block_order.empty() &&
+               live_blocks.count(cfg.block_order.back())) {
+        // Image-edge fallthrough (mirrors generate_function): no in-image next
+        // function exists, so a live final block that runs off the end must
+        // tail-transfer to its continuation PC instead of falling off the C
+        // body with cpu->pc still consumed to 0.
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool runs_off_end =
+            (last_block.exit_instr.type == ControlFlowType::None) ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        if (runs_off_end) {
+            body << fmt::format(
+                "    cpu->pc = 0x{:08X}u; return;  /* image-edge fallthrough: tail-transfer */\n",
+                last_block.end_addr + 4u);
         }
     }
     body << "    ;  /* label compatibility */\n";
@@ -3132,6 +3282,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void cosim_block(uint32_t block_leader_phys);\n";
     ss << "extern void cosim_instr(uint32_t pc);\n";
     ss << "#endif\n";
+    ss << "extern int  psx_game_text_native_ok(uint32_t addr);  /* stale-static guard (dispatch shard) */\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
@@ -3140,6 +3291,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void psx_ws_mmx6_bg_stage_init(void);    /* ws 2D stage reveal invalidation (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int32_t psx_ws_player_x_bound(int32_t vanilla);  /* typed gameplay X bound */\n";
+    ss << "extern int32_t psx_ws_screen_x_bound(int32_t vanilla);  /* typed screen-pixel X bound */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti(uint32_t sx, uint32_t imm);   /* ws cull signed right edge (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_slti_lower(uint32_t sx, uint32_t imm); /* ws cull signed lower edge (gpu.c) */\n";
@@ -3308,7 +3460,9 @@ std::string CodeGenerator::generate_file(
     if (config_.split_mid_function_targets) {
         std::set<uint32_t> cfgs_to_scan;  // Which CFGs to scan (empty = all)
         uint32_t exe_start = exe_.header.load_address;
-        uint32_t exe_end = exe_.end_address();
+        // Analysis bound: a split at a trailing delay-slot guard word would
+        // mint a function whose first instruction has no successor word.
+        uint32_t exe_end = exe_.analysis_end_address();
         int total_new = 0;
         // Safety cap only — the loop must run to convergence. Unconverged
         // targets emit `call_by_address(mid-func); return;` which misses the
@@ -3542,6 +3696,27 @@ std::string CodeGenerator::generate_ranges_manifest(
                 blk.exit_instr.address == blk.end_addr && hi <= UINT32_MAX - 4u) {
                 hi += 4u;
             }
+            /* A validity range may never claim a byte the shard never saw.
+             * The candidate CRC and the page-generation watch are computed
+             * over these ranges, so a range past the image end would validate
+             * the shard against bytes that were not part of its input — the
+             * cache would then "confirm" garbage.
+             *
+             * Two ways the +4 above can overrun, both real:
+             *   - a block leading at a trailing guard word (the defect this
+             *     manifest is a second-order victim of; fixed upstream by the
+             *     analysis bound, clamped here as well so the invariant does
+             *     not depend on that fix staying in place), and
+             *   - a branch-likely opcode (0x14-0x17, RESERVED on the R3000A)
+             *     as the image's very last word. translate_basic_block
+             *     short-circuits those into an inline RI raise BEFORE reading
+             *     any delay slot, so the mandatory-delay-slot throw never
+             *     fires and generation succeeds with hi == image_end + 4.
+             * Clamp to the READ bound, not the analysis bound: a guard word
+             * genuinely IS compiled into the shard when it serves as a delay
+             * slot, and must participate in the CRC. */
+            const uint32_t image_hi = exe_.end_address();
+            if (hi > image_hi) hi = image_hi;
             if (hi > lo) iv.emplace_back(lo, hi);
         }
         if (iv.empty()) continue;

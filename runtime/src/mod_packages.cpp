@@ -22,7 +22,7 @@ namespace PSXRecompV4 {
 namespace {
 
 constexpr uint32_t kMinFormatVersion = 1;
-constexpr uint32_t kMaxFormatVersion = 5;
+constexpr uint32_t kMaxFormatVersion = 6;
 constexpr uint64_t kMaxArchiveBytes = 256ull * 1024ull * 1024ull;
 constexpr uint32_t kMaxArchiveFiles = 4096;
 
@@ -680,6 +680,7 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
                                  const std::vector<ModResolution::Overlay>& overlays,
                                  const std::vector<ModResolution::DerivedDisc>& derived_discs,
                                  const std::vector<ModResolution::Plugin>& plugins,
+                                 const std::vector<ModResolution::Resource>& resources,
                                  const std::string& source_disc_sha256) {
     std::ostringstream out;
     out << "source_disc=" << source_disc_sha256 << '\n';
@@ -753,6 +754,10 @@ std::string canonical_resolution(const std::vector<const ModPackage*>& ordered,
         out << "plugin:" << plugin.id << ':' << plugin.package_id << ':'
             << plugin.feature_id << '\n';
     }
+    for (const ModResolution::Resource& resource : resources) {
+        out << "resource:" << resource.package_id << ':' << resource.feature_id
+            << ':' << resource.id << '=' << resource.path.string() << '\n';
+    }
     return out.str();
 }
 
@@ -770,6 +775,17 @@ const ModOption* find_option(const ModPackage& package,
             return item.feature_id == feature_id && item.id == id;
         });
     return option == package.options.end() ? nullptr : &*option;
+}
+
+const ModResource* find_resource(const ModPackage& package,
+                                 const std::string& feature_id,
+                                 const std::string& id) {
+    const auto resource = std::find_if(
+        package.resources.begin(), package.resources.end(),
+        [&](const ModResource& item) {
+            return item.feature_id == feature_id && item.id == id;
+        });
+    return resource == package.resources.end() ? nullptr : &*resource;
 }
 
 bool constraint_satisfied(
@@ -822,6 +838,20 @@ std::string effective_option_value(const ModPackage& package,
     }
     const ModOption* option = find_option(package, feature_id, id);
     return option ? option->default_value : std::string();
+}
+
+fs::path effective_resource_path(const ModPackage& package,
+                                 const ModSelection& selection,
+                                 const std::string& feature_id,
+                                 const std::string& id) {
+    const ModFeature* feature = find_feature(package, feature_id);
+    if (!feature || feature->legacy) return {};
+    const ModFeatureSelection* selected =
+        find_feature_selection(package, selection, feature_id);
+    if (!selected) return {};
+    const auto resource = selected->resources.find(id);
+    return resource == selected->resources.end() ? fs::path{} :
+                                                   fs::path(resource->second);
 }
 
 bool prospective_feature_enabled(
@@ -1048,8 +1078,11 @@ void read_conditions(const toml::value& value, const std::vector<ModOption>& opt
             when[id] = condition_value;
         }
     }
-    for (const auto& [id, condition_value] : when) {
-        (void)condition_value;
+    /* Bind map entries to real locals before the lambda — capturing a
+     * structured binding is a C++20 extension and breaks MinGW C++17 builds. */
+    for (const auto& entry : when) {
+        const std::string& id = entry.first;
+        const std::string& condition_value = entry.second;
         const auto option = std::find_if(
             options.begin(), options.end(),
             [&](const ModOption& item) {
@@ -1438,6 +1471,65 @@ void mod_clear_plugins_for_tests() {
     registered_plugins().clear();
 }
 
+const char* mod_channel_name(ModChannel channel) {
+    switch (channel) {
+        case ModChannel::Experimental: return "experimental";
+        case ModChannel::Developer:    return "developer";
+        case ModChannel::Stable:       break;
+    }
+    return "stable";
+}
+
+bool mod_channel_from_name(const std::string& name, ModChannel& out) {
+    if (name == "stable")       { out = ModChannel::Stable;       return true; }
+    if (name == "experimental") { out = ModChannel::Experimental; return true; }
+    if (name == "developer")    { out = ModChannel::Developer;    return true; }
+    return false;
+}
+
+namespace {
+
+/* Remove every developer-channel feature and everything that only existed to
+ * serve one. "Developer does not ship" means absent, not hidden: a release
+ * build must not carry the operations either, or a stale state.toml naming a
+ * dropped feature could still reach them.
+ *
+ * Returns false when nothing is left, so the caller can drop the package
+ * rather than list one with no features. */
+bool strip_developer_features(ModPackage& package) {
+    std::set<std::string> dropped;
+    for (const ModFeature& feature : package.features)
+        if (feature.channel == ModChannel::Developer)
+            dropped.insert(feature.id);
+    if (dropped.empty()) return !package.features.empty();
+
+    const auto orphaned = [&dropped](const std::string& feature_id) {
+        return dropped.count(feature_id) != 0;
+    };
+    const auto prune = [&orphaned](auto& entries) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                     [&orphaned](const auto& entry) {
+                                         return orphaned(entry.feature_id);
+                                     }),
+                      entries.end());
+    };
+    package.features.erase(
+        std::remove_if(package.features.begin(), package.features.end(),
+                       [&orphaned](const ModFeature& feature) {
+                           return orphaned(feature.id);
+                       }),
+        package.features.end());
+    prune(package.options);
+    prune(package.constraints);
+    prune(package.patches);
+    prune(package.overlays);
+    prune(package.plugins);
+    prune(package.resources);
+    return !package.features.empty();
+}
+
+} // namespace
+
 ModPackageManager::ModPackageManager(fs::path mods_root) : root_(std::move(mods_root)) {}
 
 void ModPackageManager::set_root(fs::path mods_root) {
@@ -1484,6 +1576,16 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
             cfg.contains("resolver") ? toml::find<std::string>(cfg, "resolver") : "declarative";
         out.save_compatibility = cfg.contains("save_compatibility")
             ? toml::find<std::string>(cfg, "save_compatibility") : "shared";
+        /* Accepted at every format version: v5 manifests already carried a
+         * package-level channel, enforced then only by a packaging grep over
+         * the manifest text. Now it parses, and it seeds the per-feature
+         * default rather than quarantining the whole package. */
+        if (cfg.contains("channel")) {
+            const std::string name = toml::find<std::string>(cfg, "channel");
+            if (!mod_channel_from_name(name, out.channel))
+                throw std::runtime_error(
+                    "channel must be stable, experimental or developer");
+        }
         out.root = path.parent_path();
         if (out.format_version < kMinFormatVersion ||
             out.format_version > kMaxFormatVersion)
@@ -1539,6 +1641,17 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                     ? toml::find<std::string>(v, "group") : "General";
                 feature.default_enabled =
                     toml::find_or<bool>(v, "default_enabled", false);
+                feature.hidden = toml::find_or<bool>(v, "hidden", false);
+                feature.channel = out.channel;
+                if (v.contains("channel")) {
+                    if (out.format_version < 6)
+                        throw std::runtime_error(
+                            "per-feature channel requires format_version 6");
+                    const std::string name = toml::find<std::string>(v, "channel");
+                    if (!mod_channel_from_name(name, feature.channel))
+                        throw std::runtime_error(
+                            "channel must be stable, experimental or developer");
+                }
                 if (!valid_id(feature.id) ||
                     !feature_ids.insert(feature.id).second)
                     throw std::runtime_error("invalid or duplicate feature id");
@@ -1554,6 +1667,7 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
             feature.name = out.name;
             feature.author = out.author;
             feature.description = out.description;
+            feature.channel = out.channel;
             feature.legacy = true;
             out.features.push_back(std::move(feature));
         }
@@ -1631,6 +1745,46 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
                     throw std::runtime_error(
                         "option disabled_by must name a boolean option "
                         "in the same feature");
+            }
+        }
+        if (cfg.contains("resource")) {
+            if (out.format_version < 5)
+                throw std::runtime_error(
+                    "resources require format_version 5");
+            std::set<std::pair<std::string, std::string>> resource_ids;
+            for (const toml::value& v :
+                 toml::find(cfg, "resource").as_array()) {
+                ModResource resource;
+                resource.feature_id = feature_style
+                    ? toml::find<std::string>(v, "feature") : "legacy";
+                resource.id = toml::find<std::string>(v, "id");
+                resource.label = toml::find<std::string>(v, "label");
+                resource.description =
+                    toml::find_or<std::string>(v, "description", "");
+                resource.file_patterns =
+                    toml::find_or<std::string>(v, "file_patterns", "");
+                resource.file_description =
+                    toml::find_or<std::string>(v, "file_description", "");
+                resource.format =
+                    toml::find_or<std::string>(v, "format", "file");
+                resource.required =
+                    toml::find_or<bool>(v, "required", false);
+                if (!find_feature(out, resource.feature_id))
+                    throw std::runtime_error(
+                        "resource references unknown feature");
+                if (!valid_id(resource.id) ||
+                    !resource_ids.insert(
+                        {resource.feature_id, resource.id}).second)
+                    throw std::runtime_error(
+                        "invalid or duplicate resource id");
+                if (resource.label.empty())
+                    throw std::runtime_error("resource label is empty");
+                if (resource.format != "file" &&
+                    resource.format != "directory" &&
+                    resource.format != "folder")
+                    throw std::runtime_error(
+                        "resource format must be file or directory");
+                out.resources.push_back(std::move(resource));
             }
         }
         if (cfg.contains("constraint")) {
@@ -2231,10 +2385,68 @@ bool ModPackageManager::read_manifest(const fs::path& path, ModPackage& out,
     }
 }
 
-bool ModPackageManager::scan(std::string* error) {
-    packages_.clear();
+void ModPackageManager::migrate_legacy_root() {
     std::error_code ec;
-    const fs::path packages_root = root_ / "packages";
+    const fs::path legacy = root_ / "packages";
+    if (!fs::exists(legacy, ec)) return;
+    const fs::path installed = installed_root();
+    const fs::path bundled = bundled_root();
+    size_t stranded = 0;
+    for (const fs::directory_entry& id_dir : fs::directory_iterator(legacy, ec)) {
+        if (ec) break;
+        if (!id_dir.is_directory()) continue;
+        const std::string id = id_dir.path().filename().string();
+        for (const fs::directory_entry& version_dir :
+             fs::directory_iterator(id_dir.path(), ec)) {
+            if (ec) break;
+            if (!version_dir.is_directory()) continue;
+            const std::string version = version_dir.path().filename().string();
+            std::error_code move_ec;
+            /* Already staged by the build: this copy is redundant output, not
+             * anything the player owns. */
+            if (fs::exists(bundled / id / version, move_ec)) {
+                fs::remove_all(version_dir.path(), move_ec);
+                continue;
+            }
+            const fs::path destination = installed / id / version;
+            if (fs::exists(destination, move_ec)) {
+                fs::remove_all(version_dir.path(), move_ec);
+                continue;
+            }
+            fs::create_directories(destination.parent_path(), move_ec);
+            if (move_ec) { ++stranded; continue; }
+            fs::rename(version_dir.path(), destination, move_ec);
+            if (move_ec) {
+                /* Cross-device or a locked file: copy rather than lose it. */
+                move_ec.clear();
+                fs::copy(version_dir.path(), destination,
+                         fs::copy_options::recursive, move_ec);
+                if (move_ec) {
+                    ++stranded;
+                    continue;
+                }
+                fs::remove_all(version_dir.path(), move_ec);
+            }
+        }
+    }
+    /* Drop the legacy tree only when every version directory was dealt with.
+     * A blanket remove_all here would be the very data loss this migration
+     * exists to end, so anything that could not be moved stays exactly where
+     * it is and is reported instead. */
+    if (stranded != 0 || ec) {
+        scan_errors_.push_back(
+            legacy.string() + ": could not migrate " +
+            std::to_string(stranded) + " package version(s) to " +
+            installed.string() + "; the old catalog was left in place");
+        return;
+    }
+    ec.clear();
+    fs::remove_all(legacy, ec);
+}
+
+bool ModPackageManager::scan_root(const fs::path& packages_root,
+                                  ModPackageOrigin origin, std::string* error) {
+    std::error_code ec;
     if (!fs::exists(packages_root, ec)) return true;
     for (const fs::directory_entry& id_dir : fs::directory_iterator(packages_root, ec)) {
         if (ec) break;
@@ -2247,13 +2459,34 @@ bool ModPackageManager::scan(std::string* error) {
             ModPackage package;
             std::string parse_error;
             if (!read_manifest(manifest, package, &parse_error)) {
+                /* A package that cannot be parsed must say so. Silently
+                 * skipping it leaves a mod author with a mod that simply does
+                 * not exist and nothing anywhere explaining why. */
+                scan_errors_.push_back(manifest.string() + ": " + parse_error);
                 continue;
             }
             if (package.id != id_dir.path().filename().string() ||
                 package.version != version_dir.path().filename().string()) {
-                set_error(error, "package path does not match manifest id/version: " +
-                                 manifest.string());
-                return false;
+                scan_errors_.push_back(
+                    manifest.string() +
+                    ": package path does not match manifest id/version");
+                continue;
+            }
+            if (!developer_channel_ && !strip_developer_features(package)) {
+                /* Every feature was developer-channel, so on this build the
+                 * package has nothing to offer. Not an error: it is the
+                 * intended outcome of shipping without them. */
+                continue;
+            }
+            package.origin = origin;
+            if (origin == ModPackageOrigin::Installed) {
+                const auto existing = packages_.find(package.id);
+                package.shadows_bundled =
+                    existing != packages_.end() &&
+                    std::any_of(existing->second.begin(), existing->second.end(),
+                                [](const std::pair<const std::string, ModPackage>& e) {
+                                    return e.second.origin == ModPackageOrigin::Bundled;
+                                });
             }
             packages_[package.id][package.version] = std::move(package);
         }
@@ -2262,6 +2495,18 @@ bool ModPackageManager::scan(std::string* error) {
         set_error(error, "cannot scan packages: " + ec.message());
         return false;
     }
+    return true;
+}
+
+bool ModPackageManager::scan(std::string* error) {
+    packages_.clear();
+    scan_errors_.clear();
+    migrate_legacy_root();
+    /* Bundled first, then installed: an installed package of the same id and
+     * version deliberately shadows the build-staged one, and records that it
+     * did so, rather than the two racing on directory-iteration order. */
+    if (!scan_root(bundled_root(), ModPackageOrigin::Bundled, error)) return false;
+    if (!scan_root(installed_root(), ModPackageOrigin::Installed, error)) return false;
     return true;
 }
 
@@ -2323,6 +2568,18 @@ bool ModPackageManager::load_state(std::string* error) {
                         else
                             throw std::runtime_error(
                                 "state feature option values must be scalar");
+                    }
+                }
+                if (v.contains("resources")) {
+                    for (const auto& [key, value] :
+                         toml::find(v, "resources").as_table()) {
+                        if (!valid_id(key))
+                            throw std::runtime_error(
+                                "invalid state feature resource id");
+                        if (!value.is_string())
+                            throw std::runtime_error(
+                                "state feature resource paths must be strings");
+                        feature.resources[key] = toml::get<std::string>(value);
                     }
                 }
                 selections_[package_id].features[feature_id] =
@@ -2388,6 +2645,11 @@ bool ModPackageManager::save_state(std::string* error) const {
                 for (const auto& [key, value] : feature.values)
                     out << key << " = " << quote_toml(value) << "\n";
             }
+            if (!feature.resources.empty()) {
+                out << "[feature.resources]\n";
+                for (const auto& [key, value] : feature.resources)
+                    out << key << " = " << quote_toml(value) << "\n";
+            }
         }
     }
     out.close();
@@ -2445,7 +2707,16 @@ bool ModPackageManager::install_archive(const fs::path& archive,
         fs::remove_all(staging, ec);
         return false;
     }
-    const fs::path destination = root_ / "packages" / package.id / package.version;
+    if (!developer_channel_ && !strip_developer_features(package)) {
+        fs::remove_all(staging, ec);
+        set_error(error,
+                  "this package contains only developer-channel features, "
+                  "which are not available in this build");
+        return false;
+    }
+    /* Player installs land in the launcher-owned root. They must never share
+     * a tree with the build-staged catalog, which every build wipes. */
+    const fs::path destination = installed_root() / package.id / package.version;
     if (fs::exists(destination)) {
         fs::remove_all(staging, ec);
         set_error(error, "package version is already installed");
@@ -2464,6 +2735,7 @@ bool ModPackageManager::install_archive(const fs::path& archive,
         return false;
     }
     package.root = destination;
+    package.origin = ModPackageOrigin::Installed;
     packages_[package.id][package.version] = package;
     if (installed_id) *installed_id = package.id;
     if (installed_version) *installed_version = package.version;
@@ -2502,6 +2774,12 @@ bool ModPackageManager::remove_version(const std::string& id, const std::string&
     const auto pit = packages_.find(id);
     if (pit == packages_.end() || pit->second.find(version) == pit->second.end()) {
         set_error(error, "package version is not installed");
+        return false;
+    }
+    if (pit->second.at(version).origin == ModPackageOrigin::Bundled) {
+        /* Deleting build output would succeed and then be undone by the next
+         * build, which is not a model any player can reason about. */
+        set_error(error, "cannot remove a bundled package; it ships with the game");
         return false;
     }
     const fs::path path = pit->second.at(version).root;
@@ -2648,6 +2926,43 @@ bool ModPackageManager::set_feature_option(const std::string& package_id,
     return true;
 }
 
+bool ModPackageManager::set_feature_resource_path(
+    const std::string& package_id,
+    const std::string& feature_id,
+    const std::string& resource_id,
+    const fs::path& path,
+    std::string* error) {
+    const ModPackage* package = selected_package(package_id);
+    const ModFeature* feature =
+        package ? find_feature(*package, feature_id) : nullptr;
+    const ModResource* resource =
+        package ? find_resource(*package, feature_id, resource_id) : nullptr;
+    if (!feature || feature->legacy || !resource) {
+        set_error(error, "unknown feature resource");
+        return false;
+    }
+    if (path.empty()) {
+        set_error(error, "resource path is empty");
+        return false;
+    }
+    std::error_code ec;
+    const bool valid = resource->format == "directory" ||
+                       resource->format == "folder"
+        ? fs::is_directory(path, ec)
+        : fs::is_regular_file(path, ec);
+    if (!valid) {
+        set_error(error,
+            resource->format == "directory" || resource->format == "folder"
+                ? "selected resource path is not a directory"
+                : "selected resource path is not a file");
+        return false;
+    }
+    selections_[package_id]
+        .features[feature_id]
+        .resources[resource_id] = path.string();
+    return true;
+}
+
 const ModPackage* ModPackageManager::selected_package(const std::string& id) const {
     const auto selection = selections_.find(id);
     const ModSelection blank;
@@ -2683,6 +2998,19 @@ std::string ModPackageManager::feature_option_value(
     return effective_option_value(
         *package, found == selections_.end() ? blank : found->second,
         feature_id, option_id);
+}
+
+fs::path ModPackageManager::feature_resource_path(
+    const std::string& package_id,
+    const std::string& feature_id,
+    const std::string& resource_id) const {
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return {};
+    const auto found = selections_.find(package_id);
+    const ModSelection blank;
+    return effective_resource_path(
+        *package, found == selections_.end() ? blank : found->second,
+        feature_id, resource_id);
 }
 
 ModResolution ModPackageManager::resolve(const std::string& game_id,
@@ -3101,6 +3429,30 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
             resolved.feature_id = plugin->feature_id;
             result.plugins.push_back(std::move(resolved));
         }
+        for (const ModResource& resource : package->resources) {
+            const ModFeature* feature =
+                find_feature(*package, resource.feature_id);
+            if (!feature ||
+                !is_feature_enabled(*package, selected, *feature))
+                continue;
+            const fs::path path = effective_resource_path(
+                *package, selected, resource.feature_id, resource.id);
+            if (path.empty()) {
+                if (resource.required) {
+                    result.errors.push_back(
+                        package->id + "/" + resource.feature_id +
+                        ": required resource not selected: " +
+                        resource.id);
+                }
+                continue;
+            }
+            ModResolution::Resource resolved;
+            resolved.package_id = package->id;
+            resolved.feature_id = resource.feature_id;
+            resolved.id = resource.id;
+            resolved.path = path;
+            result.resources.push_back(std::move(resolved));
+        }
     }
     if (result.derived_discs.size() > 1) {
         std::string providers;
@@ -3286,12 +3638,13 @@ ModResolution ModPackageManager::resolve(const std::string& game_id,
         result.overlays.clear();
         result.derived_discs.clear();
         result.plugins.clear();
+        result.resources.clear();
         return result;
     }
     result.fingerprint = fingerprint_text(
         canonical_resolution(
             result.ordered, selections_, result.writes, result.overlays,
-            result.derived_discs, result.plugins,
+            result.derived_discs, result.plugins, result.resources,
             disc_sha256));
     result.ok = true;
     return result;

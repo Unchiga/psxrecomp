@@ -890,8 +890,16 @@ static int16_t voice_next_sample(int idx) {
         v->active = 0;
     }
 
+    /* Pitch 0 means the sample counter does not advance: the voice holds its
+     * current sample. It does NOT mean "play at 1.0x" — coercing it to 0x1000
+     * makes a parked voice stream forward through SPU RAM at full rate,
+     * decoding whatever follows as ADPCM. Alien Resurrection (SLUS-00633)
+     * parks its two ambience voices that way when the pause menu opens: pitch
+     * 0, envelope frozen mid-sustain, no key-off. Coerced, they ran ~0x790
+     * bytes past their own repeat address and turned the menu into a
+     * continuous mid-band buzz. DuckStation and Beetle both just add the
+     * pitch to the counter, so zero holds. */
     uint32_t pitch = voice_reg(idx, 2) & 0x3FFFu;
-    if (pitch == 0) pitch = 0x1000u;
     v->phase += pitch;
     while (v->phase >= 0x1000u) {
         v->phase -= 0x1000u;
@@ -907,8 +915,11 @@ static void key_on(uint32_t mask) {
         SpuVoice *v = &voices[i];
         memset(v, 0, sizeof(*v));
         v->active = 1;
-        v->cur_addr = ((uint32_t)voice_reg(i, 3) << 3) & (SPU_RAM_SIZE - 1u);
-        v->repeat_addr = ((uint32_t)voice_reg(i, 7) << 3) & (SPU_RAM_SIZE - 1u);
+        /* Address registers count 8-byte units but hardware ignores bit0
+         * — block fetches are 16-byte aligned (DuckStation Voice::KeyOn
+         * `adpcm_start_address & ~1u`; Beetle aligns identically). */
+        v->cur_addr = ((uint32_t)(voice_reg(i, 3) & ~1u) << 3) & (SPU_RAM_SIZE - 1u);
+        v->repeat_addr = ((uint32_t)(voice_reg(i, 7) & ~1u) << 3) & (SPU_RAM_SIZE - 1u);
         v->sample_idx = SPU_BLOCK_SAMPLES;
         /* Reset ADSR — KEYON starts envelope at 0 in Attack phase
          * (matches Beetle's PS_SPU::ResetEnvelope). */
@@ -1438,8 +1449,9 @@ void spu_write(uint32_t addr, uint32_t value) {
              * re-looping ~1400x/s, +11 dB over the oracle, clipping). */
             if (idx < (uint32_t)SPU_VOICE_COUNT * 8u && (idx & 7u) == 7u) {
                 int v = (int)(idx >> 3);
+                /* bit0 ignored (16-byte alignment) — same masking as KEYON. */
                 voices[v].repeat_addr =
-                    ((uint32_t)(uint16_t)value << 3) & (SPU_RAM_SIZE - 1u);
+                    ((uint32_t)((uint16_t)value & ~1u) << 3) & (SPU_RAM_SIZE - 1u);
             }
 
             /* Volume registers feed the sweep envelopes: a direct write
@@ -1587,6 +1599,10 @@ uint32_t spu_ram_peek(uint32_t addr, uint8_t *out, uint32_t len) {
     if (len > SPU_RAM_SIZE - addr) len = SPU_RAM_SIZE - addr;
     memcpy(out, spu_ram + addr, len);
     return len;
+}
+
+uint16_t spu_ctrl_read(void) {
+    return spu_regs[reg_index(0x1F801DAAu)];
 }
 
 void spu_get_global_state(SpuGlobalState* out) {

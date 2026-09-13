@@ -99,6 +99,34 @@ void dirty_ram_irq_ambient_resync_after_restore(void);
 extern uint32_t g_overlay_region_floor;
 #define OVERLAY_REGION_FLOOR (g_overlay_region_floor)
 
+/* The text-image BASE (phys) = this game's main-EXE load address. The floor
+ * above only bounds the text from ABOVE; on its own it encodes the assumption
+ * that the boot EXE sits at the bottom of usable RAM, so that [KERNEL_END,
+ * FLOOR) is text and [FLOOR, RAM) is overlay. That holds for a load_address of
+ * 0x80010000 (text base == KERNEL_END, so the region below text is empty) but
+ * is FALSE for a boot EXE that loads HIGH and streams its gameplay code into
+ * the RAM BELOW itself: Klonoa loads at 0x80180000 (text 0x180000-0x18B000,
+ * overlays at 0x10000-0x130000), Street Fighter Alpha 3 at 0x80113B00,
+ * Bomberman Fantasy Race at 0x8003004C. For those the sub-text RAM was
+ * misclassified as main-EXE text — clear_image_baseline() wiped its dirty bits
+ * and the dispatch admit-heuristic refused it, so a JALR into an overlay page
+ * the CD DMA'd there fell through to psx_unknown_dispatch and fail-fast
+ * exit(1) (Klonoa, frame 687, target 0x80123D00).
+ *
+ * The overlay region is therefore BOTH sides of the text image, not just above
+ * it. main.cpp pins g_text_image_lo = load_address & 0x1FFFFFFF at game load;
+ * the default equals DIRTY_RAM_KERNEL_WINDOW_END so the below-text clause is
+ * empty for BIOS-only runs and for every bottom-loading game. */
+extern uint32_t g_text_image_lo;
+
+/* 1 iff phys is runtime-loaded overlay RAM rather than main-EXE text — either
+ * side of the text image. Identical to `phys >= FLOOR` whenever the game loads
+ * at the bottom of RAM (g_text_image_lo == KERNEL_WINDOW_END). */
+static inline int phys_is_overlay_region(uint32_t phys) {
+    return phys >= g_overlay_region_floor ||
+           (phys >= DIRTY_RAM_KERNEL_WINDOW_END && phys < g_text_image_lo);
+}
+
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
@@ -111,8 +139,13 @@ int      dirty_ram_is_dirty(uint32_t phys);
  * on writes into the body. Runtime-patched bodies (pad/SIO install stubs)
  * never verify and keep interpreting — faithful either way. */
 int      psx_kernel_bless_dispatchable(uint32_t phys);
+/* True when a declared kernel patch range ENDS at this RAM address. The
+ * emitter registered that PC as a continuation key, so the interpreter hands
+ * straight-line flow back to static dispatch there and only the guest's
+ * patched words interpret (memory.c psx_bios_kernel_patch_ranges). */
+int      psx_kernel_patch_range_ends_at(uint32_t phys);
 void     psx_kernel_bless_note_range(uint32_t phys, uint32_t len);
-void     psx_kernel_bless_stats(uint64_t out[6]);
+void     psx_kernel_bless_stats(uint64_t out[8]);
 void     psx_kernel_bless_resync_after_restore(void);
 /* Soft-return rematch / BIOS switch: drop latched SCPH↔OpenBIOS window +
  * CLEAN/MISMATCH so the next kbless_on() re-reads psx_bios_image. */
@@ -196,6 +229,30 @@ typedef struct {
                           * below the local-flow floor every taken branch
                           * re-dispatches, so chain blocks dominate. entry_hits
                           * is the evidence stream for interior-alias seeds. */
+    /* Enrichment (2026-09-05, BoF3): make a bare interpreted PC explainable
+     * from a session-long per_pc snapshot alone, with no offline join and no
+     * live-ring window. Stamped only on EXTERNAL entries (arrived from native
+     * dispatch, addr != chain target), which is where the value is. */
+    uint32_t occ_crc;    /* tier 1: psx_overlay_resident_crc_at(pc) at the last
+                          * external entry -- the manifest CRC of the static
+                          * variant whose code ranges span this PC (DLL path:
+                          * last hash taken). Disambiguates a mixed band
+                          * (0x801D0C00 carries BATTLE/ETC/SCENARIO/WORLD
+                          * occupants) to the one actually loaded, which the
+                          * offline enrich_pcs join cannot. 0 = nothing compiled
+                          * spans this PC (BIOS / kernel / boot EXE). */
+    uint8_t  occ_ok;     /* 1 = that variant validated at the time (interior
+                          * gap inside live native code: an Axis B seed);
+                          * 0 = it is resident but CRC-missing (data inside the
+                          * code range rewritten, or a different section than
+                          * the one compiled) -- the whole band runs
+                          * interpreted and no seed will fix it. */
+    uint32_t last_ext_ra;/* tier 2: gpr[31] (caller RA) at the most recent
+                          * external entry — names the call site that reaches a
+                          * function-pointer-table interior. This is the §9 (LOGO
+                          * effect-handler tables) diagnosis made durable and
+                          * session-long instead of ring-bounded; the full
+                          * call/jalr/jr transfer split stays in the fp-log ring. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 /* Every aligned main-RAM word is a possible instruction PC.  Execution

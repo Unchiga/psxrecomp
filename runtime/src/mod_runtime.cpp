@@ -4,6 +4,7 @@
 #include "iso_reader.h"
 #include "mod_packages.h"
 #include "mod_plugins.h"
+#include "gpu.h"
 #include "psx_sha256.h"
 
 #if defined(RECOMP_LAUNCHER)
@@ -68,6 +69,7 @@ struct RuntimeMods {
     bool main_applied = false;
     bool disc_enabled = false;
     bool disc_guard_failed = false;
+    const ModResolution::Plugin* current_plugin = nullptr;
 };
 
 RuntimeMods& state() {
@@ -624,7 +626,10 @@ int provider_package_get(void*, int index, RecompLauncherCModPackage* out) {
     copy_text(out->source_url, sizeof(out->source_url), package->source_url);
     out->enabled = package_has_enabled_feature(*package);
     out->option_count = (int)package->options.size();
-    out->removable = !out->enabled;
+    /* A bundled package is build output. Offering to remove it would succeed
+     * and then be silently undone by the next build. */
+    out->removable = !out->enabled &&
+                     package->origin == ModPackageOrigin::Installed;
     return 1;
 }
 
@@ -739,6 +744,20 @@ int provider_feature_get(void*, int index, RecompLauncherCModFeature* out) {
     copy_text(out->source_name, sizeof(out->source_name), package->source_name);
     copy_text(out->source_url, sizeof(out->source_url), package->source_url);
     copy_text(out->group, sizeof(out->group), feature->group);
+    out->hidden = feature->hidden ? 1 : 0;
+    switch (feature->channel) {
+        case ModChannel::Experimental:
+            out->channel = RECOMP_MOD_CHANNEL_EXPERIMENTAL;
+            break;
+        case ModChannel::Developer:
+            /* Only reachable on a local developer build: a shipped catalog
+             * carries no developer-channel feature to report. */
+            out->channel = RECOMP_MOD_CHANNEL_DEVELOPER;
+            break;
+        case ModChannel::Stable:
+            out->channel = RECOMP_MOD_CHANNEL_STABLE;
+            break;
+    }
     out->enabled =
         state().manager.feature_enabled(package->id, feature->id) ? 1 : 0;
     out->option_count =
@@ -837,6 +856,69 @@ int provider_feature_set_option(void*, const char* package_id,
     });
 }
 
+int provider_feature_resource_count(void*, const char* package_id,
+                                    const char* feature_id) {
+    if (!package_id || !feature_id) return 0;
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return 0;
+    return (int)std::count_if(
+        package->resources.begin(), package->resources.end(),
+        [&](const ModResource& resource) {
+            return resource.feature_id == feature_id;
+        });
+}
+
+int provider_feature_resource_get(void*, const char* package_id,
+                                  const char* feature_id, int index,
+                                  RecompLauncherCModResource* out) {
+    if (!package_id || !feature_id || !out || index < 0) return 0;
+    const ModPackage* package = selected_package(package_id);
+    if (!package) return 0;
+    for (const ModResource& resource : package->resources) {
+        if (resource.feature_id != feature_id) continue;
+        if (index-- != 0) continue;
+        const std::filesystem::path path =
+            state().manager.feature_resource_path(
+                package_id, feature_id, resource.id);
+        std::error_code ec;
+        const bool directory =
+            resource.format == "directory" || resource.format == "folder";
+        const bool verified = !path.empty() &&
+            (directory ? std::filesystem::is_directory(path, ec)
+                       : std::filesystem::is_regular_file(path, ec));
+        std::memset(out, 0, sizeof(*out));
+        copy_text(out->id, sizeof(out->id), resource.id);
+        copy_text(out->label, sizeof(out->label), resource.label);
+        copy_text(out->description, sizeof(out->description),
+                  resource.description);
+        copy_text(out->path, sizeof(out->path), path.string());
+        copy_text(out->status, sizeof(out->status),
+                  path.empty() ? "Not selected" :
+                      (verified ? "Selected" : "Selected path is missing"));
+        copy_text(out->file_patterns, sizeof(out->file_patterns),
+                  resource.file_patterns);
+        copy_text(out->file_description, sizeof(out->file_description),
+                  resource.file_description);
+        out->required = resource.required ? 1 : 0;
+        out->verified = verified ? 1 : 0;
+        copy_text(out->format, sizeof(out->format), resource.format);
+        return 1;
+    }
+    return 0;
+}
+
+int provider_feature_resource_set_path(void*, const char* package_id,
+                                       const char* feature_id,
+                                       const char* resource_id,
+                                       const char* path) {
+    if (!package_id || !feature_id || !resource_id || !path) return 0;
+    return mutate([&](std::string& error) {
+        return state().manager.set_feature_resource_path(
+            package_id, feature_id, resource_id,
+            std::filesystem::path(path), &error);
+    });
+}
+
 int provider_diagnostic_count(void*, const char* package_id,
                               const char* feature_id) {
     if (!package_id || !feature_id) return 0;
@@ -891,8 +973,9 @@ int provider_version_get(void*, const char* package_id, int index,
     copy_text(out->version, sizeof(out->version), version->first);
     const ModPackage* selected = selected_package(package_id);
     out->selected = selected && selected->version == version->first;
-    out->removable = !out->selected ||
-                     !selected || !package_has_enabled_feature(*selected);
+    out->removable = (!out->selected || !selected ||
+                      !package_has_enabled_feature(*selected)) &&
+                     version->second.origin == ModPackageOrigin::Installed;
     return 1;
 }
 
@@ -1002,6 +1085,9 @@ RecompLauncherCModProvider provider = {
     nullptr, /* archive_extension — PSX defaults */
     nullptr, /* archive_description */
     provider_commit_netplay,
+    provider_feature_resource_count,
+    provider_feature_resource_get,
+    provider_feature_resource_set_path,
 };
 #endif
 
@@ -1038,6 +1124,11 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         if (error) *error = s.error;
         return false;
     }
+    /* A manifest that fails to parse used to be skipped in silence, so a mod
+     * author's typo produced a mod that simply did not exist. Name every one. */
+    for (const std::string& scan_error : s.manager.scan_errors())
+        std::fprintf(stderr, "psxrecomp: mod manifest ignored: %s\n",
+                     scan_error.c_str());
     if (!sha256_file(exe_path, s.exe_sha256, &s.error)) {
         /* Release installs commonly do not carry a loose PS-X EXE; game-id and
          * expected-byte guards remain available in that case. */
@@ -1207,16 +1298,22 @@ extern "C" void mod_runtime_activate_plugins(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
-    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        s.current_plugin = &plugin;
         mod_invoke_activation_plugin(plugin.id);
+        s.current_plugin = nullptr;
+    }
 }
 
 extern "C" void mod_runtime_on_vblank(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();
     if (!s.initialized || !s.plan.ok) return;
-    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        s.current_plugin = &plugin;
         mod_invoke_vblank_plugin(plugin.id);
+        s.current_plugin = nullptr;
+    }
 }
 
 extern "C" int psx_mod_game_started(void) {
@@ -1243,6 +1340,27 @@ extern "C" int psx_mod_option_value(const char* package_id,
     if (value.size() + 1 > (size_t)out_size) return 0;
     std::memcpy(out, value.c_str(), value.size() + 1);
     return 1;
+}
+
+extern "C" int psx_mod_current_resource_path(const char* resource_id,
+                                             char* out, uint32_t out_size) {
+    using namespace PSXRecompV4;
+    if (out && out_size) out[0] = '\0';
+    if (!resource_id || !resource_id[0] || !out || out_size == 0)
+        return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok || !s.current_plugin) return 0;
+    for (const ModResolution::Resource& resource : s.plan.resources) {
+        if (resource.package_id != s.current_plugin->package_id ||
+            resource.feature_id != s.current_plugin->feature_id ||
+            resource.id != resource_id)
+            continue;
+        const std::string text = resource.path.string();
+        if (text.empty() || text.size() + 1 > (size_t)out_size) return 0;
+        std::memcpy(out, text.c_str(), text.size() + 1);
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" uint8_t psx_mod_read_byte(uint32_t address) {
@@ -1286,6 +1404,27 @@ extern "C" uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t size,
 
 extern "C" int32_t psx_mod_widescreen_x_margin(void) {
     return (int32_t)psx_ws_x_margin();
+}
+
+/*
+ * The presenter's own view of the scanned-out picture. Plugins that draw
+ * overlay primitives need the real edge, and the visible width depends on the
+ * GP1(06h) horizontal range, which GPUSTAT does not carry -- so a plugin
+ * cannot derive this itself. Zero means "not established yet"; the header
+ * tells callers to skip drawing rather than guess.
+ */
+extern "C" uint32_t psx_mod_display_width(void) {
+    GpuDisplayInfo info;
+    std::memset(&info, 0, sizeof(info));
+    gpu_get_display_info(&info);
+    return info.width;
+}
+
+extern "C" uint32_t psx_mod_display_height(void) {
+    GpuDisplayInfo info;
+    std::memset(&info, 0, sizeof(info));
+    gpu_get_display_info(&info);
+    return info.height;
 }
 
 extern "C" int psx_mod_register_function_entry_plugin(

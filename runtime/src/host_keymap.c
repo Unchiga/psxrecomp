@@ -25,9 +25,18 @@ typedef struct HostKeyBind {
 typedef struct HostKeyAction {
     HostKeyBind binds[HOST_KEYMAP_MAX_BINDS];
     int count;
+    /* 1 when [KeyMap] names this action with an empty / "None" / "(unbound)"
+     * value: the user cleared it, so apply_defaults must NOT put the built-in
+     * key back. A MISSING line still gets the default. */
+    int explicit_unbound;
 } HostKeyAction;
 
+
 static HostKeyAction s_actions[HOST_KEYMAP_ACTION_COUNT];
+
+static int want_default(HostKeymapAction action) {
+    return s_actions[action].count == 0 && !s_actions[action].explicit_unbound;
+}
 
 static int ieq(const char *a, const char *b) {
     if (!a || !b) return 0;
@@ -79,24 +88,28 @@ static void add_bind(HostKeymapAction action, int keycode, int scancode, int mod
 }
 
 static void apply_defaults(void) {
-    if (s_actions[HOST_KEYMAP_FULLSCREEN].count == 0) {
+    if (want_default(HOST_KEYMAP_FULLSCREEN)) {
         add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_RETURN, (int)SDL_SCANCODE_RETURN, KMOD_ALT);
         add_bind(HOST_KEYMAP_FULLSCREEN, (int)SDLK_f, (int)SDL_SCANCODE_F, KMOD_CTRL);
     }
-    if (s_actions[HOST_KEYMAP_TURBO].count == 0)
+    if (want_default(HOST_KEYMAP_TURBO))
         add_bind(HOST_KEYMAP_TURBO, (int)SDLK_TAB, (int)SDL_SCANCODE_TAB, 0);
-    if (s_actions[HOST_KEYMAP_VOLUME_UP].count == 0)
+    if (want_default(HOST_KEYMAP_VOLUME_UP))
         add_bind(HOST_KEYMAP_VOLUME_UP, (int)SDLK_KP_PLUS, (int)SDL_SCANCODE_KP_PLUS, 0);
-    if (s_actions[HOST_KEYMAP_VOLUME_DOWN].count == 0)
+    if (want_default(HOST_KEYMAP_VOLUME_DOWN))
         add_bind(HOST_KEYMAP_VOLUME_DOWN, (int)SDLK_KP_MINUS, (int)SDL_SCANCODE_KP_MINUS, 0);
-    if (s_actions[HOST_KEYMAP_DISPLAY_PERF].count == 0)
+    if (want_default(HOST_KEYMAP_DISPLAY_PERF))
         add_bind(HOST_KEYMAP_DISPLAY_PERF, (int)SDLK_f, (int)SDL_SCANCODE_F, 0);
 #if defined(PSX_HAS_RBENGINE_SNAP)
-    if (s_actions[HOST_KEYMAP_REWIND].count == 0)
+    if (want_default(HOST_KEYMAP_REWIND))
         add_bind(HOST_KEYMAP_REWIND, (int)SDLK_F8, (int)SDL_SCANCODE_F8, 0);
 #endif
-    if (s_actions[HOST_KEYMAP_SAVE_STATE_MENU].count == 0)
+    if (want_default(HOST_KEYMAP_SAVE_STATE_MENU))
         add_bind(HOST_KEYMAP_SAVE_STATE_MENU, (int)SDLK_F7, (int)SDL_SCANCODE_F7, 0);
+    if (want_default(HOST_KEYMAP_SCANLINES))
+        add_bind(HOST_KEYMAP_SCANLINES, (int)SDLK_F6, (int)SDL_SCANCODE_F6, 0);
+    if (want_default(HOST_KEYMAP_TURBO_TOGGLE))
+        add_bind(HOST_KEYMAP_TURBO_TOGGLE, (int)SDLK_F9, (int)SDL_SCANCODE_F9, 0);
 }
 
 /* Parse one "Ctrl+Alt+PageUp" token into key+mods. */
@@ -154,6 +167,8 @@ static HostKeymapAction action_for_key(const char *name) {
     if (ieq(name, "DisplayPerf")) return HOST_KEYMAP_DISPLAY_PERF;
     if (ieq(name, "Rewind")) return HOST_KEYMAP_REWIND;
     if (ieq(name, "SaveStateMenu")) return HOST_KEYMAP_SAVE_STATE_MENU;
+    if (ieq(name, "Scanlines")) return HOST_KEYMAP_SCANLINES;
+    if (ieq(name, "TurboToggle")) return HOST_KEYMAP_TURBO_TOGGLE;
     return HOST_KEYMAP_ACTION_COUNT;
 }
 
@@ -196,26 +211,36 @@ void host_keymap_load(const char *config_ini_path) {
         trim_inplace(val);
         act = action_for_key(key);
         if (act == HOST_KEYMAP_ACTION_COUNT) continue;
-        /* Explicit empty unbinds (no keypad fallback for that action until
-         * apply_defaults — empty means user cleared it; still fall back). */
+        /* Explicit empty / "None" unbinds: the user cleared it, so no
+         * default fallback for that action (explicit_unbound). */
         s_actions[act].count = 0;
+        s_actions[act].explicit_unbound = 0;
         parse_value(act, val);
+        if (s_actions[act].count == 0)
+            s_actions[act].explicit_unbound = 1;
     }
     fclose(f);
     apply_defaults();
 }
 
-int host_keymap_match(HostKeymapAction action, int keycode, int mod) {
+int host_keymap_match_event(HostKeymapAction action, int keycode,
+                            int scancode, int mod) {
     const HostKeyAction *a;
     const int relevant = (int)(KMOD_CTRL | KMOD_ALT | KMOD_SHIFT);
     int i;
     if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return 0;
     a = &s_actions[action];
     for (i = 0; i < a->count; i++) {
-        if (a->binds[i].keycode != keycode) continue;
+        if (a->binds[i].keycode != keycode &&
+            (scancode <= 0 || a->binds[i].scancode != scancode))
+            continue;
         if ((mod & relevant) == a->binds[i].mods) return 1;
     }
     return 0;
+}
+
+int host_keymap_match(HostKeymapAction action, int keycode, int mod) {
+    return host_keymap_match_event(action, keycode, 0, mod);
 }
 
 int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod) {
@@ -289,6 +314,8 @@ const char *host_keymap_label(HostKeymapAction action, char *out, size_t cap) {
     if (action < 0 || action >= HOST_KEYMAP_ACTION_COUNT) return out;
     a = &s_actions[action];
     if (a->count <= 0) {
+        if (a->explicit_unbound)
+            return out;
 #if defined(PSX_HAS_RBENGINE_SNAP)
         if (action == HOST_KEYMAP_REWIND)
             snprintf(out, cap, "F8");

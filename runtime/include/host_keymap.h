@@ -21,6 +21,8 @@ typedef enum HostKeymapAction {
     HOST_KEYMAP_DISPLAY_PERF,
     HOST_KEYMAP_REWIND,           /* default F8 */
     HOST_KEYMAP_SAVE_STATE_MENU,  /* default F7 */
+    HOST_KEYMAP_SCANLINES,        /* default F6 */
+    HOST_KEYMAP_TURBO_TOGGLE,     /* default F9; latches Turbo until pressed again */
     HOST_KEYMAP_ACTION_COUNT
 } HostKeymapAction;
 
@@ -29,6 +31,12 @@ void host_keymap_load(const char *config_ini_path);
 
 /* 1 if (keycode, mod) matches a binding for `action`. */
 int host_keymap_match(HostKeymapAction action, int keycode, int mod);
+
+/* Match a key event by its logical keycode or physical scancode. SDL can
+ * report a layout-dependent/unknown keycode while still providing the stable
+ * scancode stored with the configured binding. */
+int host_keymap_match_event(HostKeymapAction action, int keycode,
+                            int scancode, int mod);
 
 /* 1 if any configured bind for `action` is currently held. */
 int host_keymap_down(HostKeymapAction action, const uint8_t *keys, int mod);
