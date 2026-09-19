@@ -66,6 +66,11 @@ int psx_guest_overlay_register(const PsxGuestOverlay *ov);
 
 /* ---- Called by the runtime. Not for titles. ---- */
 int                    psx_guest_overlay_count(void);
+/* Capacity, and how many registrations the full table has refused. A refused
+ * overlay never draws and is otherwise indistinguishable from one that chose
+ * not to; the debug server's `guest_overlays` reports both. */
+int                    psx_guest_overlay_max(void);
+int                    psx_guest_overlay_dropped(void);
 const PsxGuestOverlay *psx_guest_overlay_at(int i);
 /* 1 if ANY registered overlay wants the frame presented. */
 int                    psx_guest_overlay_any_needs_present(void);

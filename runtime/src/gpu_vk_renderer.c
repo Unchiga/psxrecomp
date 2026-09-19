@@ -2115,7 +2115,7 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
  * seen.
  */
 
-#define VK_OVL_MAX 14            /* layers per frame: guest overlays, menu, toast */
+#define VK_OVL_MAX 18            /* layers per frame: guest overlays, menu, toast */
 
 static VkRenderPass          s_ovl_rpass;
 static VkImageView           s_ovl_scview[8];

@@ -19,6 +19,7 @@
 #include "debug_server.h"
 #include "debug_server_internal.h"
 #include "debug_cmds_hardware.h"
+#include "psx_guest_overlay.h"
 #include "psx_bss.h"
 #include "nd_intro_ot.h"
 #include "latency_ring.h"
@@ -10382,6 +10383,19 @@ static void handle_dispatch_stats(int id, const char *json)
              s_unknown_unique_count);
 }
 
+/* guest_overlays: how many guest-space overlays registered, the table's
+ * capacity, and how many registrations it refused. A refused overlay never
+ * draws, which looks exactly like one that decided to stay hidden.
+ *   {"cmd":"guest_overlays"} -> {"count":N,"max":M,"dropped":D} */
+static void handle_guest_overlays(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"count\":%d,\"max\":%d,\"dropped\":%d}",
+             id, psx_guest_overlay_count(), psx_guest_overlay_max(),
+             psx_guest_overlay_dropped());
+}
+
 /* dispatch_check: check if a specific address was ever dispatched */
 static void handle_dispatch_check(int id, const char *json) {
     char abuf[32] = {0};
@@ -12984,6 +12998,7 @@ static const CmdEntry s_commands[] = {
     { "quit",              handle_quit },
     { "quit_graceful",     handle_quit_graceful },
     { "dispatch_stats",    handle_dispatch_stats },
+    { "guest_overlays",    handle_guest_overlays },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
     { "card_mgr_trace",    handle_card_mgr_trace },
