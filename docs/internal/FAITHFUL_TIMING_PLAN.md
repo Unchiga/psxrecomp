@@ -213,6 +213,22 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-19 (XA EOF must not stop ReadS):** Yu-Gi-Oh! Forbidden
+  Memories' opening scene exposed an XA/CD-ROM regression. A live save had
+  Psy-Q's range reader at state 6 with only 16 sectors left, but the controller
+  had stopped at an XA Form-2 EOF sector; the game consequently exhausted its
+  600-tick fallback (438 ticks / about 14.6 seconds remained in the report).
+  PSX-SPX limits Setmode bit 1 auto-pause to CD-DA track transitions, and the
+  Beetle CDC defines XA EOF but does not stop its read state on it. The runtime
+  now leaves ReadN/ReadS active at XA EOF. Snapshot restore also recognizes the
+  exact impossible state written by the faulty controller (stopped read, active
+  XA mode/decoder, last raw Mode-2 sector marked EOF+Audio) and resumes ReadS
+  from the already-advanced MSF; deliberate Pause/Stop states do not match.
+  The accelerated-consumer unit test pins that narrow migration. Live against
+  the unchanged reporter slot: restore resumed ReadS at the saved next sector,
+  the remaining range cleared in 0.246 s, and the post-Cross image transition
+  completed in 0.749 s (previously about 14.6 s) on the next dialogue frame.
+
 - **2026-09-12 (WO-3 observed overlay interior recovery):**
   Branch `fix/observed-overlay-interiors` preserves validated, executed dispatch
   demands even when shared CFG ownership rejects their hostless interior seeds.

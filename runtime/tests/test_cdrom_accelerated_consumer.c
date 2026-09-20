@@ -36,6 +36,33 @@ int main(void) {
                 failed = 1;
         }
     }
+
+    /* Old snapshots can preserve the short-lived controller bug where XA EOF
+     * stopped ReadS. Only that impossible EOF state is resumed; an ordinary
+     * paused XA stream must remain stopped. */
+    reading = 0;
+    read_cmd = 0;
+    read_delay = 0;
+    mode_reg = 0x4A;
+    xa_stream_active = 1;
+    xa_data_end_pending = 1;
+    last_sector_have_raw = 1;
+    last_sector_raw_mode = CDROM_SECTOR_MODE2;
+    last_sector_xa_submode = XA_SUBMODE_EOF | XA_SUBMODE_AUDIO;
+    stat_reg = CDSTAT_MOTOR;
+    cdrom_repair_legacy_xa_eof_snapshot();
+    if (!reading || read_cmd != 0x1B || read_delay != 451584 ||
+        xa_data_end_pending || !(stat_reg & CDSTAT_READ)) {
+        failed = 1;
+    }
+
+    reading = 0;
+    read_cmd = 0;
+    read_delay = 0;
+    last_sector_xa_submode = XA_SUBMODE_AUDIO;
+    cdrom_repair_legacy_xa_eof_snapshot();
+    if (reading || read_cmd || read_delay) failed = 1;
+
     if (!failed) puts("PASS: every accelerated mode protects its pending consumer");
     return failed;
 }

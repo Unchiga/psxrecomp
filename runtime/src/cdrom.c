@@ -1643,17 +1643,12 @@ static int read_sector_at(int min, int sec, int sect) {
         delivery.data_delivered = 0;
         delivery.skip_reason = CDROM_SKIP_XA_AUDIO_REALTIME;
     }
-    if ((delivery.xa_submode & (XA_SUBMODE_EOF | XA_SUBMODE_AUDIO)) ==
-        (XA_SUBMODE_EOF | XA_SUBMODE_AUDIO)) {
-        if (!(mode_reg & 0x08u) ||
-            (delivery.xa_file == filter_file &&
-             delivery.xa_channel == filter_channel)) {
-            xa_data_end_pending = 1;
-            if (mode_reg & 0x02u) {
-                stop_read_stream();
-            }
-        }
-    }
+    /* XA EOF marks the end of an XA file, not the end of the ReadN/ReadS
+     * command. Setmode bit 1 auto-pauses CD-DA at a SubQ track transition;
+     * it does not stop an XA read at a Form-2 subheader EOF bit. Beetle's CDC
+     * likewise keeps the drive in DS_READING here. Stopping the stream used
+     * to strand Psy-Q's sector-range reader short of its requested end LBA,
+     * leaving games to wait for their multi-second safety timeout. */
 
     CdSectorBuf *wb = NULL;
     if (delivery.data_delivered) {
@@ -3620,6 +3615,27 @@ static int cdrom_snap_emit(PstW *w) {
     return 1;
 }
 
+/* States written by cd55e8a4..240cff54 can contain a controller state that
+ * real hardware cannot produce: ReadS stopped on an XA Form-2 EOF sector while
+ * the XA decoder and read mode remain active. Resume at the already-advanced
+ * MSF so those states inherit the corrected controller behavior too. The
+ * subheader check makes this migration distinct from a deliberate Pause/Stop. */
+static void cdrom_repair_legacy_xa_eof_snapshot(void) {
+    const uint8_t eof_audio = XA_SUBMODE_EOF | XA_SUBMODE_AUDIO;
+    if (reading || !xa_stream_active || read_cmd != 0 ||
+        !(mode_reg & 0x40u) || !last_sector_have_raw ||
+        last_sector_raw_mode != CDROM_SECTOR_MODE2 ||
+        (last_sector_xa_submode & eof_audio) != eof_audio) {
+        return;
+    }
+
+    reading = 1;
+    read_cmd = 0x1B; /* ReadS: XA streams in Psy-Q use the streaming command. */
+    read_delay = sector_delay_cycles();
+    xa_data_end_pending = 0;
+    stat_reg |= CDSTAT_READ;
+}
+
 static int cdrom_snap_parse(PstR *r) {
     uint8_t b;
     int32_t i;
@@ -3686,6 +3702,7 @@ static int cdrom_snap_parse(PstR *r) {
         pending_set_remaining(pending_rem);
     else
         pending.due_cyc = 0;
+    cdrom_repair_legacy_xa_eof_snapshot();
     return 1;
 }
 
